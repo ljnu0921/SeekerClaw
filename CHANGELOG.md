@@ -3,7 +3,7 @@
 All notable changes to SeekerClaw are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [1.9.0] - 2026-04-07
+## [1.9.0] - 2026-04-13
 
 ### Added
 - **OpenAI Codex OAuth** — sign in with a ChatGPT Plus/Pro subscription instead of a platform API key. Browser PKCE flow, Keystore-encrypted token storage, automatic token refresh, per-provider auth-type memory across provider switches (BAT-485, #316)
