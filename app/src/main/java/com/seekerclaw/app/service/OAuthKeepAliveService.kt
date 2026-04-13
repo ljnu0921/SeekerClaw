@@ -3,6 +3,7 @@ package com.seekerclaw.app.service
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.os.Handler
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -29,17 +30,22 @@ import com.seekerclaw.app.SeekerClawApplication
  * LIFECYCLE
  * ---------
  * Started by OpenAIOAuthActivity BEFORE opening Chrome Custom Tab.
- * Stopped by OpenAIOAuthActivity's onComplete callback (success, error,
- * cancel, or timeout). Also auto-stops after 2 minutes via
- * [android.app.Service.stopSelf] as a safety net in case the callback
- * never arrives.
+ * Explicitly stopped by OpenAIOAuthActivity in the normal completion
+ * paths: onComplete callback (success/error), cancel button press,
+ * server-start failure, and error/missing-code callback handler paths.
+ * If the OAuth flow reaches its 10-minute timeout without an explicit
+ * stop, this service's own auto-stop safety net (also 10 minutes)
+ * cleans it up — the two timeouts are aligned by design.
  */
 class OAuthKeepAliveService : Service() {
 
     companion object {
         private const val TAG = "OAuthKeepAlive"
         private const val NOTIFICATION_ID = 9002
-        private const val AUTO_STOP_DELAY_MS = 120_000L // 2 minutes
+        // Aligned with the 10-minute OAuth polling timeout in
+        // rememberOpenAIOAuthController so the service doesn't die while
+        // the user is still authenticating (e.g. slow MFA).
+        private const val AUTO_STOP_DELAY_MS = 600_000L // 10 minutes
 
         fun start(context: Context) {
             try {
@@ -62,6 +68,11 @@ class OAuthKeepAliveService : Service() {
         }
     }
 
+    // Single Handler instance — must be the SAME object in onStartCommand
+    // and onDestroy so removeCallbacks actually finds the posted Runnable.
+    // Using a different Handler instance would make removeCallbacks a no-op.
+    private val handler = Handler(android.os.Looper.getMainLooper())
+
     private val autoStopRunnable = Runnable {
         Log.w(TAG, "Auto-stopping after ${AUTO_STOP_DELAY_MS / 1000}s timeout")
         stopSelf()
@@ -71,7 +82,7 @@ class OAuthKeepAliveService : Service() {
         val notification = NotificationCompat.Builder(this, SeekerClawApplication.CHANNEL_ID)
             .setContentTitle("Signing in...")
             .setContentText("Completing OpenAI authentication")
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setSmallIcon(R.drawable.ic_notification)
             .setOngoing(true)
             .setSilent(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -80,14 +91,17 @@ class OAuthKeepAliveService : Service() {
         startForeground(NOTIFICATION_ID, notification)
         Log.i(TAG, "Keep-alive service started (foreground)")
 
-        // Safety net: stop after 2 minutes in case the OAuth callback never arrives.
-        android.os.Handler(mainLooper).postDelayed(autoStopRunnable, AUTO_STOP_DELAY_MS)
+        // Clear any existing auto-stop from a prior start cycle, then
+        // schedule a fresh one. Prevents stacked callbacks on rapid
+        // stop/start cycles.
+        handler.removeCallbacks(autoStopRunnable)
+        handler.postDelayed(autoStopRunnable, AUTO_STOP_DELAY_MS)
 
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
-        android.os.Handler(mainLooper).removeCallbacks(autoStopRunnable)
+        handler.removeCallbacks(autoStopRunnable)
         Log.i(TAG, "Keep-alive service destroyed")
         super.onDestroy()
     }
