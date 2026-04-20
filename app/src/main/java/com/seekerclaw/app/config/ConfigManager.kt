@@ -112,6 +112,7 @@ object ConfigManager {
     private const val KEY_WALLET_ADDRESS = "wallet_address"
     private const val KEY_WALLET_LABEL = "wallet_label"
     private const val KEY_MCP_SERVERS_ENC = "mcp_servers_enc"
+    private const val KEY_ENV_VARS_ENC = "env_vars_enc"
     private const val KEY_HEARTBEAT_INTERVAL = "heartbeat_interval"
     private const val KEY_PROVIDER = "provider"
     private const val KEY_OPENAI_API_KEY_ENC = "openai_api_key_enc"
@@ -842,6 +843,21 @@ object ConfigManager {
             // Only the tokens are needed by Node — email/expiresAt are Android-only metadata.
             if (config.openaiOAuthToken.isNotBlank()) put("openaiOAuthToken", config.openaiOAuthToken)
             if (config.openaiOAuthRefresh.isNotBlank()) put("openaiOAuthRefresh", config.openaiOAuthRefresh)
+            // NOTE: loadEnvVars() decrypts on the calling thread, matching the
+            // pre-existing pattern in this function — every secret field above
+            // (bot tokens, API keys, OAuth tokens, MCP tokens) is also decrypted
+            // from Keystore on the same thread. Capped at 256 keys × 8 KB; typical
+            // real-world size is a few keys × a few hundred bytes, so total work is
+            // small. If `writeConfigJson` is ever migrated off the main thread,
+            // this block moves with it — see service/OpenClawService.kt caller.
+            val envVars = loadEnvVars(context)
+            if (envVars.isNotEmpty()) {
+                val envObj = JSONObject()
+                for (v in envVars) {
+                    envObj.put(v.name, v.value)
+                }
+                put("envVars", envObj)
+            }
             val mcpServers = loadMcpServers(context)
             if (mcpServers.isNotEmpty()) {
                 val arr = JSONArray()
@@ -943,6 +959,90 @@ object ConfigManager {
                 } else null
             }
             else -> null
+        }
+    }
+
+    // ==================== Env Vars ====================
+
+    /**
+     * Persist the user's env var list, encrypted, to SharedPreferences.
+     * Bumps [configVersion] so observers re-read.
+     *
+     * Defense in depth: applies full validation (name regex, reserved check, value size cap),
+     * dedupes on name (last occurrence wins — matches `.env` convention and the Raw editor),
+     * and enforces [EnvVar.MAX_KEYS]. UI already blocks these, but a malicious programmatic
+     * caller could bypass the UI.
+     */
+    fun saveEnvVars(context: Context, vars: List<EnvVar>) {
+        // Last-wins-on-value dedup via associateBy: when a name appears multiple
+        // times, the later entry's VALUE replaces the earlier one's, matching
+        // `.env` convention and EnvVarRawEditorDialog. Iteration order follows
+        // first-insertion of each key (Kotlin LinkedHashMap behavior — entries
+        // don't re-order on update), which is fine because loadEnvVars sorts
+        // alphabetically before returning anyway.
+        val cleaned = vars
+            .filter { EnvVar.validateName(it.name) == null } // regex + reserved check
+            .filter { EnvVar.validateValue(it.value) == null } // 8 KB UTF-8 byte cap + no newlines
+            .associateBy { it.name }
+            .values
+            .take(EnvVar.MAX_KEYS)
+            .toList()
+        if (cleaned.size < vars.size) {
+            LogCollector.append(
+                "[Config] Dropped ${vars.size - cleaned.size} env var(s) on save (invalid name/value or over ${EnvVar.MAX_KEYS} keys)",
+                LogLevel.WARN,
+            )
+        }
+        val json = JSONArray().apply {
+            for (v in cleaned) {
+                put(JSONObject().apply {
+                    put("name", v.name)
+                    put("value", v.value)
+                })
+            }
+        }.toString()
+        val enc = KeystoreHelper.encrypt(json)
+        prefs(context).edit()
+            .putString(KEY_ENV_VARS_ENC, Base64.encodeToString(enc, Base64.NO_WRAP))
+            .apply()
+        configVersion.intValue++
+    }
+
+    /**
+     * Load the user's env var list. Returns empty list if unset or decryption fails.
+     * Sorted alphabetically by name (stable UI).
+     *
+     * Defense in depth: the same validation + dedup + cap rules as [saveEnvVars] are applied
+     * here so an imported or corrupted blob cannot inject invalid names, oversized values,
+     * or duplicates into `process.env`.
+     */
+    fun loadEnvVars(context: Context): List<EnvVar> {
+        return try {
+            val enc = prefs(context).getString(KEY_ENV_VARS_ENC, null) ?: return emptyList()
+            val json = KeystoreHelper.decrypt(Base64.decode(enc, Base64.NO_WRAP))
+            val arr = JSONArray(json)
+            val raw = (0 until arr.length()).map { i ->
+                val obj = arr.getJSONObject(i)
+                EnvVar(
+                    name = obj.getString("name"),
+                    value = obj.optString("value", ""),
+                )
+            }
+            // Same last-wins dedup as saveEnvVars (associateBy — later values
+            // replace earlier ones). Using distinctBy here would diverge from
+            // saveEnvVars' semantics and produce inconsistent results on
+            // corrupted/legacy blobs that happen to contain duplicate names.
+            raw.filter { EnvVar.validateName(it.name) == null }
+                .filter { EnvVar.validateValue(it.value) == null }
+                .associateBy { it.name }
+                .values
+                .take(EnvVar.MAX_KEYS)
+                .sortedBy { it.name }
+                .toList()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to load env vars", e)
+            LogCollector.append("[Config] Failed to load env vars: ${e.javaClass.simpleName}", LogLevel.ERROR)
+            emptyList()
         }
     }
 

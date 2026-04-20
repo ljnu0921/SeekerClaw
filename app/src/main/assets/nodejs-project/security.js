@@ -16,6 +16,52 @@ function _escRx(s) { return s.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&'); }
 // Cached dynamic redaction patterns (rebuilt when config changes)
 let _dynamicPatterns = [];
 
+// Extra literal secrets registered at runtime (e.g. user env-var values — BAT-495).
+// Use a Set so duplicates are silently ignored. The alternation regex is rebuilt
+// ONCE per register batch so redactSecrets() does a single O(msg) pass.
+const _extraRedactedSecrets = new Set();
+let _extraRedactedRegex = null;
+
+// Guard against false positives: values ≥ 7 chars (avoid common-word clobbering
+// like "true"/"1234"). No upper cap — the Kotlin EnvVar.MAX_VALUE_BYTES=8192
+// cap is already the ceiling, and any stored value deserves redaction regardless
+// of length. 256 keys × 8 KB = ~2 MB of alternation text, which V8 handles fine.
+const _MIN_SECRET_LEN = 7;
+
+function _rebuildExtraRedactedRegex() {
+    if (_extraRedactedSecrets.size === 0) { _extraRedactedRegex = null; return; }
+    // Longest first so one secret that is a substring of another doesn't get
+    // partially swallowed by the shorter match.
+    const parts = Array.from(_extraRedactedSecrets)
+        .sort((a, b) => b.length - a.length)
+        .map(_escRx);
+    _extraRedactedRegex = new RegExp(parts.join('|'), 'g');
+}
+
+// Register a single runtime secret value for redaction. Rebuilds the alternation
+// regex once. Prefer registerRedactedSecrets(list) for startup batch registration
+// so the regex is built just once per batch.
+function registerRedactedSecret(s) {
+    if (typeof s !== 'string' || s.length < _MIN_SECRET_LEN) return;
+    const sizeBefore = _extraRedactedSecrets.size;
+    _extraRedactedSecrets.add(s);
+    if (_extraRedactedSecrets.size !== sizeBefore) _rebuildExtraRedactedRegex();
+}
+
+// Register many runtime secrets at once, rebuilding the alternation regex just
+// once for the whole batch. Use this at startup to avoid O(N) rebuilds.
+function registerRedactedSecrets(values) {
+    if (!Array.isArray(values) || values.length === 0) return;
+    let added = false;
+    for (const s of values) {
+        if (typeof s !== 'string' || s.length < _MIN_SECRET_LEN) continue;
+        const sizeBefore = _extraRedactedSecrets.size;
+        _extraRedactedSecrets.add(s);
+        if (_extraRedactedSecrets.size !== sizeBefore) added = true;
+    }
+    if (added) _rebuildExtraRedactedRegex();
+}
+
 // Rebuild literal-match patterns for secrets without a known prefix.
 // Called at startup and after syncAgentApiKeys() mutates config.
 function rebuildRedactPatterns() {
@@ -60,6 +106,11 @@ function redactSecrets(msg) {
     // Redact Jupiter API key + MCP auth tokens (cached literal patterns)
     for (const { rx, replacement } of _dynamicPatterns) {
         msg = msg.replace(rx, replacement);
+    }
+    // Redact user-provided env-var values registered at startup (BAT-495) — single
+    // alternation regex is rebuilt on register, so this stays O(msg length).
+    if (_extraRedactedRegex) {
+        msg = msg.replace(_extraRedactedRegex, '[REDACTED_ENV]');
     }
     return msg;
 }
@@ -201,6 +252,8 @@ function wrapSearchResults(result, provider) {
 module.exports = {
     redactSecrets,
     rebuildRedactPatterns,
+    registerRedactedSecret,
+    registerRedactedSecrets,
     safePath,
     INJECTION_PATTERNS,
     normalizeWhitespace,

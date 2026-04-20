@@ -95,6 +95,59 @@ function normalizeSecret(val) {
 }
 
 // ============================================================================
+// USER ENV VARS — merge user-set env vars into process.env
+// ============================================================================
+// Filters out POSIX-invalid names and reserved names (defense in depth — the
+// Android-side UI already blocks these, but a malicious config import could
+// bypass that). USER_ENV_KEYS is exported so buildSystemBlocks() and the
+// env_list tool can list the user-set keys without filtering process.env
+// (which also contains system vars like PATH).
+
+const _ENV_RESERVED_EXACT = new Set([
+    'PATH', 'HOME', 'TMPDIR', 'USER', 'SHELL', 'LANG', 'TERM',
+    'AGENT_VERSION',
+    'API_TIMEOUT_MS', 'API_TIMEOUT_RETRIES',
+    'API_TIMEOUT_BACKOFF_MS', 'API_TIMEOUT_MAX_BACKOFF_MS',
+    'WS_NO_UTF_8_VALIDATE', 'WS_NO_BUFFER_UTIL',
+]);
+// All prefixes UPPERCASE — the POSIX name regex above rejects any input with
+// lowercase, so a mixed-case reservation would be unreachable dead code.
+const _ENV_RESERVED_PREFIXES = ['NODE_', 'NPM_', 'ANDROID_', 'LC_', 'JAVA_'];
+// Defense-in-depth caps mirror Kotlin EnvVar.MAX_KEYS / MAX_VALUE_BYTES — a
+// tampered config.json that bypasses the UI cannot push oversized blobs into
+// process.env or exceed the 256-key ceiling.
+const _ENV_MAX_KEYS = 256;
+const _ENV_MAX_VALUE_BYTES = 8192;
+const USER_ENV_KEYS = [];
+
+if (config.envVars && typeof config.envVars === 'object') {
+    let droppedOversize = 0;
+    for (const [key, value] of Object.entries(config.envVars)) {
+        if (USER_ENV_KEYS.length >= _ENV_MAX_KEYS) break;
+        if (typeof key !== 'string') continue;
+        if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) continue;
+        if (_ENV_RESERVED_EXACT.has(key)) continue;
+        if (_ENV_RESERVED_PREFIXES.some((p) => key.startsWith(p))) continue;
+        const str = String(value);
+        // Newline-free rule mirrors Kotlin EnvVar.validateValue. A value with
+        // embedded \r or \n interpolated into a shell command (e.g.
+        // `curl -H "Authorization: Bearer $TOK"`) can split the command; on a
+        // .env round-trip the serialization would be ambiguous. Skip defensively
+        // in case a tampered config.json tries to inject newline values.
+        if (str.indexOf('\n') >= 0 || str.indexOf('\r') >= 0) continue;
+        if (Buffer.byteLength(str, 'utf8') > _ENV_MAX_VALUE_BYTES) {
+            droppedOversize++;
+            continue;
+        }
+        process.env[key] = str;
+        USER_ENV_KEYS.push(key);
+    }
+    USER_ENV_KEYS.sort();
+    const note = droppedOversize > 0 ? ` (${droppedOversize} dropped for exceeding ${_ENV_MAX_VALUE_BYTES}-byte cap)` : '';
+    log(`[Config] Merged ${USER_ENV_KEYS.length} user env var(s) into process.env${note}`, 'DEBUG');
+}
+
+// ============================================================================
 // CONFIG CONSTANTS
 // ============================================================================
 
@@ -596,4 +649,7 @@ module.exports = {
 
     // Conversational API keys (BAT-236)
     syncAgentApiKeys,
+
+    // User env vars (BAT-495)
+    USER_ENV_KEYS,
 };
