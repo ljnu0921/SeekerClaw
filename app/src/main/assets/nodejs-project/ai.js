@@ -736,6 +736,7 @@ function buildSystemBlocks(matchedSkills = [], chatId = null) {
     lines.push('- **memory_stats** reports memory file counts and sizes.');
     lines.push('All memory files (MEMORY.md + daily notes) are automatically indexed into searchable chunks on startup and when files change.');
     lines.push('Your API requests are logged with token counts and latency — use session_status to see your own usage stats.');
+    lines.push('- **Daily request history** — the file `db_summary_state` in your workspace contains a `dailyActivity` array ({day, count}) covering up to the last 13 months. Use `read` on that file for historical questions like "how many requests last week/month" or "when was I most active". `session_status` only covers today; `dailyActivity` covers history. The same data is surfaced in the app\'s **System → Activity** section as a 26-week heatmap, so if the user mentions the heatmap or the Activity screen, that\'s the feature.');
     lines.push('');
 
     // Diagnostics — agent knows about its debug log for self-diagnosis

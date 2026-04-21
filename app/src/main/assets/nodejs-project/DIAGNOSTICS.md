@@ -351,3 +351,23 @@ grep -i "rate limit.*mcp\|rate limit.*exceeded" node_debug.log | tail -10
 2. **Missing binaries (`requires.bins`):** Explain the requirement and suggest alternatives (e.g., use `js_eval` instead of a shell binary).
 3. **Config keys (`requires.config`):** The skill needs a built-in config value (e.g., Jupiter API key, Helius API key). Guide the user to the relevant Settings page.
 4. Use the `shell_exec` tool to run `grep 'Skipping' node_debug.log | tail -10` — shows which skills were gated and why at last startup.
+
+## Activity Heatmap
+
+### Heatmap Shows "No message data yet" or Looks Blank
+**Symptoms:** User says "my Activity heatmap is empty" or "I don't see any cells on the System → Activity screen" even though they've used the agent.
+**Check:**
+1. `read` the file `db_summary_state` in the workspace — look for the `dailyActivity` array
+2. If the array is empty or missing: `shell_exec` with `grep -i "getDailyActivity" node_debug.log` — any WARN entries mean the SQL query threw
+3. If the array has data but the UI doesn't render it: the heatmap's fallback reads the file directly, so the UI should show it even when the service is stopped. If it doesn't, the app may need a full close + reopen.
+**Diagnosis:** `dailyActivity` is populated every ~30 seconds by `getDbSummary()` via `getDailyActivity()` in `database.js`. The query reads `api_request_log` rows (one per API call) grouped by local date, capped at the last 13 months. Common causes of an empty array: the service has never run long enough to log API requests; the SQL.js DB failed to open at startup (check for `[DB] ... error` in logs); timezone edge on very fresh installs.
+**Fix:**
+1. If the service just started: wait ~30 seconds and reload the System screen
+2. If logs show `[DB] getDailyActivity error`: the SQLite index or WASM loader failed — restart the app and check startup logs
+3. The heatmap persists between service runs (reads `db_summary_state` from disk), so a stopped service alone shouldn't empty it
+
+### Heatmap Right Column Looks Cut Off or Today Missing
+**Symptoms:** User reports the rightmost column is clipped, or today's cell is not visible.
+**Diagnosis:** The grid is a fixed 26-week window ending with the current week. Today's cell sits at whatever row corresponds to today's weekday (Mon=row 0, Sun=row 6). Future days in the current week are intentionally blank (Color.Transparent) — not a bug. Clipping on the actual right edge was fixed in PR #304 by switching to weight-based cells (BAT-500). If clipping reappears, it's likely a regression in `MessageActivityHeatmap` in `SystemScreen.kt`.
+**Fix:** This is a UI bug path, not a data bug. Ask the user for a screenshot and the device model + app version, then file a bug.
+
