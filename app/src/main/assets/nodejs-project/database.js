@@ -477,8 +477,34 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 // DB SUMMARY & STATS SERVER (BAT-31)
 // ============================================================================
 
+// Daily request counts for the Activity heatmap (up to 13 months of history).
+// Each row in api_request_log is one API call to the model — note that a single
+// user message can produce multiple API calls via tool-use loops, retries, or
+// background session summaries. The UI reflects this accurately: the section is
+// labeled "Activity" and the total reads "X requests" (not "messages").
+function getDailyActivity() {
+    if (!db) return [];
+    try {
+        // SUBSTR extracts the local date portion directly from ISO timestamps
+        // (e.g. "2026-03-28T19:17:24+04:00" → "2026-03-28"), avoiding DATE()
+        // timezone interpretation issues. Capped at 13 months to limit query size.
+        const rows = db.exec(
+            `SELECT SUBSTR(timestamp, 1, 10) AS day, COUNT(*) AS count
+             FROM api_request_log
+             WHERE SUBSTR(timestamp, 1, 10) >= date('now', 'localtime', '-13 months')
+             GROUP BY SUBSTR(timestamp, 1, 10)
+             ORDER BY day ASC`
+        );
+        if (rows.length === 0 || rows[0].values.length === 0) return [];
+        return rows[0].values.map(([day, count]) => ({ day, count }));
+    } catch (e) {
+        log('[DB] getDailyActivity error: ' + e.message, 'WARN');
+        return [];
+    }
+}
+
 function getDbSummary() {
-    const summary = { today: null, month: null, memory: null };
+    const summary = { today: null, month: null, memory: null, dailyActivity: [] };
     if (!db) return summary;
 
     try {
@@ -552,6 +578,7 @@ function getDbSummary() {
         }
     } catch (e) { /* non-fatal */ }
 
+    summary.dailyActivity = getDailyActivity();
     return summary;
 }
 

@@ -3,6 +3,7 @@ package com.seekerclaw.app.ui.system
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -31,9 +32,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import com.seekerclaw.app.ui.theme.RethinkSans
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.seekerclaw.app.BuildConfig
@@ -48,13 +52,35 @@ import com.seekerclaw.app.util.AppStorageInfo
 import com.seekerclaw.app.util.DeviceInfo
 import com.seekerclaw.app.util.DeviceInfoProvider
 import com.seekerclaw.app.util.ApiUsageData
+import com.seekerclaw.app.util.DayActivity
 import com.seekerclaw.app.util.DbSummary
 import com.seekerclaw.app.util.ServiceState
 import com.seekerclaw.app.util.ServiceStatus
 import com.seekerclaw.app.util.fetchDbSummary
+import java.time.DayOfWeek
+import java.time.LocalDate
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+
+private val HeatmapColors = listOf(
+    Color(0xFF252530),  // Level 0: visible empty cell (subtle but clear grid structure)
+    Color(0xFF3D1117),
+    Color(0xFF6B1D2A),
+    Color(0xFF8B2232),
+    Color(0xFFE41F28),
+)
+
+private fun heatmapColorForCount(count: Int, thresholds: List<Int>): Color {
+    if (count == 0) return HeatmapColors[0]
+    if (thresholds.isEmpty()) return HeatmapColors[4]
+    return when {
+        count <= thresholds.getOrElse(0) { 1 } -> HeatmapColors[1]
+        count <= thresholds.getOrElse(1) { 2 } -> HeatmapColors[2]
+        count <= thresholds.getOrElse(2) { 5 } -> HeatmapColors[3]
+        else -> HeatmapColors[4]
+    }
+}
 
 @Composable
 fun SystemScreen(onBack: () -> Unit) {
@@ -96,7 +122,9 @@ fun SystemScreen(onBack: () -> Unit) {
             delay(60_000)
         }
     }
-    // Fetch DB summary every 30s while running; clear on stop
+    // Fetch DB summary every 30s while running; one-shot read when stopped so the
+    // Activity heatmap keeps showing the last-written snapshot from disk instead
+    // of going blank. workspace/db_summary_state persists across service stops.
     LaunchedEffect(status) {
         if (status == ServiceStatus.RUNNING) {
             while (true) {
@@ -105,7 +133,7 @@ fun SystemScreen(onBack: () -> Unit) {
                 delay(if (result != null) 30_000L else 5_000L)
             }
         } else {
-            dbSummary = null
+            dbSummary = fetchDbSummary()
         }
     }
 
@@ -146,6 +174,25 @@ fun SystemScreen(onBack: () -> Unit) {
             InfoRow("Agent", agentName)
             InfoRow("Uptime", formatUptime(uptime), isLast = true)
         }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // ==================== ACTIVITY ====================
+        SectionLabel("Activity")
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // Preserve last known activity data even when service stops
+        val lastKnownActivity = remember { mutableStateOf<List<DayActivity>>(emptyList()) }
+        val currentActivity = dbSummary?.dailyActivity ?: emptyList()
+        LaunchedEffect(currentActivity) {
+            if (currentActivity.isNotEmpty()) {
+                lastKnownActivity.value = currentActivity
+            }
+        }
+
+        MessageActivityHeatmap(
+            dailyActivity = lastKnownActivity.value
+        )
 
         Spacer(modifier = Modifier.height(24.dp))
 
@@ -532,6 +579,161 @@ private fun StatCard(
             fontSize = 11.sp,
             color = SeekerClawColors.TextDim,
         )
+    }
+}
+
+@Composable
+private fun MessageActivityHeatmap(dailyActivity: List<DayActivity>) {
+    val cellGap = 3.dp
+    val cellShape = RoundedCornerShape(3.dp)
+
+    val today = LocalDate.now()
+    // Rolling 26-week window ending with the current week (GitHub-style).
+    // Grid = Mon of 26 weeks ago → Sun of the current week. Today sits wherever
+    // its weekday falls in the rightmost column; later days in that column stay
+    // blank until the week completes.
+    val currentWeekMonday = today.with(DayOfWeek.MONDAY)
+    val gridStart = currentWeekMonday.minusWeeks(25)
+    val gridEnd = currentWeekMonday.plusDays(6) // Sunday of current week
+
+    // Build date -> count map
+    val dateCountMap = remember(dailyActivity) {
+        dailyActivity.mapNotNull { activity ->
+            try {
+                LocalDate.parse(activity.day) to activity.count
+            } catch (_: Exception) {
+                null
+            }
+        }.toMap()
+    }
+
+    // Build weeks grid: 26 weeks × 7 days (Mon-Sun), every cell a real date.
+    val weeks = remember(gridStart) {
+        (0 until 26).map { weekIndex ->
+            val weekStart = gridStart.plusWeeks(weekIndex.toLong())
+            (0 until 7).map { dow -> weekStart.plusDays(dow.toLong()) }
+        }
+    }
+
+    // Percentile thresholds from non-zero counts
+    val thresholds = remember(dateCountMap) {
+        val nonZero = dateCountMap.values.filter { it > 0 }.sorted()
+        if (nonZero.isEmpty()) emptyList()
+        else {
+            val pctThresholds = listOf(
+                nonZero[(nonZero.size * 0.25).toInt().coerceAtMost(nonZero.size - 1)],
+                nonZero[(nonZero.size * 0.50).toInt().coerceAtMost(nonZero.size - 1)],
+                nonZero[(nonZero.size * 0.75).toInt().coerceAtMost(nonZero.size - 1)],
+            )
+            // Fallback: if all thresholds are identical, spread evenly across max
+            if (pctThresholds.distinct().size == 1) {
+                val max = nonZero.last()
+                listOf(max / 4, max / 2, (max * 3) / 4).map { it.coerceAtLeast(1) }
+            } else pctThresholds
+        }
+    }
+
+    // All-time total across every day the query returned (database.js caps at
+    // 13 months, which comfortably covers SeekerClaw's entire install history).
+    val totalMessages = remember(dailyActivity) {
+        dailyActivity.sumOf { it.count.toLong() }
+    }
+
+    CardSurface(
+        modifier = Modifier.semantics {
+            contentDescription = "Message activity heatmap showing $totalMessages messages"
+        },
+    ) {
+        if (dailyActivity.isEmpty() || totalMessages == 0L) {
+            Text(
+                text = "No message data yet",
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+                color = SeekerClawColors.TextDim,
+            )
+        } else {
+            // Fixed 26-week window — no horizontal scroll. Cells size responsively
+            // within a 6–16dp range; at typical phone widths they land around 10–12dp.
+            // Grid: 7 rows × 26 weeks. Weighted cells + spacedBy arrangement let
+            // Compose distribute the exact available width — no manual rounding,
+            // no right-edge clipping. aspectRatio(1f) keeps cells square.
+            Column(verticalArrangement = Arrangement.spacedBy(cellGap)) {
+                for (dayOfWeek in 0..6) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(cellGap),
+                    ) {
+                        for (weekIndex in weeks.indices) {
+                            val date = weeks[weekIndex][dayOfWeek]
+                            // Past + today → normal heatmap color; future days in the
+                            // current week stay blank so "today" is visually the last
+                            // filled cell.
+                            val color = if (date <= today) {
+                                heatmapColorForCount(dateCountMap[date] ?: 0, thresholds)
+                            } else {
+                                Color.Transparent
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .aspectRatio(1f)
+                                    .background(color, cellShape),
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Footer
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val countText = when {
+                    totalMessages >= 1_000_000 -> "%.1fM".format(totalMessages / 1_000_000f)
+                    totalMessages >= 10_000 -> "%.0fK".format(totalMessages / 1_000f)
+                    else -> "%,d".format(totalMessages)
+                }
+                Text(
+                    text = "$countText requests",
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    color = SeekerClawColors.TextDim,
+                )
+
+                // Legend
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "Less",
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        color = SeekerClawColors.TextDim,
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    val legendSize = 8.dp
+                    for (i in HeatmapColors.indices) {
+                        Box(
+                            modifier = Modifier
+                                .size(legendSize)
+                                .background(HeatmapColors[i], cellShape),
+                        )
+                        if (i < HeatmapColors.size - 1) {
+                            Spacer(modifier = Modifier.width(2.dp))
+                        }
+                    }
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "More",
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        color = SeekerClawColors.TextDim,
+                    )
+                }
+            }
+        }
     }
 }
 
