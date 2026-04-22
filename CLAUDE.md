@@ -457,6 +457,34 @@ adb install app/build/outputs/apk/dappStore/debug/app-dappStore-debug.apk
 ./gradlew bundleGooglePlayRelease     # → AAB
 ```
 
+### Pre-push check (BAT-502)
+
+Before every `git push`, run:
+
+```bash
+scripts/pre-push-check.sh
+```
+
+Does in ~5–10 seconds (incremental):
+1. Node.js smoke test (`tests/nodejs-project/smoke.js`) — syntax + module load
+2. Kotlin compile (`compileDappStoreDebugKotlin`) — catches missing imports,
+   type errors, unresolved references BEFORE CI
+
+The script auto-detects JDK 17+ (prefers Android Studio's bundled JBR at
+`jbr/`) and Android SDK (from main-repo `local.properties` or standard
+locations).
+
+Exit codes:
+- `0` — all checks passed
+- `1` — Node smoke failed
+- `2` — Kotlin compile failed
+- `3` — JDK 17+ not found
+- `4` — Android SDK not found
+- `5` — couldn't cd to repo root (broken path / permissions)
+
+Catches the bug class from PR #334 (missing `aspectRatio` import passed
+Node smoke, failed CI after 4 minutes).
+
 ## CI/CD (GitHub Actions)
 
 **`.github/workflows/build.yml`** — runs on push/PR to main, builds both flavor debug APKs for validation.
