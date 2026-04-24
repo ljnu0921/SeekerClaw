@@ -358,10 +358,17 @@ fun SettingsScreen(
         }
     }
 
+    // Fields whose value is re-read live from agent_settings.json on the Node
+    // side (no service restart needed). Keep in sync with live-pickup readers
+    // in main.js (heartbeat) and ai.js (maxStepsPerTurn).
+    val liveUpdateFields = setOf("maxStepsPerTurn", "heartbeatIntervalMinutes")
+
     fun saveField(field: String, value: String) {
         ConfigManager.updateConfigField(context, field, value)
         config = ConfigManager.loadConfig(context)
-        showRestartDialog = true
+        if (field !in liveUpdateFields) {
+            showRestartDialog = true
+        }
     }
 
     val authTypeLabel = if (config?.authType == "setup_token") "Pro/Max Setup Token" else "API Key"
@@ -437,6 +444,16 @@ fun SettingsScreen(
                         editValue = (config?.heartbeatIntervalMinutes ?: 30).toString()
                     },
                     info = SettingsHelpTexts.HEARTBEAT_INTERVAL,
+                )
+                ConfigField(
+                    label = "Max Agent Steps Per Turn",
+                    value = "${config?.maxStepsPerTurn ?: 35} steps",
+                    onClick = {
+                        editField = "maxStepsPerTurn"
+                        editLabel = "Max Agent Steps Per Turn (10–100)"
+                        editValue = (config?.maxStepsPerTurn ?: 35).toString()
+                    },
+                    info = SettingsHelpTexts.MAX_STEPS_PER_TURN,
                 )
                 ConfigField(
                     label = "Search Provider",
