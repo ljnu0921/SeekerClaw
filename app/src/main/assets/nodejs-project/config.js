@@ -168,7 +168,10 @@ let OWNER_ID = CHANNEL === 'discord'
 const _SUPPORTED_PROVIDERS = new Set(['claude', 'openai', 'openrouter', 'custom']);
 const _rawProvider = (typeof config.provider === 'string' && config.provider.trim()) ? config.provider.trim().toLowerCase() : 'claude';
 const PROVIDER = _SUPPORTED_PROVIDERS.has(_rawProvider) ? _rawProvider : 'claude';
-const ANTHROPIC_KEY = normalizeSecret(config.anthropicApiKey);
+// ANTHROPIC_KEY is derived after AUTH_TYPE is computed (below) so it can
+// pick the right credential field. Kotlin now writes raw `anthropicApiKey`
+// and `setupToken` as SEPARATE fields in config.json (the activeCredential
+// collapse used to happen Kotlin-side), so Node picks by auth mode here.
 const OPENAI_KEY = normalizeSecret(config.openaiApiKey || '');
 const OPENAI_OAUTH_TOKEN = normalizeSecret(config.openaiOAuthToken || '');
 const OPENAI_OAUTH_REFRESH = normalizeSecret(config.openaiOAuthRefresh || '');
@@ -199,6 +202,19 @@ if (PROVIDER === 'openai' && !_SUPPORTED_OPENAI_AUTH_TYPES.has(AUTH_TYPE)) {
 // fallback. The credential validation below will fail fast on missing OAuth token.
 const OPENAI_AUTH_TYPE = AUTH_TYPE === 'oauth' ? 'oauth' : 'api_key';
 
+// Now that AUTH_TYPE is known, pick the right Claude credential. Kotlin
+// writes both fields raw. In setup_token mode, derive STRICTLY from
+// setupToken with no API-key fallback — otherwise a missing setup token
+// would silently boot the agent with an API key in the Bearer header
+// while it thinks it's in setup_token mode, causing every request to
+// fail confusingly at runtime. The startup validation below fails
+// loudly instead, which is what we want.
+const ANTHROPIC_KEY = normalizeSecret(
+    (PROVIDER === 'claude' && AUTH_TYPE === 'setup_token')
+        ? (config.setupToken || '')
+        : (config.anthropicApiKey || '')
+);
+
 const OPENROUTER_KEY = normalizeSecret(config.openrouterApiKey || '');
 const CUSTOM_KEY = normalizeSecret(config.customApiKey || '');
 const CUSTOM_BASE_URL = (typeof config.customBaseUrl === 'string' ? config.customBaseUrl : '').trim();
@@ -213,6 +229,48 @@ const _defaultModel = PROVIDER === 'openai' ? 'gpt-5.4'
     : 'claude-opus-4-7';
 const MODEL = config.model || _defaultModel;
 const AGENT_NAME = config.agentName || 'SeekerClaw';
+
+/**
+ * Resolve the currently-active model — the agent_settings.json overlay
+ * wins over the startup MODEL const. The `/model` Telegram command and
+ * the Settings UI model picker both write to agent_settings.json; this
+ * resolver is what lets those changes take effect live (no service
+ * restart). Called per chat() turn and by any self-report surface
+ * (/status, /version, session_status, system prompt) so the agent
+ * never reports a different model than the one handling the request.
+ *
+ * Provider-scoping: if the overlay specifies a provider, only adopt the
+ * overlay model when it matches the running provider. This closes a race
+ * where `/provider` writes `{provider: openai, model: gpt-5.4}` to
+ * agent_settings.json BEFORE the service restart completes (~2.5s
+ * window); without scoping, the still-running Claude adapter would pick
+ * up `gpt-5.4` and try to call Anthropic with an OpenAI model ID,
+ * causing immediate API failures for any message in that window.
+ *
+ * Falls back to the module-level MODEL if:
+ *   - agent_settings.json doesn't exist
+ *   - it can't be parsed
+ *   - `model` field is missing / non-string / blank
+ *   - overlay.provider is set AND differs from the startup PROVIDER
+ *     (provider switch is pending; old adapter can't use new model)
+ */
+function resolveActiveModel() {
+    try {
+        const settingsPath = path.join(workDir, 'agent_settings.json');
+        if (fs.existsSync(settingsPath)) {
+            const s = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+            // Overlay is stale while a /provider restart is pending.
+            const overlayProvider = typeof s.provider === 'string' ? s.provider.trim() : '';
+            if (overlayProvider && overlayProvider !== PROVIDER) {
+                return MODEL;
+            }
+            const m = typeof s.model === 'string' ? s.model.trim() : '';
+            if (m) return m;
+        }
+    } catch (_) {}
+    return MODEL;
+}
+
 let BRIDGE_TOKEN = normalizeSecret(config.bridgeToken || '');
 const USER_AGENT = 'SeekerClaw/1.0 (Android; +https://seekerclaw.com)';
 
@@ -284,6 +342,7 @@ if (!_activeKey) {
     const keyName = PROVIDER === 'openai' ? 'openaiApiKey or openaiOAuthToken'
         : PROVIDER === 'openrouter' ? 'openrouterApiKey'
         : PROVIDER === 'custom' ? 'customApiKey'
+        : AUTH_TYPE === 'setup_token' ? 'setupToken'
         : 'anthropicApiKey';
     log(`ERROR: Missing required config (${keyName}) for provider "${PROVIDER}"`, 'ERROR');
     process.exit(1);
@@ -598,6 +657,7 @@ module.exports = {
     OPENROUTER_FALLBACK_CONTEXT,
     AUTH_TYPE,
     MODEL,
+    resolveActiveModel,
     AGENT_NAME,
     BRIDGE_TOKEN,
     USER_AGENT,

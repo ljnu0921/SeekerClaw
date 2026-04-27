@@ -1,6 +1,8 @@
 package com.seekerclaw.app.bridge
 
 import android.Manifest
+import android.app.AlarmManager
+import android.app.PendingIntent
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -21,6 +23,7 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import com.seekerclaw.app.camera.CameraCaptureActivity
 import com.seekerclaw.app.config.ConfigManager
+import com.seekerclaw.app.service.OpenClawService
 import com.seekerclaw.app.util.Analytics
 import com.seekerclaw.app.util.ServiceState
 import fi.iki.elonen.NanoHTTPD
@@ -44,6 +47,13 @@ class AndroidBridge(
     companion object {
         private const val TAG = "AndroidBridge"
         private const val AUTH_HEADER = "X-Bridge-Token"
+        // Delay between returning HTTP 200 and stopping the service — gives the
+        // Node caller (and its Telegram reply) time to flush.
+        private const val RESTART_DELAY_MS = 500L
+        // Delay from stopService to the AlarmManager-scheduled fresh start.
+        // Long enough for onDestroy cleanup + process death + OS reclaim.
+        private const val SERVICE_RESTART_DELAY_MS = 2_000L
+        private const val SERVICE_RESTART_REQUEST_CODE = 1001
     }
 
     private var tts: TextToSpeech? = null
@@ -59,6 +69,12 @@ class AndroidBridge(
         "/contacts/add" to Pair(10, 60_000L),
         "/location" to Pair(10, 60_000L),
         "/openai/oauth/save-tokens" to Pair(5, 60_000L),
+        // /config/credentials loads AppConfig (Keystore decrypt +
+        // agent_settings reconciliation) on every call — rate-limit so
+        // a misbehaving Node caller can't spin it. 10/min is ample for
+        // normal /provider interactive use.
+        "/config/credentials" to Pair(10, 60_000L),
+        "/service/restart" to Pair(3, 60_000L),
     )
 
     @Synchronized
@@ -145,6 +161,8 @@ class AndroidBridge(
                 "/solana/send" -> handleSolanaSend(params)
                 "/config/save-owner" -> handleConfigSaveOwner(params)
                 "/openai/oauth/save-tokens" -> handleOpenAIOAuthSaveTokens(params)
+                "/config/credentials" -> handleConfigCredentials()
+                "/service/restart" -> handleServiceRestart()
                 "/stats/db-summary" -> proxyToNodeStats()
                 "/ping" -> jsonResponse(200, mapOf("status" to "ok", "bridge" to "AndroidBridge"))
                 else -> jsonResponse(404, mapOf("error" to "Unknown endpoint: $uri"))
@@ -153,6 +171,117 @@ class AndroidBridge(
             Log.e(TAG, "Error handling $uri", e)
             jsonResponse(500, mapOf("error" to e.message))
         }
+    }
+
+    // ==================== Config credentials ====================
+
+    /**
+     * Returns credential PRESENCE (not values) for every provider auth
+     * mode that /provider credential-gating cares about. Used by the
+     * Node /provider handler so switching decisions reflect the
+     * runtime Kotlin SharedPreferences (which gets updated on
+     * Settings saves, OAuth token saves, etc.) rather than the stale
+     * workspace/config.json snapshot that Node loaded at startup.
+     *
+     * Security: credential VALUES never leave Kotlin — every field
+     * is returned as a short placeholder ("•") when set and "" when
+     * unset, so Node's `nonBlank` credential-gating checks work
+     * unchanged without exposing secrets across the bridge.
+     *
+     * customBaseUrl is returned the same way. Even though it's a URL
+     * rather than a direct secret, URLs can legally embed credentials
+     * (https://user:pass@host) or tokens in query params (?token=…),
+     * so returning verbatim would risk accidental secret exposure to
+     * Node's logs / bridge caller. Presence is all Node's gating
+     * needs for the "is custom provider configured" check — the real
+     * URL is read from config.json at service start when Node
+     * actually needs to route requests.
+     */
+    private fun handleConfigCredentials(): Response {
+        val config = ConfigManager.loadConfig(context)
+        if (config == null) {
+            return jsonResponse(200, mapOf("ok" to true, "credentials" to emptyMap<String, String>()))
+        }
+        val placeholder = "•" // • — any non-blank string; values never leak.
+        val creds = mapOf(
+            "anthropicApiKey" to if (config.anthropicApiKey.isNotBlank()) placeholder else "",
+            "setupToken" to if (config.setupToken.isNotBlank()) placeholder else "",
+            "openaiApiKey" to if (config.openaiApiKey.isNotBlank()) placeholder else "",
+            "openaiOAuthToken" to if (config.openaiOAuthToken.isNotBlank()) placeholder else "",
+            "openrouterApiKey" to if (config.openrouterApiKey.isNotBlank()) placeholder else "",
+            "customApiKey" to if (config.customApiKey.isNotBlank()) placeholder else "",
+            "customBaseUrl" to if (config.customBaseUrl.isNotBlank()) placeholder else "",
+        )
+        return jsonResponse(200, mapOf("ok" to true, "credentials" to creds))
+    }
+
+    // ==================== Service restart ====================
+
+    /**
+     * Cleanly stops the :node service and schedules a fresh start 2s later.
+     *
+     * Used by the /provider Telegram slash command — changing provider or
+     * auth type requires re-initializing provider-specific module state
+     * (adapter selection, endpoint, auth headers) which are set at startup
+     * from module-level consts in config.js.
+     *
+     * Why the two-step dance:
+     *   1. stopService triggers OpenClawService.onDestroy() which runs the
+     *      full shutdown sequence (Watchdog.stop, NodeBridge.stop, wake-lock
+     *      release, crash-counter reset, and killProcess at the end). That's
+     *      much cleaner than raw Process.killProcess from the bridge, which
+     *      skipped all of it — notably the crash-counter reset, so rapid
+     *      back-to-back /provider switches could hit the 3-restarts-in-30s
+     *      crash-loop protection and stop the service entirely.
+     *   2. stopService is an EXPLICIT stop, so START_STICKY won't auto-
+     *      respawn. AlarmManager schedules a fresh startForegroundService
+     *      2s later — that's durable across :node process death (unlike a
+     *      postDelayed on a :node handler, which dies with the process).
+     *
+     * The initial RESTART_DELAY_MS gives the HTTP response (and the Node
+     * Telegram reply that triggered this) time to flush before onDestroy
+     * closes the bridge.
+     */
+    private fun handleServiceRestart(): Response {
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            try {
+                Log.i(TAG, "[Bridge] /service/restart — scheduling clean restart")
+                scheduleServiceRestart(SERVICE_RESTART_DELAY_MS)
+                // OpenClawService.stop() is the canonical shutdown path: it
+                // clears any pending restart callbacks on the companion
+                // Handler (so a stale restart scheduled elsewhere can't race
+                // our AlarmManager one), updates ServiceState, and then
+                // delegates to stopService() which triggers onDestroy →
+                // full cleanup → Process.killProcess at the end.
+                OpenClawService.stop(context)
+            } catch (e: Exception) {
+                Log.e(TAG, "[Bridge] /service/restart failed: ${e.message}", e)
+            }
+        }, RESTART_DELAY_MS)
+        return jsonResponse(
+            200,
+            mapOf("status" to "restarting", "delayMs" to RESTART_DELAY_MS + SERVICE_RESTART_DELAY_MS)
+        )
+    }
+
+    private fun scheduleServiceRestart(delayMs: Long) {
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val intent = Intent(context, OpenClawService::class.java)
+        val pendingIntent = PendingIntent.getForegroundService(
+            context,
+            SERVICE_RESTART_REQUEST_CODE,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        // setAndAllowWhileIdle: inexact (±few seconds) but doesn't require
+        // the SCHEDULE_EXACT_ALARM permission (gated on Android 12+). A
+        // /provider-initiated restart is user-facing but not latency-
+        // critical; "about 2 seconds" is acceptable UX.
+        alarmManager.setAndAllowWhileIdle(
+            AlarmManager.ELAPSED_REALTIME_WAKEUP,
+            android.os.SystemClock.elapsedRealtime() + delayMs,
+            pendingIntent,
+        )
     }
 
     // ==================== Battery ====================

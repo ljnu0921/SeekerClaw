@@ -2,6 +2,7 @@ package com.seekerclaw.app.config
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -88,8 +89,37 @@ data class McpServerConfig(
 )
 
 object ConfigManager {
-    /** Incremented on every saveConfig(); observe in `remember(configVersion)`. */
+    /** Incremented on every saveConfig(); observe in `remember(configVersion)`.
+     *
+     *  Per-process Compose state. The :node service process and the main UI
+     *  process each have their OWN copy of this counter. To bridge changes
+     *  across processes, saveConfig and reconcileWithAgentSettings emit
+     *  ACTION_CONFIG_CHANGED broadcasts after their writes; a receiver in
+     *  SeekerClawApplication (main process only) bumps this value on
+     *  receipt so UI screens recompose when the :node process writes prefs
+     *  (e.g., during a /provider Telegram switch's service-start reconcile).
+     */
     val configVersion = mutableIntStateOf(0)
+
+    /** Sent after any change to canonical SharedPreferences config state.
+     *  Receiver in SeekerClawApplication bumps configVersion in the main
+     *  process so UI screens auto-refresh after writes from the :node
+     *  service process. Same-process saves bump configVersion directly
+     *  AND fire this broadcast — the redundant bump is harmless and the
+     *  alternative (suppress same-process broadcasts) requires fragile
+     *  process detection. */
+    const val ACTION_CONFIG_CHANGED = "com.seekerclaw.app.action.CONFIG_CHANGED"
+
+    private fun broadcastConfigChanged(context: Context) {
+        try {
+            val intent = Intent(ACTION_CONFIG_CHANGED).setPackage(context.packageName)
+            context.sendBroadcast(intent)
+        } catch (e: Exception) {
+            // Non-fatal — main process UI just won't auto-refresh until
+            // user navigates away and back. Log and continue.
+            LogCollector.append("[Config] broadcastConfigChanged failed: ${e.message}", LogLevel.WARN)
+        }
+    }
 
     private const val PREFS_NAME = "seekerclaw_prefs"
     private const val KEY_API_KEY_ENC = "api_key_enc"
@@ -331,6 +361,25 @@ object ConfigManager {
         val persisted = editor.commit()
         if (persisted) {
             configVersion.intValue++
+            // Keep agent_settings.json overlay in sync with prefs we just
+            // wrote. Without this, prior `/provider` Telegram commands leave
+            // a stale provider/authType/model in the overlay; the next
+            // loadConfig's reconcileWithAgentSettings sees overlay≠prefs
+            // and adopts the STALE overlay back into prefs — silently
+            // reverting whatever Settings UI / Setup / OAuth flow just
+            // saved. By syncing here, the overlay is only "ahead" of
+            // prefs when the legitimate /provider Telegram flow wrote
+            // overlay without touching prefs (which is exactly when the
+            // reconcile is supposed to fire). Pass `configOverride=config`
+            // so writeAgentSettingsJson skips its own loadConfig
+            // round-trip (which would re-trigger the reconcile we're
+            // trying to keep idle). See PR #339 device-test regression.
+            writeAgentSettingsJson(context, configOverride = config)
+            // Notify the OTHER process — main-process UI relies on this
+            // to refresh after :node-process writes (e.g. /provider
+            // Telegram switch's service-start reconcile). Same-process
+            // observers already saw the configVersion bump above.
+            broadcastConfigChanged(context)
         } else {
             LogCollector.append("[Config] Failed to persist config (commit=false)", LogLevel.ERROR)
         }
@@ -543,7 +592,7 @@ object ConfigManager {
             ""
         }
 
-        return AppConfig(
+        val fromPrefs = AppConfig(
             anthropicApiKey = apiKey,
             setupToken = setupToken,
             authType = resolveAuthType(p),
@@ -580,6 +629,222 @@ object ConfigManager {
             openaiOAuthEmail = openaiOAuthEmail,
             openaiOAuthExpiresAt = p.getString(KEY_OPENAI_OAUTH_EXPIRES_AT, "") ?: "",
         )
+
+        // Reconcile with agent_settings.json so TG-initiated changes (via
+        // `/model` and `/provider` slash commands) survive a service
+        // restart. Node writes provider/authType/model directly to this
+        // file; we adopt them here and mirror back to SharedPreferences so
+        // the next loadConfig reads a consistent state.
+        return reconcileWithAgentSettings(context, p, fromPrefs)
+    }
+
+    private fun reconcileWithAgentSettings(
+        context: Context,
+        prefs: android.content.SharedPreferences,
+        fromPrefs: AppConfig,
+    ): AppConfig {
+        val settingsFile = File(File(context.filesDir, "workspace"), "agent_settings.json")
+        if (!settingsFile.exists()) return fromPrefs
+        val json = try {
+            JSONObject(settingsFile.readText())
+        } catch (e: Exception) {
+            LogCollector.append("[Config] agent_settings.json unreadable (${e.message}) — skipping reconciliation", LogLevel.WARN)
+            return fromPrefs
+        }
+
+        // Use opt() + cast rather than optString() — optString() coerces
+        // non-string JSON values (numbers, booleans, nested objects) into
+        // strings via .toString(), which would silently adopt a corrupted
+        // or tampered agent_settings.json value into SharedPreferences.
+        // Reject non-String values up front.
+        fun stringField(key: String): String? {
+            val raw = json.opt(key) ?: return null
+            val v = (raw as? String)?.trim() ?: return null
+            return if (v.isBlank()) null else v
+        }
+
+        val newProvider = stringField("provider")
+        val newAuthType = stringField("authType")
+        val newModel = stringField("model")
+
+        // No overlay fields present — nothing to reconcile
+        if (newProvider == null && newAuthType == null && newModel == null) return fromPrefs
+
+        // Ignore unrecognized providers (defensive — don't corrupt prefs from a bad write).
+        // Derive from the Providers.kt registry so adding a provider there doesn't
+        // require updating this allowlist (which would silently drop TG-initiated
+        // settings for the new provider until this list was updated).
+        val validProviders = availableProviders.map { it.id }.toSet()
+        val validProvider = newProvider?.takeIf { it in validProviders }
+        // If provider is present but invalid, reject the WHOLE overlay — don't adopt
+        // authType/model scoped to a bogus provider either.
+        if (newProvider != null && validProvider == null) {
+            LogCollector.append(
+                "[Config] agent_settings.json has unrecognized provider='$newProvider' — ignoring overlay",
+                LogLevel.WARN
+            )
+            return fromPrefs
+        }
+
+        // Validate authType against the effective provider (existing or new).
+        // OpenAI supports api_key|oauth; others support api_key|setup_token (Claude) or api_key.
+        val effectiveProvider = validProvider ?: fromPrefs.provider
+        val allowedAuthTypes = when (effectiveProvider) {
+            "openai" -> setOf("api_key", "oauth")
+            "claude" -> setOf("api_key", "setup_token")
+            else -> setOf("api_key")
+        }
+        val validAuthType = newAuthType?.takeIf { it in allowedAuthTypes }
+        if (newAuthType != null && validAuthType == null) {
+            LogCollector.append(
+                "[Config] agent_settings.json has invalid authType='$newAuthType' for provider='$effectiveProvider' — ignoring overlay",
+                LogLevel.WARN
+            )
+            return fromPrefs
+        }
+
+        // If the overlay changes provider but omits authType, the old prefs
+        // authType may not be valid for the new provider (e.g. provider=openai
+        // + authType=setup_token would crash Node startup validation and
+        // trigger the crash-loop protection). /provider always writes
+        // authType alongside provider, so this path is only reachable via
+        // a tampered/partial agent_settings.json — reject defensively.
+        val providerChangingWithoutAuth =
+            validProvider != null &&
+            validProvider != fromPrefs.provider &&
+            validAuthType == null &&
+            fromPrefs.authType !in allowedAuthTypes
+        if (providerChangingWithoutAuth) {
+            LogCollector.append(
+                "[Config] agent_settings.json changes provider to '$validProvider' but omits authType; " +
+                    "current prefs authType='${fromPrefs.authType}' is not valid for the new provider — ignoring overlay",
+                LogLevel.WARN
+            )
+            return fromPrefs
+        }
+
+        val providerChanged = validProvider != null && validProvider != fromPrefs.provider
+        val authChanged = validAuthType != null && validAuthType != fromPrefs.authType
+        // Decide the effective model. If the overlay supplies one, use it.
+        // Otherwise, if we're switching provider, the existing prefs.model
+        // is likely INVALID for the new provider (e.g. /provider openai
+        // while prefs.model is 'claude-opus-4-7' → OpenAI endpoint would
+        // reject the request). Validate and fall back to the new
+        // provider's safe default when the old model isn't usable.
+        val effectiveProviderAfter = validProvider ?: fromPrefs.provider
+        val effectiveAuthAfter = validAuthType ?: fromPrefs.authType
+        // Unified validation for both overlay and prefs paths: any candidate
+        // model must be valid for the EFFECTIVE new provider+auth pair,
+        // else substitute the provider's safe default. For freeform
+        // providers (openrouter/custom), any non-blank string is "valid"
+        // — the user's prior model carries forward, possibly wrong for
+        // their endpoint but keeps Node alive (a /model <id> can fix it).
+        // For custom specifically, defaultModelForProvider returns ''; if
+        // the candidate is also blank, we return blank and Node startup
+        // will exit with a clear error. In practice prefs.model is never
+        // blank after a successful Setup flow, so this edge case is
+        // unreachable for normal users.
+        //
+        // Auth changes matter too: OpenAI's oauth model list includes
+        // gpt-5.4-mini but the api_key list doesn't, so switching oauth→
+        // api_key on OpenAI must revalidate prefs.model against the new
+        // auth mode's allowlist even when provider stays the same.
+        val resolvedModel: String = when {
+            newModel != null -> {
+                // Overlay model present — validate; substitute default if invalid.
+                if (isModelValidForProvider(effectiveProviderAfter, effectiveAuthAfter, newModel)) {
+                    newModel
+                } else {
+                    val providerDefault = defaultModelForProvider(effectiveProviderAfter, effectiveAuthAfter)
+                    if (providerDefault.isNotBlank()) providerDefault else newModel
+                }
+            }
+            providerChanged || authChanged -> {
+                // No overlay model but provider or auth changed — validate
+                // prefs.model against the NEW effective provider+auth.
+                if (isModelValidForProvider(effectiveProviderAfter, effectiveAuthAfter, fromPrefs.model)) {
+                    fromPrefs.model
+                } else {
+                    val providerDefault = defaultModelForProvider(effectiveProviderAfter, effectiveAuthAfter)
+                    if (providerDefault.isNotBlank()) providerDefault else fromPrefs.model
+                }
+            }
+            else -> fromPrefs.model
+        }
+        val modelChanged = resolvedModel != fromPrefs.model
+
+        if (!providerChanged && !authChanged && !modelChanged) return fromPrefs
+
+        val editor = prefs.edit()
+        if (providerChanged) editor.putString(KEY_PROVIDER, validProvider)
+        if (authChanged) editor.putString(KEY_AUTH_TYPE, validAuthType)
+        if (modelChanged) editor.putString(KEY_MODEL, resolvedModel)
+        // commit() not apply(): the broadcast below races the async disk
+        // flush of apply(). Main process receives the broadcast → bumps
+        // configVersion → Compose recomposes screens that re-read
+        // prefs via loadConfig — but if the apply() write hasn't flushed
+        // yet, loadConfig sees STALE values and the UI displays the OLD
+        // provider/authType/model instead of the just-reconciled new
+        // ones. commit() is synchronous: blocks until disk write
+        // completes, so the broadcast can't outrun the data. Same
+        // class of bug as 76041c1 (apply→commit before killProcess in
+        // onDestroy); same fix.
+        editor.commit()
+
+        // Bump same-process configVersion so any in-process UI observer
+        // recomposes. /provider Telegram → :node service-start reconcile
+        // is the canonical path here, where :node's ConfigManager.
+        // configVersion bumps but main-process UI needs the broadcast
+        // below to know.
+        configVersion.intValue++
+        broadcastConfigChanged(context)
+
+        LogCollector.append(
+            "[Config] Reconciled from agent_settings.json: " +
+                "provider=${if (providerChanged) "$validProvider (was ${fromPrefs.provider})" else fromPrefs.provider}, " +
+                "authType=${if (authChanged) "$validAuthType (was ${fromPrefs.authType})" else fromPrefs.authType}, " +
+                "model=${if (modelChanged) "$resolvedModel (was ${fromPrefs.model})" else fromPrefs.model}"
+        )
+
+        return fromPrefs.copy(
+            provider = if (providerChanged) validProvider!! else fromPrefs.provider,
+            authType = if (authChanged) validAuthType!! else fromPrefs.authType,
+            model = if (modelChanged) resolvedModel else fromPrefs.model,
+        )
+    }
+
+    /**
+     * Check whether a given model ID is valid for a provider+auth pair.
+     *
+     * For Claude/OpenAI, the allowlist from Providers.kt applies strictly.
+     * For OpenRouter/custom, any non-blank string is accepted (both
+     * providers are freeform — the user types the upstream model ID).
+     * Blank always returns false.
+     *
+     * Trims modelId before blank-check and allowlist comparison. The
+     * Settings UI and Node's overlay resolver both trim on read/write
+     * (see ProviderConfigScreen.persistCustomModelAndClose and
+     * config.js:resolveActiveModel), so a legacy prefs value with
+     * surrounding whitespace would otherwise be incorrectly rejected
+     * during reconciliation and silently overwritten with the provider
+     * default.
+     */
+    private fun isModelValidForProvider(
+        providerId: String,
+        authType: String,
+        modelId: String,
+    ): Boolean {
+        val trimmed = modelId.trim()
+        if (trimmed.isBlank()) return false
+        return when (providerId) {
+            "openrouter", "custom" -> true
+            else -> {
+                val list = try {
+                    modelsForProvider(providerId, authType)
+                } catch (_: Exception) { emptyList() }
+                list.any { it.id == trimmed }
+            }
+        }
     }
 
     fun getAutoStartOnBoot(context: Context): Boolean =
@@ -707,8 +972,11 @@ object ConfigManager {
             "openaiOAuthExpiresAt" -> config.copy(openaiOAuthExpiresAt = value)
             else -> return
         }
+        // saveConfig now syncs the agent_settings.json overlay
+        // automatically (writes prefs + overlay atomically), so the
+        // separate writeAgentSettingsJson call previously here is no
+        // longer needed. See saveConfig for the architectural fix.
         saveConfig(context, updated)
-        writeAgentSettingsJson(context)
     }
 
     fun saveOwnerId(context: Context, ownerId: String): Boolean {
@@ -811,7 +1079,14 @@ object ConfigManager {
         val json = JSONObject().apply {
             put("botToken", config.telegramBotToken)
             put("ownerId", config.telegramOwnerId)
-            put("anthropicApiKey", if (config.provider in listOf("openai", "openrouter", "custom")) "" else config.activeCredential)
+            // Write Claude credentials as separate raw fields regardless of active
+            // provider so Node's /provider credential-gating (model-catalog.hasCredentialsFor)
+            // can accurately answer "does the user have credentials for claude api_key
+            // AND/OR claude setup_token?" before we commit to a restart. Node derives
+            // its runtime ANTHROPIC_KEY from (authType==setup_token ? setupToken : anthropicApiKey)
+            // at config-load time, so the activeCredential logic lives in Node now.
+            put("anthropicApiKey", config.anthropicApiKey)
+            if (config.setupToken.isNotBlank()) put("setupToken", config.setupToken)
             // For OpenAI: if user has selected oauth but hasn't completed sign-in (token
             // is blank), write api_key to the workspace JSON so Node's strict validation
             // doesn't crash on startup. The UI keeps the user's intended "oauth" choice
@@ -885,8 +1160,21 @@ object ConfigManager {
         File(workspaceDir, "config.json").writeText(json.toString(2))
     }
 
-    fun writeAgentSettingsJson(context: Context) {
-        val config = loadConfig(context)
+    /**
+     * Write the Android-managed slice of agent_settings.json (the file Node
+     * reads for live-pickup of model + heartbeat + maxSteps).
+     *
+     * @param configOverride if non-null, write THESE values to the overlay
+     *   without going through loadConfig. Used by saveField (Settings UI)
+     *   so the just-saved AppConfig lands directly in the overlay,
+     *   bypassing reconcileWithAgentSettings — otherwise the reconcile
+     *   would see the stale overlay (from a prior /provider command)
+     *   and revert prefs back to the overlay's value, undoing the
+     *   Settings UI save. Service-start callers omit this param to get
+     *   the default reconcile-then-publish behavior.
+     */
+    fun writeAgentSettingsJson(context: Context, configOverride: AppConfig? = null) {
+        val config = configOverride ?: loadConfig(context)
         if (config == null) {
             LogCollector.append("[Config] writeAgentSettingsJson: loadConfig returned null; skipping write", LogLevel.WARN)
             return
@@ -900,9 +1188,15 @@ object ConfigManager {
             } else {
                 JSONObject()
             }
-            // Android-managed fields always overwrite
+            // Android-managed fields always overwrite. The provider/authType/model
+            // triple is included so Node-initiated changes (via /model or /provider
+            // Telegram commands) have a single consistent source of truth, and a
+            // Settings UI save here publishes the canonical values.
             existing.put("heartbeatIntervalMinutes", config.heartbeatIntervalMinutes)
             existing.put("maxStepsPerTurn", config.maxStepsPerTurn)
+            existing.put("provider", config.provider)
+            existing.put("authType", config.authType)
+            existing.put("model", config.model)
             // Ensure apiKeys object exists (agent writes individual keys into it)
             if (!existing.has("apiKeys")) {
                 existing.put("apiKeys", JSONObject())

@@ -3,11 +3,26 @@
 // Uses init() dependency injection — all external dependencies received via init(deps).
 
 const fs = require('fs');
-const { CHANNEL } = require('./config');
+const path = require('path');
+const { CHANNEL, workDir, PROVIDER, AUTH_TYPE, OPENAI_AUTH_TYPE, resolveActiveModel, config: _config } = require('./config');
 const { stripSilentReply, containsSilentReply } = require('./silent-reply');
+const modelCatalog = require('./model-catalog');
+const { buildHelpLines } = require('./telegram-commands');
 
 let deps = {};
 let initialized = false;
+
+// Set when /provider triggers a service restart. Stays true for the ~2.5s
+// window between bridge call and process death — during that window any
+// interaction with /model or /provider would be unsafe:
+//   - resolveActiveProviderState shows the overlay's NEW provider while the
+//     running adapter is still the OLD one, so /model display is misleading
+//     (Copilot round 12 concern #1).
+//   - /model <id> writes overlay.model that'll be applied post-restart with
+//     the NEW provider; user could accept a model valid for the OLD provider
+//     but not the new one, corrupting post-restart state.
+// Naturally reset on process death (new process, fresh flag).
+let _restartPending = false;
 
 function init(d) {
     deps = d;
@@ -22,7 +37,7 @@ function assertInit() {
 // COMMAND HANDLERS
 // ============================================================================
 
-async function handleCommand(chatId, command, args) {
+async function handleCommand(chatId, command, args, messageId = null) {
     assertInit();
     switch (command) {
         case '/start': {
@@ -58,23 +73,11 @@ Send me anything to get started!`;
 
         case '/help':
         case '/commands': {
+            // Body lines come from the central registry in telegram-commands.js
+            // so the same list drives setMyCommands + /help + drift-guard tests.
             const skillCount = deps.loadSkills().length;
-            return `**Commands**
-
-/quick — one-tap preset actions
-/status — bot status, uptime, model
-/new — archive session & start fresh
-/reset — wipe conversation (no backup)
-/resume — continue an interrupted task
-/skill — list skills (or \`/skill name\` to run one)
-/soul — view SOUL.md
-/memory — view MEMORY.md
-/logs — last 10 log entries
-/version — app & runtime versions
-/approve — confirm pending action
-/deny — reject pending action
-
-*${skillCount} skill${skillCount !== 1 ? 's' : ''} installed · /help to see this again*`;
+            const body = buildHelpLines().join('\n');
+            return `**Commands**\n\n${body}\n\n*${skillCount} skill${skillCount !== 1 ? 's' : ''} installed · /help to see this again*`;
         }
 
         case '/quick': {
@@ -116,7 +119,7 @@ Send me anything to get started!`;
 ⏱️ Uptime: ${uptimeFormatted}
 💬 Messages: ${todayCount} today (${totalCount} in conversation)
 🧠 Memory: ${memoryFileCount} files
-📊 Model: \`${deps.MODEL}\`
+📊 Model: \`${resolveActiveModel()}\`
 🧩 Skills: ${skillCount}
 💾 RAM: ${heapMB} MB heap / ${rssMB} MB RSS`;
         }
@@ -222,7 +225,7 @@ Use YAML frontmatter with \`name\`, \`description\`, and \`triggers\` fields.`;
             return `**SeekerClaw**
 Agent: \`${deps.AGENT_NAME}\`
 Package: \`${pkgVersion}\`
-Model: \`${deps.MODEL}\`
+Model: \`${resolveActiveModel()}\`
 Node.js: \`${nodeVer}\`
 Platform: \`${platform}\``;
         }
@@ -364,9 +367,410 @@ Platform: \`${platform}\``;
             return { __resumeFallthrough: true, originalGoal: full.originalGoal || null };
         }
 
+        case '/model': {
+            return await handleModelCommand(chatId, args);
+        }
+
+        case '/provider': {
+            return await handleProviderCommand(chatId, args, messageId);
+        }
+
         default:
             return null; // Not a command — falls through to agent
     }
+}
+
+// ============================================================================
+// AGENT_SETTINGS PATCHING — used by /model and /provider to persist
+// TG-initiated changes. Node reads `model` live from this file on every
+// chat() call (see ai.js activeModel resolver). On service restart,
+// Kotlin's ConfigManager.loadConfig() reconciles these fields into
+// SharedPreferences so they survive battery death / app kill.
+// ============================================================================
+
+function writeAgentSettingsPatch(patch) {
+    const settingsPath = path.join(workDir, 'agent_settings.json');
+    let current = {};
+    try {
+        if (fs.existsSync(settingsPath)) {
+            const raw = fs.readFileSync(settingsPath, 'utf8');
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                current = parsed;
+            }
+        }
+    } catch (e) {
+        deps.log(`[AgentSettings] existing file unreadable (${e.message}) — starting from {}`, 'WARN');
+        current = {};
+    }
+    // `undefined` means "remove this key" (for revert paths). Any other
+    // value (including null, 0, '', false) is written as-is.
+    const merged = { ...current };
+    for (const [k, v] of Object.entries(patch)) {
+        if (v === undefined) delete merged[k];
+        else merged[k] = v;
+    }
+    const tmp = settingsPath + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf8');
+    fs.renameSync(tmp, settingsPath);
+}
+
+// Fetch current credential presence from Kotlin via the bridge. Used by
+// /provider credential gating so switching decisions reflect runtime
+// SharedPreferences (updated on Settings saves + OAuth token saves)
+// rather than the workspace/config.json snapshot Node loaded at startup.
+// Without this, /provider openai oauth would reject immediately after a
+// user completed OAuth sign-in (token in SharedPrefs but not yet in
+// config.json — writeConfigJson only runs at service start).
+// Kotlin returns placeholder strings for set fields and "" for unset, so
+// modelCatalog.hasCredentialsFor's nonBlank() checks work unchanged.
+// On bridge failure, falls back to the startup _config snapshot — degraded
+// (same stale behavior as before) but keeps /provider functional.
+async function fetchRuntimeCredentials() {
+    try {
+        const res = await deps.androidBridgeCall('/config/credentials', {}, 3000);
+        if (res && res.ok && res.credentials && typeof res.credentials === 'object') {
+            return res.credentials;
+        }
+        deps.log(`[/provider] bridge /config/credentials returned unexpected shape; using startup config`, 'WARN');
+    } catch (e) {
+        deps.log(`[/provider] bridge /config/credentials failed (${e && e.message}); using startup config`, 'WARN');
+    }
+    return _config;
+}
+
+// Resolve the currently-active provider/authType/model as seen by Node.
+// Prefers agent_settings.json overrides (which reflect in-session TG
+// changes) over the startup-loaded module consts from config.js. Model
+// resolution delegates to config.resolveActiveModel() so this surface
+// and ai.js / tools/session.js / /status / /version all agree.
+function resolveActiveProviderState() {
+    let overlay = {};
+    try {
+        const settingsPath = path.join(workDir, 'agent_settings.json');
+        if (fs.existsSync(settingsPath)) {
+            const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                overlay = parsed;
+            }
+        }
+    } catch (_) { overlay = {}; }
+
+    const nonBlank = (v) => typeof v === 'string' && v.trim().length > 0;
+
+    // Validate overlay values before adopting them. A partial/tampered
+    // agent_settings.json could carry, say, (provider='openai',
+    // authType='bogus') — without this guard, modelsForProvider() would
+    // return [] and /model would treat OpenAI as "freeform" in its
+    // no-args display, which is misleading. Fall through to the startup
+    // consts when the overlay is invalid.
+    const rawOverlayProvider = nonBlank(overlay.provider) ? overlay.provider.trim() : null;
+    const overlayProviderValid = rawOverlayProvider && modelCatalog.KNOWN_PROVIDERS.includes(rawOverlayProvider);
+
+    // Provider-scoping (mirrors resolveActiveModel in config.js): during
+    // the /provider restart window, overlay carries the NEW provider but
+    // the running adapter is still the OLD one. Returning the new
+    // provider from here would make /model display/validate against a
+    // provider we can't talk to yet. In practice /model and /provider
+    // short-circuit on _restartPending so this path is rarely reached,
+    // but keep the same-provider scoping for symmetry and defense in
+    // depth (e.g. a stale overlay left behind by a crashed pre-restart
+    // write).
+    const provider = (overlayProviderValid && rawOverlayProvider === PROVIDER)
+        ? rawOverlayProvider
+        : PROVIDER;
+
+    // authType is NOT live-pickup — OPENAI_AUTH_TYPE / AUTH_TYPE are
+    // module-level consts in config.js, set once from config.json at
+    // Node startup. The overlay in agent_settings.json carries the
+    // user's INTENDED authType (what Kotlin's Settings UI saved), but
+    // Kotlin's writeConfigJson can DOWNGRADE it before Node boots:
+    // e.g. "oauth selected with a blank token" gets written to
+    // config.json as authType=api_key so Node's strict validation
+    // doesn't crash on startup. If we honored overlay.authType here,
+    // /model would display + validate against the oauth allowlist
+    // (includes gpt-5.4-mini) while Node is actually running api_key
+    // mode (doesn't) — users could /model gpt-5.4-mini, see it
+    // accepted, and then every chat request would 422.
+    //
+    // Return the runtime startupAuth instead. Matches what Node
+    // actually sends to the provider API.
+    const startupAuth = provider === 'openai' ? OPENAI_AUTH_TYPE : AUTH_TYPE;
+    const authType = startupAuth;
+
+    return { provider, authType, model: resolveActiveModel() };
+}
+
+// ============================================================================
+// /model HANDLER
+// Shows current model + options (no args), or switches to a new model
+// within the current provider (with arg). Model is live-picked up on
+// the next chat() call — no service restart.
+// ============================================================================
+
+async function handleModelCommand(chatId, args) {
+    if (_restartPending) {
+        return `⏳ Restart in progress — try again in a moment.`;
+    }
+    const state = resolveActiveProviderState();
+    const trimmed = (args || '').trim();
+    const models = modelCatalog.modelsForProvider(state.provider, state.authType);
+    const isFreeform = models.length === 0;
+
+    if (!trimmed) {
+        // No args — show current + options
+        const lines = [`**Current model:** \`${state.model}\``];
+        lines.push(`Provider: \`${state.provider}\`${state.authType ? ` (${state.authType})` : ''}`);
+        lines.push('');
+        if (isFreeform) {
+            lines.push(`\`${state.provider}\` accepts any model ID.`);
+            lines.push(`Usage: \`/model <model-id>\``);
+        } else {
+            lines.push('**Options:**');
+            models.forEach((m) => {
+                const marker = m.id === state.model ? '  ← current' : '';
+                lines.push(`• \`${m.id}\` — ${m.displayName}${marker}`);
+            });
+            lines.push('');
+            lines.push('Usage: `/model <model-id>`');
+        }
+        return lines.join('\n');
+    }
+
+    const v = modelCatalog.validateModelForProvider(state.provider, state.authType, trimmed);
+    if (!v.ok) {
+        const optLine = (v.options && v.options.length)
+            ? `\n\nOptions: ${v.options.map((o) => '`' + o + '`').join(', ')}`
+            : '';
+        return `❌ ${v.reason}${optLine}`;
+    }
+
+    try {
+        writeAgentSettingsPatch({ model: v.model });
+    } catch (e) {
+        deps.log(`[/model] Failed to write agent_settings.json: ${e.message}`, 'ERROR');
+        return `❌ Couldn't save — ${e.message}`;
+    }
+    deps.log(`[/model] Switched to ${v.model} (provider=${state.provider}, auth=${state.authType})`, 'INFO');
+    return `✓ Switched to \`${v.model}\`. Takes effect on your next message.`;
+}
+
+// ============================================================================
+// /provider HANDLER
+// Shows current provider + options (no args), or switches to a new
+// provider+auth (with args). Requires a service restart — provider
+// adapter, endpoint, and auth headers are set at Node startup from
+// module-level consts. Rejects if credentials aren't configured.
+// ============================================================================
+
+async function handleProviderCommand(chatId, args, messageId = null) {
+    if (_restartPending) {
+        return `⏳ Restart in progress — try again in a moment.`;
+    }
+    const state = resolveActiveProviderState();
+    const parts = (args || '').trim().split(/\s+/).filter(Boolean);
+
+    if (parts.length === 0) {
+        const lines = [
+            `**Current:** \`${state.provider}\`${state.authType ? ` (${state.authType})` : ''}`,
+            `Model: \`${state.model}\``,
+            '',
+            '**Providers:**',
+        ];
+        modelCatalog.KNOWN_PROVIDERS.forEach((p) => {
+            const auths = modelCatalog.authTypesForProvider(p);
+            const authHint = auths.length > 1 ? ` (${auths.join(' | ')})` : '';
+            const marker = p === state.provider ? '  ← current' : '';
+            lines.push(`• \`${p}\`${authHint}${marker}`);
+        });
+        lines.push('');
+        lines.push('Switch: `/provider <id>` or `/provider openai <api_key|oauth>`');
+        lines.push('');
+        lines.push('_Changing provider restarts the agent (~10s)._');
+        return lines.join('\n');
+    }
+
+    const newProvider = parts[0].toLowerCase();
+    if (!modelCatalog.KNOWN_PROVIDERS.includes(newProvider)) {
+        return `❌ Unknown provider: \`${newProvider}\`\n\nOptions: ${modelCatalog.KNOWN_PROVIDERS.map((p) => '`' + p + '`').join(', ')}`;
+    }
+
+    // Fetch runtime credential state from Kotlin BEFORE gating decisions.
+    // _config is the startup snapshot and misses anything saved since
+    // (e.g. OAuth tokens completed mid-session). Fall back to _config on
+    // bridge failure — degraded but /provider still works.
+    const runtimeConfig = await fetchRuntimeCredentials();
+
+    const authTypes = modelCatalog.authTypesForProvider(newProvider);
+    let newAuthType;
+    if (parts[1]) {
+        newAuthType = parts[1].toLowerCase();
+        if (!authTypes.includes(newAuthType)) {
+            return `❌ Invalid auth type for ${newProvider}: \`${newAuthType}\`\n\nOptions: ${authTypes.map((a) => '`' + a + '`').join(', ')}`;
+        }
+    } else if (newProvider === state.provider && authTypes.includes(state.authType)) {
+        // Same-provider re-select — keep current auth
+        newAuthType = state.authType;
+    } else {
+        // Switching providers without explicit auth — pick the first authType
+        // that actually has credentials configured. authTypes[0] alone would
+        // wrongly reject users who only have the non-first option configured
+        // (e.g. /provider openai for an OAuth-only user, or /provider claude
+        // for a setup-token-only user — both get rejected by credential
+        // gating below because the default api_key isn't set). If NONE of
+        // the provider's auth modes have credentials, fall back to
+        // authTypes[0] so the gating below rejects with a clear "no API key"
+        // message rather than us picking silently.
+        const credentialedAuth = authTypes.find((at) =>
+            modelCatalog.hasCredentialsFor(runtimeConfig, newProvider, at).ok
+        );
+        newAuthType = credentialedAuth || authTypes[0];
+    }
+
+    // Credential gating: reject if the user hasn't configured this provider/auth yet.
+    const cred = modelCatalog.hasCredentialsFor(runtimeConfig, newProvider, newAuthType);
+    if (!cred.ok) {
+        return `❌ ${cred.reason}`;
+    }
+
+    const newModel = modelCatalog.defaultModelForProvider(newProvider, newAuthType);
+
+    // Write `model` only when the new provider has a concrete default
+    // (claude/openai/openrouter). For freeform providers (custom) where
+    // defaultModelForProvider returns '' there's no sensible default, so
+    // we intentionally DON'T touch overlay.model — Kotlin's reconcile
+    // validates the effective model (overlay or prefs) against the new
+    // provider's allowlist and substitutes defaultModelForProvider if
+    // invalid. This aligns with Kotlin's preserve-then-validate
+    // semantics rather than diverging: clearing here would just leave
+    // overlay blank while prefs still holds the old model, and Node
+    // startup hard-exits on PROVIDER=custom + blank MODEL — so the
+    // clear-path would crash the service if Kotlin's fallback ever
+    // failed to write a non-blank model to prefs.
+    // Guard: if switching to a provider whose default is blank (custom)
+    // AND there's no currently-effective model to carry forward, the
+    // post-restart Node would hard-exit at startup (config.js rejects
+    // PROVIDER=custom + blank MODEL) — trapping the user with no
+    // working agent to even run /model against. In any healthy setup
+    // state.model is non-blank (Node's own startup rejected blank so
+    // it must have had one), so this fires only for truly degenerate
+    // configurations. Belt-and-suspenders, since the cost of hitting
+    // it is a service crash-loop.
+    if (newProvider === 'custom' && !newModel && !state.model) {
+        return `❌ Cannot switch to \`custom\` — no model configured. Run \`/model <id>\` first, or set a model in Settings > AI Provider > Custom.`;
+    }
+
+    const settingsPatch = {
+        provider: newProvider,
+        authType: newAuthType,
+    };
+    if (newModel) {
+        settingsPatch.model = newModel;
+    }
+
+    // Snapshot pre-patch values of the fields we're about to mutate, so if
+    // the restart bridge call fails we can restore the overlay to what it
+    // was — otherwise the process keeps running on the OLD adapter but with
+    // overlay metadata suggesting the NEW one, leaving the app in a
+    // confusing half-switched state. `undefined` in the revert patch
+    // signals "this key was absent before — delete it" (see
+    // writeAgentSettingsPatch).
+    const prevOverlay = (() => {
+        try {
+            const settingsPath = path.join(workDir, 'agent_settings.json');
+            if (fs.existsSync(settingsPath)) {
+                const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    return parsed;
+                }
+            }
+        } catch (_) {}
+        return {};
+    })();
+    const revertPatch = {};
+    for (const k of Object.keys(settingsPatch)) {
+        revertPatch[k] = Object.prototype.hasOwnProperty.call(prevOverlay, k)
+            ? prevOverlay[k]
+            : undefined;
+    }
+
+    try {
+        writeAgentSettingsPatch(settingsPatch);
+    } catch (e) {
+        deps.log(`[/provider] Failed to write agent_settings.json: ${e.message}`, 'ERROR');
+        return `❌ Couldn't save — ${e.message}`;
+    }
+
+    deps.log(`[/provider] Switching to ${newProvider}/${newAuthType} (model=${newModel}); restart pending`, 'INFO');
+
+    const displayProv = modelCatalog.displayNameForProvider(newProvider);
+    const authSuffix = authTypes.length > 1 ? ` (${newAuthType})` : '';
+    const modelLine = newModel ? `\nModel: \`${newModel}\`` : '';
+    // When defaultModelForProvider returns '' (currently just custom),
+    // we don't write overlay.model in the settingsPatch — Kotlin's
+    // reconcile then preserves prefs.model (non-blank is "valid" for
+    // freeform providers), so Node's post-restart MODEL is typically
+    // a carry-over from the previous provider. That carry-over is
+    // often WRONG for a custom endpoint (e.g. user was on OpenAI
+    // gpt-5.5, switching to a local Ollama instance). Surface the
+    // effective pre-switch model in the reply so the user can catch
+    // mismatches before the first request fails. Only fall back to
+    // the strong "After restart, set a model" hint in the rare case
+    // where there's no model at all (unreachable in normal Setup flow,
+    // but defensive).
+    const modelHint = newModel
+        ? ''
+        : state.model
+            ? `\nCurrent model: \`${state.model}\` — run \`/model <id>\` after restart if it's not valid for your custom endpoint.`
+            : '\nAfter restart, set a model with `/model <id>`.';
+    const reply = `✓ Switching to **${displayProv}**${authSuffix}.${modelLine}${modelHint}\n\nRestarting agent, back in ~10s…`;
+
+    // Flip the restart-pending flag synchronously BEFORE the async cascade
+    // so any /model or /provider command arriving after this point is
+    // denied cleanly (see flag declaration for why).
+    _restartPending = true;
+
+    // Send the TG reply first, THEN trigger the Kotlin service to kill
+    // itself (which Android will respawn with the new config). Doing this
+    // after sendMessage resolves avoids losing the reply if the process
+    // gets killed before Telegram acks. messageId threads the reply to
+    // the originating /provider message for consistent UX with other
+    // command responses (which get replyTo via deps.sendMessage(_, _, messageId)
+    // in the handleMessage dispatcher).
+    deps.sendMessage(chatId, reply, messageId).then(() => {
+        deps.androidBridgeCall('/service/restart', {}, 5000).catch((err) => {
+            _restartPending = false;
+            deps.log(`[/provider] /service/restart bridge call failed: ${err && err.message}`, 'ERROR');
+            // Revert the overlay so the process doesn't keep running with
+            // the OLD adapter while overlay metadata advertises the NEW
+            // one. Without this, `resolveActiveProviderState` (and any
+            // post-failure Kotlin-side reconcile on a manual restart)
+            // would diverge from the actually-active adapter.
+            try {
+                writeAgentSettingsPatch(revertPatch);
+            } catch (e) {
+                deps.log(`[/provider] overlay revert failed (${e && e.message}); agent_settings.json may be half-switched`, 'WARN');
+            }
+            // Restart didn't fire — tell the user so they don't wait
+            // forever for a restart that never happens.
+            deps.sendMessage(
+                chatId,
+                `⚠️ Couldn't trigger the restart automatically. Please restart the SeekerClaw app manually and run \`/provider ${newProvider}\` again to finish switching.`,
+                messageId,
+            ).catch((e) => deps.log(`[/provider] restart-fallback sendMessage failed: ${e && e.message}`, 'WARN'));
+        });
+    }).catch((err) => {
+        _restartPending = false;
+        deps.log(`[/provider] sendMessage failed; skipping restart: ${err && err.message}`, 'ERROR');
+        try {
+            writeAgentSettingsPatch(revertPatch);
+        } catch (e) {
+            deps.log(`[/provider] overlay revert failed (${e && e.message})`, 'WARN');
+        }
+    });
+
+    // We've handled the reply ourselves — tell the dispatcher not to send it again.
+    return { __handled: true };
 }
 
 // ============================================================================
@@ -411,6 +815,23 @@ async function handleMessage(normalized) {
         return;
     }
 
+    // A service restart is imminent (/provider committed, AlarmManager
+    // armed, process death in ~2s). Don't start a chat() turn we can't
+    // finish — tool calls + API requests would get interrupted mid-
+    // flight, potentially leaving the user with a half-written reply
+    // or orphaned tool state. handleCommand paths already gate on
+    // this via the per-command checks; this guard covers all the
+    // non-command chat-triggering paths. Placed AFTER the owner gate
+    // so non-owner users still get silently ignored during the
+    // restart window (consistent with the rest of handleMessage).
+    if (_restartPending) {
+        await deps.sendMessage(chatId,
+            `⏳ Restart in progress — try again in a moment.`,
+            messageId,
+        ).catch((e) => deps.log(`[restart] sendMessage during restart-pending failed: ${e && e.message}`, 'DEBUG'));
+        return;
+    }
+
     // Note: confirmation YES/NO interception is in enqueueMessage() (main.js),
     // not here — must happen BEFORE queuing to prevent deadlock.
 
@@ -431,7 +852,7 @@ async function handleMessage(normalized) {
             const args = argParts.join(' ');
             // Strip @botusername suffix for group chat compatibility (e.g. /status@MyBot → /status)
             const command = commandToken.toLowerCase().replace(/@\w+$/, '');
-            const response = await handleCommand(chatId, command, args);
+            const response = await handleCommand(chatId, command, args, messageId);
             if (response?.__handled) {
                 // Command fully handled (e.g. /quick sent inline keyboard) — stop processing
                 await statusReaction.clear();

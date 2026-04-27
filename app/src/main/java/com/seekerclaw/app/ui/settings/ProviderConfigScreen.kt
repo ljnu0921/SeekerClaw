@@ -563,7 +563,10 @@ fun ProviderConfigScreen(onBack: () -> Unit) {
                 val trimmedModel = orModelValue.trim()
                 val trimmedCtx = orContextValue.trim()
                 if (trimmedModel.isNotEmpty() || !isModel) {
-                    saveField(modelField, trimmedModel, needsRestart = true)
+                    // "model" is live-pickup; "openrouterFallbackModel" still requires a restart
+                    // (it's a module-level config in Node, not re-read per chat).
+                    val modelNeedsRestart = modelField != "model"
+                    saveField(modelField, trimmedModel, needsRestart = modelNeedsRestart)
                 }
                 // Validate + clamp context: empty is OK, otherwise 4096..2000000
                 if (trimmedCtx.isEmpty()) {
@@ -585,7 +588,12 @@ fun ProviderConfigScreen(onBack: () -> Unit) {
     // Model picker dialog — shows models for active provider only (skip for freeform providers)
     if (showModelPicker && modelsForProvider(activeProvider, effectiveAuthType).isNotEmpty()) {
         val models = modelsForProvider(activeProvider, effectiveAuthType)
-        var selectedModel by remember {
+        // Key remember() to (activeProvider, effectiveAuthType) so the picker's
+        // state reinitializes when the active provider or its auth mode changes
+        // while the dialog is in composition. Without the keys, switching
+        // provider/auth with the picker open would leave selectedModel pointing
+        // at a model from the previous provider.
+        var selectedModel by remember(activeProvider, effectiveAuthType) {
             // Preserve the user's current model even when it's not in the known list —
             // otherwise opening the picker would silently overwrite a custom model ID.
             val current = config?.model.orEmpty()
@@ -598,8 +606,56 @@ fun ProviderConfigScreen(onBack: () -> Unit) {
             )
         }
 
+        // Custom-model state hoisted to the picker's outer composable scope so
+        // persistCustomModelAndClose (wired into onDismissRequest / confirmButton /
+        // dismissButton below) can read it. Kotlin captures are by reference,
+        // so the helper reflects the latest typed value at dialog-close time.
+        val isCustomSelected = selectedModel == CUSTOM_MODEL_SENTINEL ||
+            (models.none { it.id == selectedModel } && selectedModel.isNotBlank())
+        // Persist the last-typed custom model per provider so switching to a predefined
+        // model and back doesn't wipe what the user typed. Pattern mirrors
+        // lastAuthType_<provider> / lastModel_<provider>.
+        val customPrefsKey = "lastCustomModel_$activeProvider"
+        // Wrap in remember(context) so getSharedPreferences doesn't run on
+        // every recomposition while the picker is open (cheap, but unnecessary
+        // work on the hot path). Keyed to context — stable for the Activity
+        // lifetime, so the handle is effectively cached once.
+        val localPrefs = remember(context) {
+            context.getSharedPreferences("seekerclaw_prefs", android.content.Context.MODE_PRIVATE)
+        }
+        // Re-read only when the per-provider key changes, not every recomposition.
+        val rememberedCustom = remember(localPrefs, customPrefsKey) {
+            localPrefs.getString(customPrefsKey, null).orEmpty()
+        }
+        // Key to activeProvider so the custom-field state re-reads the correct
+        // per-provider prefs entry when the provider changes mid-dialog.
+        var customModelId by remember(activeProvider) {
+            mutableStateOf(
+                when {
+                    isCustomSelected && selectedModel != CUSTOM_MODEL_SENTINEL -> selectedModel
+                    else -> rememberedCustom
+                }
+            )
+        }
+
+        // Persist the custom field value on dialog close — once, not per keystroke.
+        // Trim before saving so a "  my-model  " doesn't round-trip differently
+        // between UI and Node (Node trims on read). Blank-after-trim clears the
+        // prefs key so the UI can truly reset this state.
+        val persistCustomModelAndClose = {
+            val editor = localPrefs.edit()
+            val trimmedCustom = customModelId.trim()
+            if (trimmedCustom.isNotBlank()) {
+                editor.putString(customPrefsKey, trimmedCustom)
+            } else {
+                editor.remove(customPrefsKey)
+            }
+            editor.apply()
+            showModelPicker = false
+        }
+
         AlertDialog(
-            onDismissRequest = { showModelPicker = false },
+            onDismissRequest = persistCustomModelAndClose,
             title = {
                 Text(
                     "Select Model",
@@ -610,14 +666,6 @@ fun ProviderConfigScreen(onBack: () -> Unit) {
             },
             text = {
                 Column {
-                    // CUSTOM_MODEL_SENTINEL is a sentinel for "user wants to type a model ID" — never display
-                    // it as the model ID itself, and don't treat it as a real selection.
-                    val isCustomSelected = selectedModel == CUSTOM_MODEL_SENTINEL ||
-                        (models.none { it.id == selectedModel } && selectedModel.isNotBlank())
-                    var customModelId by remember {
-                        mutableStateOf(if (isCustomSelected && selectedModel != CUSTOM_MODEL_SENTINEL) selectedModel else "")
-                    }
-
                     models.forEach { model ->
                         Row(
                             modifier = Modifier
@@ -679,6 +727,10 @@ fun ProviderConfigScreen(onBack: () -> Unit) {
                                     customModelId = it
                                     // Update selectedModel even when blank — point at the sentinel
                                     // so canSave (which excludes the sentinel) disables Save.
+                                    // The in-memory `customModelId` persists for the lifetime of
+                                    // the dialog. The SharedPreferences write happens on Save or
+                                    // dialog dismiss (see confirmButton/onDismissRequest) so we
+                                    // don't hit disk on every keystroke.
                                     selectedModel = it.ifBlank { CUSTOM_MODEL_SENTINEL }
                                 },
                                 placeholder = { Text("e.g. gpt-5.4-pro", fontSize = 12.sp) },
@@ -700,13 +752,23 @@ fun ProviderConfigScreen(onBack: () -> Unit) {
                 }
             },
             confirmButton = {
-                val canSave = selectedModel.isNotBlank() && selectedModel != CUSTOM_MODEL_SENTINEL
+                // Trim before checking — a whitespace-only custom input would
+                // otherwise pass isNotBlank() on the pre-trim value and then
+                // save empty after trimming downstream.
+                val trimmedModel = selectedModel.trim()
+                val canSave = trimmedModel.isNotBlank() && trimmedModel != CUSTOM_MODEL_SENTINEL
                 TextButton(
                     onClick = {
                         if (canSave) {
-                            saveField("model", selectedModel, needsRestart = true)
-                            Analytics.modelSelected(selectedModel)
-                            showModelPicker = false
+                            // Model is live-read by Node from agent_settings.json on every
+                            // chat() call — no service restart needed to pick up the change.
+                            // Save the TRIMMED value so stored model IDs are normalized:
+                            // Node trims on read (agent_settings.json resolver), but the
+                            // UI doesn't, so a raw-saved "  gpt-5.4  " would display
+                            // differently in Settings than in /status / /model output.
+                            saveField("model", trimmedModel, needsRestart = false)
+                            Analytics.modelSelected(trimmedModel)
+                            persistCustomModelAndClose()
                         }
                     },
                     enabled = canSave,
@@ -716,7 +778,7 @@ fun ProviderConfigScreen(onBack: () -> Unit) {
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showModelPicker = false }) {
+                TextButton(onClick = persistCustomModelAndClose) {
                     Text("Cancel", fontFamily = RethinkSans, color = SeekerClawColors.TextDim)
                 }
             },
