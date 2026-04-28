@@ -25,6 +25,59 @@ setDb(() => db);
 function getDb() { return db; }
 
 // ============================================================================
+// DIRTY FLAG + DEBOUNCED SAVE (BAT-523, BAT-518 phase 3A)
+// ============================================================================
+//
+// Pre-BAT-523, the DB was saved every 60s via an unconditional periodic
+// timer, regardless of whether anything changed. On an idle agent that's 1,440
+// pointless `db.export() + atomic-rename` cycles per day — wear on flash
+// for no behavioural reason.
+//
+// Now: a single in-memory `dirty` flag is set by every mutation site
+// (markDbDirty), which arms a one-shot setTimeout to fire
+// SAVE_DEBOUNCE_MS after the FIRST mutation in a clean window.
+// Subsequent mutations that arrive while the timer is pending coalesce
+// into the same save — the timer is NOT reset per mutation. This is
+// deliberate: a true trailing debounce (where every mutation pushes the
+// timer back) could be starved indefinitely under continuous writes,
+// breaking the staleness bound. The behaviour we want is bounded-delay
+// coalescing: at most SAVE_DEBOUNCE_MS between any mutation and its
+// disk save, regardless of mutation rate.
+//
+// `saveDatabase({ force: true })` skips both the dirty check and the
+// timer (used by init and graceful shutdown to flush synchronously).
+//
+// Best-effort persistence bound: barring save/I/O failures, any
+// mutation that markDbDirty() is called for is normally persisted to
+// disk within at most SAVE_DEBOUNCE_MS — the same 60s upper bound the
+// pre-BAT-523 setInterval offered. Save failures retry on a
+// SAVE_DEBOUNCE_MS cadence (see the catch block in saveDatabase),
+// except during gracefulShutdown which opts out so dead retries don't
+// fire post-process-exit. Idle periods produce zero writes.
+const SAVE_DEBOUNCE_MS = 60_000;
+let dirty = false;
+let saveTimer = null;
+
+/**
+ * Mark the DB as having unsaved mutations and schedule a debounced save.
+ * No-op if no DB instance is loaded yet (init failed or hasn't run).
+ *
+ * Call this from EVERY db.run() that mutates state (INSERT/UPDATE/DELETE),
+ * either directly at the call site or via a wrapping function that ends
+ * a batch (e.g. saveSession() at the end of its INSERT). Reads
+ * (db.exec SELECT, etc.) must NOT call this.
+ */
+function markDbDirty() {
+    if (!db) return;
+    dirty = true;
+    if (saveTimer) return; // Already scheduled — coalesce.
+    saveTimer = setTimeout(() => {
+        saveTimer = null;
+        saveDatabase();
+    }, SAVE_DEBOUNCE_MS);
+}
+
+// ============================================================================
 // DATABASE INJECTION (shutdown deps live in main.js / ai.js, injected here)
 // ============================================================================
 
@@ -133,13 +186,19 @@ async function initDatabase() {
         )`);
         db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_ended ON sessions(ended_at)`);
 
-        // Persist immediately so the file exists on disk right away
-        saveDatabase();
+        // Persist immediately so the file exists on disk right away. Force
+        // because no mutations have been marked yet — this is the bootstrap
+        // write so SQL.js has a real file to load on next launch.
+        saveDatabase({ force: true });
 
         log('[DB] SQL.js database initialized', 'INFO');
 
-        // Start periodic saves only after successful init
-        setInterval(saveDatabase, 60000);
+        // BAT-523 (BAT-518 phase 3A): the prior unconditional 60s
+        // periodic save is gone. Saves are now triggered by
+        // `markDbDirty()` from mutation sites and coalesced via
+        // SAVE_DEBOUNCE_MS bounded-delay debounce (see file-top
+        // comment block for why this isn't a true trailing debounce).
+        // Idle agent → zero periodic writes.
 
     } catch (err) {
         log(`[DB] Failed to initialize SQL.js (non-fatal): ${err.message}`, 'ERROR');
@@ -147,8 +206,29 @@ async function initDatabase() {
     }
 }
 
-function saveDatabase() {
+/**
+ * Persist the in-memory SQL.js DB to disk via atomic temp+rename.
+ *
+ * BAT-523 (BAT-518 phase 3A): no longer called every 60s by an interval.
+ * The default invocation no-ops when nothing has been marked dirty since
+ * the last save — the only writes that happen are those triggered by
+ * `markDbDirty()` (debounced) or callers that explicitly request a flush.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.force=false] Save even if `dirty` is false.
+ *        Used by `initDatabase` (bootstrap write so the file exists on
+ *        disk for next launch) and by `gracefulShutdown` (flush any
+ *        pending mutations before the process exits).
+ * @param {boolean} [opts.scheduleRetry=true] On transient I/O failure,
+ *        re-arm a retry timer SAVE_DEBOUNCE_MS later. Disabled by
+ *        gracefulShutdown — the process exits immediately after, the
+ *        retry would never fire, and a "retry in 60s" log would be a
+ *        lie. Init keeps the default so a failed bootstrap write
+ *        retries before any mutation arrives.
+ */
+function saveDatabase({ force = false, scheduleRetry = true } = {}) {
     if (!db) return;
+    if (!dirty && !force) return; // Idle — nothing changed since last save.
     try {
         const data = db.export();
         const buffer = Buffer.from(data);
@@ -156,8 +236,52 @@ function saveDatabase() {
         const tmpPath = DB_PATH + '.tmp';
         fs.writeFileSync(tmpPath, buffer);
         fs.renameSync(tmpPath, DB_PATH);
+        dirty = false;
+        // We just persisted on the synchronous path — cancel any pending
+        // debounced save so it doesn't fire a redundant second write a
+        // few seconds later.
+        if (saveTimer) {
+            clearTimeout(saveTimer);
+            saveTimer = null;
+        }
     } catch (err) {
-        log(`[DB] Save error: ${err.message}`, 'ERROR');
+        // BAT-523: transient I/O failures must reschedule a retry.
+        //
+        // Two failure shapes need it:
+        //
+        // 1. Debounced path failure (dirty=true, force=false). The
+        //    timer callback nulled saveTimer before calling us; the
+        //    success-path clear above didn't run. Without a fresh
+        //    timer, dirty stays true with no scheduled retry — the
+        //    DB sits unsaved until the next mutation or shutdown,
+        //    which can be unbounded on an idle agent.
+        //
+        // 2. Forced path failure (force=true, dirty=false). Init's
+        //    bootstrap write — "ensure file exists on disk right
+        //    away" — fails. dirty is false, so a `dirty &&` guard
+        //    would skip the retry. The init contract is broken for
+        //    arbitrarily long if we don't re-arm. Same applies to
+        //    shutdown's force-flush, except shutdown is process-
+        //    exit-bound and has no future to retry into; the
+        //    re-arm is a no-op there.
+        //
+        // The retry callback re-uses the same `force` flag so a
+        // forced bootstrap write that failed retries WITH force,
+        // preserving the original semantics. Bounded by
+        // SAVE_DEBOUNCE_MS — explicitly NOT a tight loop.
+        //
+        // `scheduleRetry=false` skips the re-arm entirely. Used by
+        // gracefulShutdown — the process exits in the next instruction
+        // so a queued retry would never fire, and the log line would
+        // misleadingly promise one.
+        const willRetry = scheduleRetry && (dirty || force) && !saveTimer;
+        log(`[DB] Save error${willRetry ? ` (retry in ${SAVE_DEBOUNCE_MS / 1000}s)` : ''}: ${err.message}`, 'ERROR');
+        if (willRetry) {
+            saveTimer = setTimeout(() => {
+                saveTimer = null;
+                saveDatabase({ force });
+            }, SAVE_DEBOUNCE_MS);
+        }
     }
 }
 
@@ -168,6 +292,16 @@ function saveDatabase() {
 // Index memory files into chunks table for search
 function indexMemoryFiles() {
     if (!db) return;
+    // BAT-523 (Copilot round-4): track whether ANY db.run mutation
+    // happened in this pass so the finally block below can mark the
+    // DB dirty even if a later step throws. Without this, a chunk
+    // INSERT that throws mid-loop would jump over the markDbDirty()
+    // at the end of the try block, leaving partially-applied
+    // mutations in memory with no scheduled save (the periodic
+    // setInterval safety net is gone). The flag is set BEFORE the
+    // first mutation in each path so any subsequent throw is
+    // covered.
+    let mutated = false;
     try {
         const crypto = require('crypto');
         const filesToIndex = [];
@@ -210,6 +344,10 @@ function indexMemoryFiles() {
             const hash = crypto.createHash('md5').update(content).digest('hex');
             const chunks = chunkMarkdown(content);
 
+            // About to mutate — set the flag BEFORE the first db.run
+            // so any throw inside this iteration is still recorded.
+            mutated = true;
+
             // Delete old chunks for this path
             db.run(`DELETE FROM chunks WHERE path = ?`, [file.path]);
 
@@ -232,14 +370,27 @@ function indexMemoryFiles() {
             indexed++;
         }
 
-        // Update meta
+        // Update meta — runs unconditionally on every indexer pass, so it
+        // mutates the DB even when every file was skipped. mutated must
+        // therefore become true here too so the all-skipped path
+        // (which never entered the in-loop mutation block) still gets
+        // a markDbDirty in the finally below.
+        mutated = true;
         db.run(`INSERT OR REPLACE INTO meta (key, value) VALUES ('last_indexed', ?)`,
             [localTimestamp()]);
 
-        if (indexed > 0) saveDatabase();
         log(`[Memory] Indexed ${indexed} files, skipped ${skipped} unchanged`, 'DEBUG');
     } catch (err) {
         log(`[Memory] Indexing error (non-fatal): ${err.message}`, 'WARN');
+    } finally {
+        // BAT-523 (Copilot round-4): mark dirty in finally so partial
+        // mutations from a mid-loop throw still get scheduled for
+        // persistence within the SAVE_DEBOUNCE_MS bound. Without this,
+        // an INSERT that fails after some chunks have already been
+        // DELETEd/INSERTed would leave the DB in a partially-modified
+        // state with no save scheduled — those mutations would sit
+        // until the next unrelated mutation or shutdown.
+        if (mutated) markDbDirty();
     }
 }
 
@@ -312,7 +463,8 @@ function saveSession({ startedAt, endedAt, durationMin, messageCount, summaryFil
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
             [startedAt, endedAt, durationMin, messageCount, summaryFile ?? null, summaryExcerpt ?? null, trigger ?? null, model ?? null]
         );
-        saveDatabase();
+        // BAT-523: schedule debounced save (was unconditional saveDatabase()).
+        markDbDirty();
     } catch (err) {
         log(`[Sessions] Save error (non-fatal): ${err.message}`, 'WARN');
     }
@@ -434,7 +586,8 @@ function backfillSessionsFromFiles() {
         }
 
         if (backfilled > 0) {
-            saveDatabase();
+            // BAT-523: schedule debounced save (was unconditional saveDatabase()).
+            markDbDirty();
             log(`[Sessions] Backfilled ${backfilled} sessions from existing summary files`, 'INFO');
         }
     } catch (err) {
@@ -467,7 +620,12 @@ async function gracefulShutdown(signal) {
     } catch (err) {
         log(`[Shutdown] Summary failed: ${err.message}`, 'ERROR');
     }
-    saveDatabase();
+    // BAT-523: force-flush any pending debounced mutations before the
+    // process exits — otherwise dirty in-memory rows would be lost.
+    // scheduleRetry=false because the very next instruction is
+    // process.exit(0) — a queued retry timer would never run, and the
+    // "retry in 60s" log line would be a lie.
+    saveDatabase({ force: true, scheduleRetry: false });
     process.exit(0);
 }
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
@@ -642,6 +800,7 @@ module.exports = {
     backfillSessionsFromFiles,
     writeDbSummaryFile,
     markDbSummaryDirty,
+    markDbDirty, // BAT-523 (BAT-518 phase 3A) — call after every db.run() that mutates state
     startDbSummaryInterval,
     startStatsServer,
 };
