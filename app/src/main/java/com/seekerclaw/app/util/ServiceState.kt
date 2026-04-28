@@ -1,10 +1,10 @@
 package com.seekerclaw.app.util
 
 import android.content.Context
+import android.os.FileObserver
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -20,9 +20,9 @@ enum class ServiceStatus { STOPPED, STARTING, RUNNING, ERROR }
 
 /** Agent API health state read from Node.js health file (BAT-134). */
 data class AgentHealth(
-    val apiStatus: String = "unknown",      // unknown, healthy, degraded, error, stale
-    val lastErrorType: String? = null,      // auth, billing, rate_limit, server, network, etc.
-    val lastErrorStatus: Int? = null,       // HTTP status code (-1 for network)
+    val apiStatus: String = "unknown", // unknown, healthy, degraded, error, stale
+    val lastErrorType: String? = null, // auth, billing, rate_limit, server, network, etc.
+    val lastErrorStatus: Int? = null, // HTTP status code (-1 for network)
     val lastErrorMessage: String? = null,
     val consecutiveFailures: Int = 0,
     val isStale: Boolean = false,
@@ -39,7 +39,7 @@ sealed class ApiUsageData {
         val sevenDayResetsAt: String,
         override val updatedAt: Long,
         override val error: String? = null,
-    ) : ApiUsageData()
+) : ApiUsageData()
 
     data class ApiKeyUsage(
         val requestsLimit: Int,
@@ -50,7 +50,7 @@ sealed class ApiUsageData {
         val tokensReset: String,
         override val updatedAt: Long,
         override val error: String? = null,
-    ) : ApiUsageData()
+) : ApiUsageData()
 }
 
 object ServiceState {
@@ -82,10 +82,13 @@ object ServiceState {
     val agentHealth: StateFlow<AgentHealth> = _agentHealth
 
     // Private lock for health transition logging.
-    // Prevents the TOCTOU where overlapping pollingJob coroutines (caused by cooperative
-    // cancellation in startPolling) both capture prevStale before the first write commits.
-    // lastLoggedStale tracks the last-logged direction so duplicate same-direction logs
-    // are suppressed even if two coroutines race to the synchronized block.
+    // Originally prevented TOCTOU between overlapping polling coroutines.
+    // Post-BAT-518 (FileObserver), inotify event delivery on the
+    // FileObserver thread is ordered, but the handler work is
+    // dispatched to Dispatchers.IO via scope.launch and CAN run
+    // concurrently. lastLoggedStale tracks the last-logged direction
+    // so duplicate same-direction logs are suppressed even when two
+    // dispatches race the synchronized block.
     private val healthTransitionLock = Any()
     @Volatile private var lastLoggedStale: Boolean? = null
 
@@ -99,17 +102,70 @@ object ServiceState {
 
     /** App files directory — exposed for cross-process file reads (e.g. stats). */
     val filesDir: File? get() = stateFile?.parentFile
-    private var pollingJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO)
-    private var initialized = false
+    // @Volatile + check-then-set under initLock: ensures only one
+    // thread runs the disk-restore work even if init() / startWatching
+    // are called concurrently from main and Dispatchers.IO. Without
+    // this, the worker thread might not observe `initialized = true`
+    // set by another thread, OR the check-then-set could double-fire
+    // restoreFromDisk.
+    @Volatile private var initialized = false
+    private val initLock = Any()
+    private val startWatchingLock = Any()
+    private val stalenessTickerStarted = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
      * Initialize state file path AND restore persisted counters.
      * Must be called before any updateStatus/incrementMessages/addTokens.
+     *
+     * Performs synchronous disk I/O on the calling thread (file read +
+     * daily-reset write). `restoreFromDisk` is single-flighted via
+     * `initLock` and gated on `initialized`, so repeat calls within a
+     * process are no-ops after the first.
+     *
+     * Known callers (treat as potentially blocking):
+     * • `SeekerClawService.onStartCommand` — runs on :node process
+     * main thread during service start. A few ms of disk I/O at
+     * service start is fine.
+     * • `SeekerClawService.stop(context)` companion — runs on whatever
+     * process invoked stop (typically main UI when user taps Stop).
+     * The first call from main UI may incur the disk I/O;
+     * subsequent calls are no-ops since `initialized` is set.
+     *
+     * Main-process callers in latency-sensitive paths should prefer
+     * `startWatching`, which dispatches the restore work to
+     * `Dispatchers.IO`.
+     *
+     * No `@WorkerThread` annotation: both known callers are component
+     * callbacks that may run on the main thread, and Android Lint
+     * correctly flags @WorkerThread mismatches there. Marking this
+     * would force a SuppressLint at the call site without actually
+     * preventing misuse — this doc comment is the clearer contract.
+     *
      */
     fun init(context: Context) {
+        initFileRefs(context)
+        restoreFromDisk() // Idempotent — single-flight via initLock
+    }
+
+    /** Sync, no I/O. Sets the file path reference so disk reads can find it. */
+    private fun initFileRefs(context: Context) {
         stateFile = File(context.filesDir, "service_state")
-        if (!initialized) {
+    }
+
+    /**
+     * Disk I/O — file restore + daily reset check.
+     *
+     * Single-flight: takes `initLock` and double-checks `initialized`
+     * inside the lock so concurrent callers (e.g. `init()` on main
+     * thread + `startWatching()`'s scope.launch on Dispatchers.IO)
+     * run the restore exactly once, regardless of memory ordering.
+     *
+     */
+    private fun restoreFromDisk() {
+        if (initialized) return // Fast path — no lock if already done
+        synchronized(initLock) {
+            if (initialized) return // Double-check inside lock
             readFromFile()
             checkDailyReset()
             initialized = true
@@ -193,27 +249,281 @@ object ServiceState {
     }
 
     /**
-     * Start polling the state file for cross-process updates.
+     * Start watching the state files for cross-process updates.
      * Call this from the UI process (Application.onCreate).
+     *
+     * BAT-518: replaced the prior 1s coroutine polling loop with kernel-
+     * level inotify (`FileObserver`). Same external contract — the
+     * StateFlow values still update when the underlying files change —
+     * but event-driven instead of 1Hz polling. Previously this method ran
+     * 86,400 disk-read cycles per day even when nothing changed.
+     *
+     * One FileObserver is attached: on `filesDir/workspace`, for
+     * `agent_health_state` and `api_usage_state`. Updates for
+     * `service_state` and `bridge_token` (which live directly in
+     * `filesDir`) flow through `LogCollector`'s FileObserver via
+     * `handleFilesDirEvent(path)` — see that method's KDoc for why.
+     * Briefly: registering two FileObservers in the same process on the
+     * same directory proved fragile on the Solana Seeker (one of two
+     * silently never received events), so we consolidate onto one.
+     *
+     * Initial reads are dispatched ASYNCHRONOUSLY to Dispatchers.IO.
+     * The first-time restore (read from
+     * service_state, daily reset check) is also dispatched.
+     *
+     * Caller-thread disk I/O caveat : `workspaceDir.mkdirs()`
+     * still runs on the caller thread because the FileObserver attach
+     * needs the directory to exist BEFORE startWatching() returns.
+     * `mkdirs()` is a no-op stat on existing directories (the common
+     * case); only fresh installs incur an actual directory creation.
+     * StrictMode's diskIo policy may flag this; for a 24/7 service
+     * that runs onCreate exactly once per process, it's acceptable.
+     *
+     * UI screens that compose before the dispatched reads complete may
+     * see default StateFlow values (STOPPED / 0 / 0 / 0) briefly —
+     * observers also fire on subsequent writes, so eventual consistency
+     * holds.
      */
-    fun startPolling(context: Context) {
-        init(context)
-        // Guard: skip if a polling loop is already running (BAT-217).
-        // Prevents overlapping coroutines that could both detect health transitions
-        // and emit duplicate log entries.
-        if (pollingJob?.isActive == true) {
-            Log.d(TAG, "startPolling: already active, skipping")
-            return
+    fun startWatching(context: Context) {
+        // Sync setup: just file path refs, no I/O. The actual disk reads
+        // (first-time restore, file content reads) happen in the launch
+        // block below so the main thread caller (Application.onCreate)
+        // returns fast. Previously, `init(context)` was called here and
+        // did synchronous disk I/O on its first invocation.
+        initFileRefs(context)
+
+        // Guard + attach are wrapped in startWatchingLock :
+        // even though Application.onCreate is the only intended caller and
+        // runs once on the main thread, the synchronized block costs nothing
+        // for an uncontended lock and documents the contract — future callers
+        // can't race the field check + assignment to attach two observers.
+        synchronized(startWatchingLock) {
+            // Guard: skip if workspace observer is already attached. After
+            // BAT-518 device-fix consolidation, filesDir is no longer
+            // independently observed by ServiceState — LogCollector's
+            // observer drives those reads via handleFilesDirEvent(). So
+            // the only ServiceState-owned observer is the workspace one.
+            if (workspaceDirObserver != null) {
+                Log.d(TAG, "startWatching: workspace observer already active, skipping")
+                return
+            }
+
+            val parent = stateFile?.parentFile
+            if (parent == null) {
+                Log.w(TAG, "startWatching: no parent dir, skipping")
+                return
+            }
+
+            // workspace/ may not exist yet on a fresh install before the service
+            // first starts. Create it so FileObserver can attach without racing
+            // service startup. Idempotent. mkdirs is fast (single stat) so OK
+            // on caller thread; the slow part is the file reads below, which
+            // are dispatched.
+            //
+            // Defensive: validate the result. mkdirs() returns false on failure
+            // (filesystem error, permission, OR a non-directory file at that
+            // path blocking creation). Without this check, FileObserver
+            // attachment to a missing/non-dir path silently no-ops and the UI
+            // never receives updates for the workspace files.
+            val workspaceDir = File(parent, "workspace")
+            if (!workspaceDir.isDirectory) {
+                workspaceDir.mkdirs()
+            }
+            val workspaceUsable = workspaceDir.isDirectory
+
+            Log.d(TAG, "startWatching: attaching workspace FileObserver")
+
+            // BAT-518 device-fix: do NOT register a separate FileObserver for
+            // filesDir. LogCollector already watches that directory for
+            // service_logs and its observer fires reliably; on the Solana
+            // Seeker, registering a SECOND FileObserver in the same process
+            // on the same directory caused this observer to silently never
+            // receive events even though API 29+ docs claim List<WeakReference>
+            // supports it. LogCollector now calls ServiceState.handleFilesDirEvent()
+            // on every event, keeping cross-process state in sync via the
+            // single working observer. workspaceDir is a different directory
+            // and remains observed separately here — no conflict.
+            if (workspaceUsable) {
+                // Filter by basename in onEvent : workspace/ also contains high-
+                // frequency files (node_debug.log from :node, daily
+                // memory files, etc.) that aren't ours. Filtering at
+                // makeDirObserver's onEvent — BEFORE coroutine launch —
+                // means those events cost only a Set lookup, not a
+                // coroutine schedule.
+                workspaceDirObserver = makeDirObserver(
+                    workspaceDir,
+                    watchedFiles = setOf("agent_health_state", "api_usage_state"),
+) { path ->
+                    when (path) {
+                        "agent_health_state" -> readAgentHealthFile()
+                        "api_usage_state" -> readApiUsageFile()
+                        // null = directory-level event without filename
+                        // (also signals Q_OVERFLOW); re-read both defensively.
+                        null -> { readAgentHealthFile(); readApiUsageFile() }
+                    }
+                }.also { it.startWatching() }
+            } else {
+                Log.w(
+                    TAG,
+                    "startWatching: workspace dir not usable (${workspaceDir.absolutePath}) — " +
+                        "skipping workspace FileObserver. agent_health_state and api_usage_state " +
+                        "will not auto-refresh; rely on initial dispatched read only.",
+)
+            }
+        } // end synchronized(startWatchingLock)
+
+        // Initial reads on Dispatchers.IO — startWatching is invoked from
+        // Application.onCreate (main thread); doing 4 disk reads there
+        // risks StrictMode violations and startup jank. The first-time
+        // restore (readFromFile + checkDailyReset, gated on `initialized`)
+        // is also done here so we don't sneak sync I/O in via init().
+        // StateFlow is pre-populated with sane defaults so UI screens
+        // that compose before the dispatched reads complete won't show
+        // garbage — they just see "STOPPED / 0 / 0 / 0" briefly until
+        // the IO dispatch lands a few ms later. Observers also fire on
+        // subsequent writes, so eventual consistency holds.
+        //
+        scope.launch {
+            restoreFromDisk()
+            readBridgeToken()
+            readApiUsageFile()
+            readAgentHealthFile()
         }
-        Log.d(TAG, "startPolling: launching polling loop")
-        pollingJob?.cancel()
-        pollingJob = scope.launch {
+
+        startStalenessTicker()
+    }
+
+    /**
+     * Re-evaluate `_agentHealth.isStale` every 30s by re-reading
+     * `agent_health_state` from disk. Necessary because BAT-518 replaced
+     * 1s polling with FileObserver — the previous polling loop ALSO
+     * refreshed staleness on every tick even when the file hadn't changed.
+     * Without this ticker, an agent that crashes and stops writing
+     * `agent_health_state` would never trigger the UI's "stale" transition:
+     * no file event → no read → `isStale` stuck at its last value (false,
+     * if the agent was healthy before crashing). That's a safety-relevant
+     * regression: the user would think the agent is healthy when it has
+     * actually died.
+     *
+     * Cost: 1 small file read every 30s (~2,880/day) — vastly cheaper than
+     * the prior 1Hz poll's 86,400/day, but not "no I/O" as an earlier
+     * iteration of this comment claimed.
+     *
+     * Once-only via AtomicBoolean.compareAndSet so concurrent startWatching
+     * calls (theoretical, defensive) don't double-start the ticker.
+     */
+    private fun startStalenessTicker() {
+        if (!stalenessTickerStarted.compareAndSet(false, true)) return
+        scope.launch {
             while (isActive) {
-                readFromFile()
-                readBridgeToken()
-                readApiUsageFile()
+                delay(30_000L)
+                // readAgentHealthFile re-derives `stale = (now - fileTime
+                // > 120_000)` on every call, so a 30s tick converges
+                // staleness within ≤30s of the 120s threshold even when
+                // no file events fire. Reading a ~few-hundred-byte file
+                // every 30s is 2,880 reads/day — 30× less than the prior
+                // 1Hz poll's 86,400 — so we keep most of BAT-518's I/O
+                // savings while restoring the safety property.
                 readAgentHealthFile()
-                delay(1000)
+            }
+        }
+    }
+
+    /**
+     * Called by LogCollector's FileObserver for events in `filesDir`
+     * matching ServiceState's files (BAT-518 device-fix consolidation).
+     *
+     * LogCollector filters by basename BEFORE calling this — only
+     * `service_state`, `bridge_token`, or `null` (directory-level events
+     * with no attributable filename) reach here. That filter is critical:
+     * without it, every `service_logs` append would launch a coroutine
+     * just to no-op on the `when`, partially undoing the I/O savings
+     * BAT-518 set out to win.
+     *
+     * Idempotent + cheap: each re-read is ~80 bytes; StateFlow only
+     * emits when values actually change.
+     */
+    fun handleFilesDirEvent(path: String?) {
+        scope.launch {
+            when (path) {
+                "service_state" -> readFromFile()
+                "bridge_token" -> readBridgeToken()
+                null -> {
+                    // Directory-level event with no attributable filename.
+                    // Read both — defensive, very rare.
+                    readFromFile()
+                    readBridgeToken()
+                }
+                // Any other path means LogCollector's filter let something
+                // through unexpectedly — silently ignore.
+            }
+        }
+    }
+
+    /**
+     * Backwards-compat alias. Older call sites (and any external code)
+     * that still call `startPolling` continue to work — same behavior,
+     * just no actual polling underneath. Removable in a follow-up once
+     * all call sites are migrated.
+     */
+    @Deprecated(
+        "Renamed to startWatching after BAT-518; this alias forwards for compat",
+        replaceWith = ReplaceWith("startWatching(context)"),
+)
+    fun startPolling(context: Context) = startWatching(context)
+
+    private var workspaceDirObserver: FileObserver? = null
+
+    private fun makeDirObserver(
+        dir: File,
+        watchedFiles: Set<String>,
+        onChange: (path: String?) -> Unit,
+): FileObserver {
+        // FileObserver(File) is API 29+; we target min SDK 34 so this is safe.
+        // Mask covers:
+        // • CLOSE_WRITE / MODIFY: writeText / appendText style writes
+        // • MOVED_TO: atomic .tmp + rename writes
+        // • CREATE: initial creation when file didn't exist at attach
+        // • DELETE: file removal in the watched dir, so the reader
+        // refreshes when one of the watched files disappears (not
+        // only on create/write). Defense-in-depth against external
+        // removal — covers the cases the polling code used to catch
+        // by re-stat'ing every tick.
+        // MOVED_FROM is also covered by MOVED_TO + CREATE on the
+        // destination dir; we don't need it here.
+        //
+        // Constants are qualified (FileObserver.MODIFY etc.) because
+        // they're Java static fields, not auto-importable into Kotlin
+        // function bodies.
+        //
+        // The callback receives `path` (basename of changed file, or
+        // null for directory-level events). The caller is responsible
+        // for filtering — the workspace observer in particular needs
+        // it because workspace/ contains high-frequency files like
+        // node_debug.log that would otherwise launch a no-op coroutine
+        // per event.
+        return object : FileObserver(
+            dir,
+            FileObserver.MODIFY or FileObserver.CLOSE_WRITE or
+                FileObserver.MOVED_TO or FileObserver.CREATE or
+                FileObserver.DELETE,
+) {
+            override fun onEvent(event: Int, path: String?) {
+                val fileName = LogCollector.fileNameFromObserverPath(path)
+                // Filter BEFORE launching : the
+                // watched dir contains high-frequency files (e.g. node_debug.log
+                // in workspace/, written multiple times per second by :node)
+                // that aren't ours. Filtering inside the coroutine wastes
+                // scheduling. path == null is always forwarded — that's the
+                // only signal Android gives us for inotify queue overflow,
+                // and we want a forced resync in that case.
+                if (fileName != null && fileName !in watchedFiles) return
+                // Dispatch to scope so the FileObserver thread (a single
+                // shared thread named "FileObserver" in Android) doesn't
+                // do file I/O. The reader functions are idempotent — if
+                // multiple events fire for the same write, re-reading is
+                // cheap and produces the same StateFlow values.
+                scope.launch { onChange(fileName) }
             }
         }
     }
@@ -298,7 +608,21 @@ object ServiceState {
         val parent = stateFile?.parentFile ?: return
         val file = File(parent, "workspace/agent_health_state")
         try {
-            if (!file.exists()) return
+            if (!file.exists()) {
+                // File deleted (rotation, cleanup, user wipe, etc.). Reset
+                // to default AgentHealth with isStale=true rather than
+                // silently leaving the UI showing the last known status —
+                // a missing source-of-truth file is itself a "stale"
+                // signal.
+                val missing = AgentHealth(apiStatus = "stale", isStale = true)
+                synchronized(healthTransitionLock) {
+                    if (_agentHealth.value != missing) {
+                        _agentHealth.value = missing
+                        lastLoggedStale = true
+                    }
+                }
+                return
+            }
             val json = JSONObject(file.readText())
             val apiStatus = json.optString("apiStatus", "unknown")
             val updatedAt = json.optString("updatedAt", "")
@@ -321,7 +645,7 @@ object ServiceState {
                 lastErrorMessage = lastErr?.optString("message"),
                 consecutiveFailures = json.optInt("consecutiveFailures", 0),
                 isStale = stale,
-            )
+)
             // Determine log entry inside a private lock (state mutation only, no I/O).
             // Lock hold time is kept short; LogCollector.append() is called after release.
             var logEntry: Pair<String, LogLevel>? = null
@@ -346,7 +670,13 @@ object ServiceState {
         val parent = stateFile?.parentFile ?: return
         val file = File(parent, "workspace/api_usage_state")
         try {
-            if (!file.exists()) return
+            if (!file.exists()) {
+                // File deleted (cleanup, rotation, user wipe). Clear
+                // the in-memory usage so the UI doesn't continue showing
+                // stale counts that no longer have a backing source.
+                if (_apiUsage.value != null) _apiUsage.value = null
+                return
+            }
             val json = JSONObject(file.readText())
             val type = json.optString("type", "")
             val updatedAt = try {
@@ -366,7 +696,7 @@ object ServiceState {
                     sevenDayResetsAt = sd?.optString("resets_at", "") ?: "",
                     updatedAt = updatedAt,
                     error = error,
-                )
+)
             } else if (type == "api_key") {
                 val req = json.optJSONObject("requests")
                 val tok = json.optJSONObject("tokens")
@@ -379,7 +709,7 @@ object ServiceState {
                     tokensReset = tok?.optString("reset", "") ?: "",
                     updatedAt = updatedAt,
                     error = error,
-                )
+)
             } else {
                 return
             }

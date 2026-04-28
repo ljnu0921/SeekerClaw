@@ -1,5 +1,9 @@
 package com.seekerclaw.app.util
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -7,13 +11,15 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
  * Pure JVM tests for LogCollector's in-memory behavior.
- * File I/O is skipped because logFile stays null (init() not called).
+ * Most tests run without file I/O (logFile stays null when init() isn't called).
+ * The offset-based reader tests use a temp file via setLogFileForTest().
  */
 class LogCollectorTest {
 
@@ -218,5 +224,241 @@ class LogCollectorTest {
         val filtered = logs.filter { it.message.contains(query, ignoreCase = true) }
 
         assertEquals(2, filtered.size)
+    }
+
+    // --- Offset-based reader (BAT-518 FileObserver path) ---
+    //
+    // FileObserver typically delivers MODIFY and CLOSE_WRITE for one
+    // write. Both events dispatch readNewFromFile concurrently via
+    // scope.launch. `readLock` serializes the file read +
+    // lastReadPosition update; `logsLock` is held only briefly inside
+    // for the in-memory _logs mutation. Together they ensure no
+    // duplicate entries land in the buffer and lastReadPosition
+    // stays correct.
+
+    @Test
+    fun `offset reader picks up incremental writes correctly`() = runBlocking {
+        val tmp = File.createTempFile("bat518-log", ".test")
+        try {
+            LogCollector.setLogFileForTest(tmp)
+            LogCollector.resetForTest()
+
+            // First write
+            val ts1 = System.currentTimeMillis()
+            tmp.writeText("$ts1|INFO|first\n")
+            LogCollector.readNewFromFileForTest()
+
+            assertEquals(1, LogCollector.logs.value.size)
+            assertEquals("first", LogCollector.logs.value[0].message)
+            assertEquals(tmp.length(), LogCollector.lastReadPositionForTest)
+
+            // Second incremental write
+            val ts2 = ts1 + 1
+            tmp.appendText("$ts2|WARN|second\n")
+            LogCollector.readNewFromFileForTest()
+
+            assertEquals(2, LogCollector.logs.value.size)
+            assertEquals("second", LogCollector.logs.value[1].message)
+            assertEquals(LogLevel.WARN, LogCollector.logs.value[1].level)
+            assertEquals(tmp.length(), LogCollector.lastReadPositionForTest)
+        } finally {
+            LogCollector.setLogFileForTest(null)
+            LogCollector.resetForTest()
+            tmp.delete()
+        }
+    }
+
+    @Test
+    fun `concurrent readNewFromFile invocations don't duplicate entries`() = runBlocking {
+        // Simulates FileObserver's MODIFY + CLOSE_WRITE dual-dispatch:
+        // multiple coroutines all see the file in the same state and
+        // race to consume it. `readLock` must ensure exactly one of
+        // them does the file read + lastReadPosition advance; the others
+        // find the offset already advanced and return cleanly.
+        // (Production locking: readLock guards file/offset, logsLock
+        // guards in-memory _logs only — see LogCollector header.)
+        val tmp = File.createTempFile("bat518-concurrent", ".test")
+        try {
+            LogCollector.setLogFileForTest(tmp)
+            LogCollector.resetForTest()
+
+            // Write 100 lines
+            val baseTs = System.currentTimeMillis()
+            val sb = StringBuilder()
+            for (i in 0 until 100) {
+                sb.append("${baseTs + i}|INFO|line-$i\n")
+            }
+            tmp.writeText(sb.toString())
+
+            // Launch 10 concurrent readers on Dispatchers.IO so they can
+            // actually run in parallel. With the default runBlocking
+            // dispatcher (single-threaded), `async { ... }` blocks all
+            // run sequentially since readNewFromFileForTest does
+            // synchronous file I/O — the test would be effectively
+            // serialized and wouldn't exercise the readLock contract.
+            //
+            val tasks = List(10) {
+                async(Dispatchers.IO) { LogCollector.readNewFromFileForTest() }
+            }
+            tasks.awaitAll()
+
+            // Exactly 100 entries, no duplicates, in order.
+            val logs = LogCollector.logs.value
+            assertEquals("Expected 100 entries; found ${logs.size}", 100, logs.size)
+            assertEquals("line-0", logs.first().message)
+            assertEquals("line-99", logs.last().message)
+            // Offset advanced to EOF.
+            assertEquals(tmp.length(), LogCollector.lastReadPositionForTest)
+        } finally {
+            LogCollector.setLogFileForTest(null)
+            LogCollector.resetForTest()
+            tmp.delete()
+        }
+    }
+
+    @Test
+    fun `offset reader handles file truncation by resetting position`() = runBlocking {
+        // Simulates rotation: write content, read it, then replace the
+        // file with a smaller one (e.g. log rotated out). Without the
+        // `currentLength < pos` guard, lastReadPosition would stay at
+        // the old length and the new (smaller) file would never be read.
+        //
+        val tmp = File.createTempFile("bat518-rotate", ".test")
+        try {
+            LogCollector.setLogFileForTest(tmp)
+            LogCollector.resetForTest()
+
+            val ts = System.currentTimeMillis()
+            // Initial 5 lines
+            tmp.writeText((0 until 5).joinToString("") { "${ts + it}|INFO|first-$it\n" })
+            LogCollector.readNewFromFileForTest()
+            assertEquals(5, LogCollector.logs.value.size)
+            val origPos = LogCollector.lastReadPositionForTest
+            assertTrue("offset should advance past initial write", origPos > 0)
+
+            // Simulate rotation: truncate file, write smaller content
+            tmp.writeText("${ts + 100}|WARN|after-rotate\n")
+            assertTrue("rotation must shrink file", tmp.length() < origPos)
+
+            LogCollector.readNewFromFileForTest()
+
+            // The rotated content was forwarded (in addition to the
+            // pre-rotation 5). Buffer holds 6 entries total.
+            assertEquals(6, LogCollector.logs.value.size)
+            assertEquals("after-rotate", LogCollector.logs.value.last().message)
+            assertEquals(LogLevel.WARN, LogCollector.logs.value.last().level)
+            // Offset now matches the rotated file's length.
+            assertEquals(tmp.length(), LogCollector.lastReadPositionForTest)
+        } finally {
+            LogCollector.setLogFileForTest(null)
+            LogCollector.resetForTest()
+            tmp.delete()
+        }
+    }
+
+    @Test
+    fun `offset reader leaves partial trailing line for next read`() = runBlocking {
+        // Simulates FileObserver firing CLOSE_WRITE while a writer is
+        // mid-line. Without line-boundary advancement, parseLine would
+        // drop the partial line AND lastReadPosition would skip past
+        // it — losing the rest of the line forever once the writer
+        // finishes.
+        val tmp = File.createTempFile("bat518-partial", ".test")
+        try {
+            LogCollector.setLogFileForTest(tmp)
+            LogCollector.resetForTest()
+
+            val ts = System.currentTimeMillis()
+            // One complete line + partial trailing (no \n)
+            tmp.writeText("$ts|INFO|complete-line\n${ts + 1}|INFO|part-")
+            val partialEndPos = tmp.length()
+
+            LogCollector.readNewFromFileForTest()
+
+            // Only the complete line should be forwarded; partial held back.
+            assertEquals(1, LogCollector.logs.value.size)
+            assertEquals("complete-line", LogCollector.logs.value[0].message)
+            // Offset advanced only past the first complete line, NOT to EOF.
+            // (If we advanced to EOF, the partial line would be lost when
+            // the writer finishes.)
+            assertTrue(
+                "offset should be past first newline but before partial line end",
+                LogCollector.lastReadPositionForTest < partialEndPos,
+)
+
+            // Writer finishes the partial line.
+            tmp.appendText("ial-line\n")
+            LogCollector.readNewFromFileForTest()
+
+            // The previously-partial line is now complete and forwarded.
+            assertEquals(2, LogCollector.logs.value.size)
+            assertEquals("part-ial-line", LogCollector.logs.value[1].message)
+            assertEquals(tmp.length(), LogCollector.lastReadPositionForTest)
+        } finally {
+            LogCollector.setLogFileForTest(null)
+            LogCollector.resetForTest()
+            tmp.delete()
+        }
+    }
+
+    @Test
+    fun `offset reader skips writes already at EOF`() = runBlocking {
+        val tmp = File.createTempFile("bat518-eof", ".test")
+        try {
+            LogCollector.setLogFileForTest(tmp)
+            LogCollector.resetForTest()
+
+            tmp.writeText("${System.currentTimeMillis()}|INFO|once\n")
+            LogCollector.readNewFromFileForTest()
+            val sizeAfterFirst = LogCollector.logs.value.size
+            val posAfterFirst = LogCollector.lastReadPositionForTest
+
+            // Spurious second call with no new content (FileObserver may
+            // emit duplicate events for a single write).
+            LogCollector.readNewFromFileForTest()
+
+            assertEquals(sizeAfterFirst, LogCollector.logs.value.size)
+            assertEquals(posAfterFirst, LogCollector.lastReadPositionForTest)
+        } finally {
+            LogCollector.setLogFileForTest(null)
+            LogCollector.resetForTest()
+            tmp.delete()
+        }
+    }
+
+    @Test
+    fun `append compacts oversized service log file`() {
+        val tmp = File.createTempFile("bat518-compact", ".test")
+        try {
+            LogCollector.setLogFileForTest(tmp)
+            LogCollector.resetForTest()
+
+            val line = "${System.currentTimeMillis()}|INFO|${"x".repeat(180)}\n"
+            val builder = StringBuilder()
+            while (builder.length < 1_100_000) {
+                builder.append(line)
+            }
+            tmp.writeText(builder.toString())
+
+            LogCollector.append("after-compaction", LogLevel.INFO)
+
+            assertTrue("service_logs should be compacted below 700KB", tmp.length() < 700_000)
+            assertTrue("new append should survive compaction", tmp.readText().contains("after-compaction"))
+        } finally {
+            LogCollector.setLogFileForTest(null)
+            LogCollector.resetForTest()
+            tmp.delete()
+        }
+    }
+
+    @Test
+    fun `observer path normalization accepts relative and absolute paths`() {
+        assertEquals("service_logs", LogCollector.fileNameFromObserverPath("service_logs"))
+        assertEquals(
+            "service_logs",
+            LogCollector.fileNameFromObserverPath("/data/user/0/com.seekerclaw.app/files/service_logs"),
+        )
+        assertEquals("agent_health_state", LogCollector.fileNameFromObserverPath("workspace/agent_health_state"))
+        assertNull(LogCollector.fileNameFromObserverPath(null))
     }
 }

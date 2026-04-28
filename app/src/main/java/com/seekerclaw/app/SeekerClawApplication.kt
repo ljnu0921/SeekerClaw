@@ -27,14 +27,33 @@ class SeekerClawApplication : Application() {
         }
         Analytics.setUserProperty("has_wallet", (!ConfigManager.getWalletAddress(this).isNullOrBlank()).toString())
 
-        // Start cross-process polling so UI picks up state/logs from :node process.
-        // Guard: only the main UI process should poll. The :node process writes state
-        // files — if it also polled, both processes would detect health transitions
-        // and write duplicate log entries to the shared service_logs file (BAT-217).
+        // Start cross-process file watching so UI picks up state/logs from :node.
+        // Guard: only the main UI process should attach observers. The :node
+        // process writes state files — if it also watched, both processes would
+        // detect health transitions and write duplicate log entries to the shared
+        // service_logs file (BAT-217).
+        //
+        // BAT-518: switched from 1s coroutine polling to kernel-level FileObserver.
+        // Same external contract (StateFlow updates on file change), event-driven
+        // with a large reduction in idle work. Not literally zero idle cost: a
+        // 30s staleness ticker re-reads agent_health_state to keep the time-based
+        // stale predicate live (see ServiceState.startStalenessTicker), and Doze
+        // mode can batch FileObserver delivery.
+        // Order matters: LogCollector's FileObserver also dispatches
+        // ServiceState reads for filesDir state files (BAT-518 device-fix
+        // consolidation). LogCollector activates its FileObserver
+        // synchronously inside startWatching() — but its log-drain dispatch
+        // is gated on `initialReadComplete` until the dispatched
+        // readAllFromFile finishes. Cross-process state events
+        // (service_state, bridge_token) ARE dispatched immediately,
+        // independent of that gate, so attaching LogCollector first
+        // guarantees its observer is live before ServiceState's initial
+        // async read runs — a bridge_token CREATE landing during the
+        // catch-up window is delivered to ServiceState without delay.
         val isMainProcess = getProcessName() == packageName
         if (isMainProcess) {
-            ServiceState.startPolling(this)
-            LogCollector.startPolling(this)
+            LogCollector.startWatching(this)
+            ServiceState.startWatching(this)
             registerConfigChangedReceiver()
         }
     }
