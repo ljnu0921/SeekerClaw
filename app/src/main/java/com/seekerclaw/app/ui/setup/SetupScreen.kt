@@ -431,7 +431,30 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
                     agentName = agentName.trim().ifBlank { "SeekerClaw" },
                 )
             }
-            ConfigManager.saveConfig(context, config)
+            // BAT-513: saveConfig now returns Boolean — false means
+            // RuntimeStateStore.write failed (runtime_state.json couldn't
+            // be persisted). Setup is the one place where this is a
+            // hard fail: without the runtime state file in place, the
+            // service-start that follows would launch with stale or
+            // missing runtime config. Block the step and surface the
+            // error so the user can retry instead of pressing on into
+            // a broken state.
+            val saved = ConfigManager.saveConfig(context, config)
+            if (!saved) {
+                // saveConfig returns false for any of: prefs commit
+                // failure, RuntimeStateStore.write failure, or invalid
+                // (provider, authType) caught at the matrix gate. The
+                // log line stays generic so we don't misattribute
+                // commit failures to the runtime-state path during
+                // diagnosis.
+                LogCollector.append(
+                    "[Setup] saveConfig returned false — see prior [Config] entries for the specific failure",
+                    LogLevel.ERROR,
+                )
+                isStarting = false
+                errorMessage = "Couldn't save configuration. Please try again."
+                return
+            }
             ConfigManager.seedWorkspace(context)
             SeekerClawService.start(context)
             ConfigManager.markFirstDeploymentDone(context)

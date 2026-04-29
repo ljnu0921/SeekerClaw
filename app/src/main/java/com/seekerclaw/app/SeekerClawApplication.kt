@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import androidx.core.content.ContextCompat
 import com.seekerclaw.app.config.ConfigManager
+import com.seekerclaw.app.state.RuntimeStateStore
 import com.seekerclaw.app.util.Analytics
 import com.seekerclaw.app.util.LogCollector
 import com.seekerclaw.app.util.ServiceState
@@ -54,6 +55,16 @@ class SeekerClawApplication : Application() {
         if (isMainProcess) {
             LogCollector.startWatching(this)
             ServiceState.startWatching(this)
+            // BAT-513: take ownership of the runtime config (provider /
+            // authType / model) BEFORE the first UI screen reads it, so
+            // RuntimeStateStore.state is hydrated on first composition
+            // and the prefs↔file mirror is live. Init reads prefs first
+            // and seeds runtime_state.json on first launch (one-shot
+            // migration from the pre-BAT-513 SharedPreferences-only
+            // path). Main process only — `:node` runs in its own
+            // process and reads the same file directly via
+            // runtime-state.js.
+            RuntimeStateStore.init(this)
             registerConfigChangedReceiver()
         }
     }
@@ -82,7 +93,15 @@ class SeekerClawApplication : Application() {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 if (intent.action == ConfigManager.ACTION_CONFIG_CHANGED) {
-                    ConfigManager.configVersion.intValue++
+                    // BAT-513 round-15: route through the helper so
+                    // configVersion mutation stays main-thread-safe
+                    // and the "single chokepoint" claim in the helper
+                    // KDoc holds. Direct `.intValue++` here would
+                    // silently bypass the centralization.
+                    // BroadcastReceiver.onReceive runs on the main
+                    // thread, so the helper's Looper check hits the
+                    // fast path with no Handler dispatch.
+                    ConfigManager.bumpConfigVersionOnMain()
                 }
             }
         }

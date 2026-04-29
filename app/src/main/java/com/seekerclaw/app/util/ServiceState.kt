@@ -476,6 +476,51 @@ object ServiceState {
     }
 
     /**
+     * One-shot catch-up: re-read both `service_state` and `bridge_token`
+     * from disk on [Dispatchers.IO]. Used by foreground UI screens
+     * (Dashboard, Logs) as a safety net for the case where
+     * LogCollector's filesDir FileObserver missed a delivery — without
+     * this, the Dashboard goes stale and the user sees "Offline" while
+     * the service is actually RUNNING (observed on Solana Seeker).
+     *
+     * Single-flight (BAT-513 round-24): if a refresh is already
+     * in-flight, returns the existing [Job] instead of queueing a
+     * duplicate. Compose loops fire every 1.5s; on slow I/O the
+     * previous read could still be pending when the next tick
+     * arrives — without coalescing the scope queue would grow with
+     * redundant identical reads.
+     *
+     * Returns the active [Job] so callers (e.g. tests) can `join()`
+     * for deterministic completion instead of relying on a fixed
+     * delay.
+     *
+     * Idempotent and cheap (~80 bytes each), StateFlow only emits when
+     * values actually change. Safe to call from a Compose
+     * `LaunchedEffect` loop while a screen is composed; cancel by
+     * disposing the Effect.
+     *
+     * NOT a 24/7 background poll. Callers MUST scope this to UI
+     * visibility — in Compose terms, run inside a `LaunchedEffect`
+     * keyed on the screen's lifecycle and let `awaitDispose` /
+     * `onDispose` stop the loop when the screen leaves composition.
+     */
+    fun refreshFromFile(): kotlinx.coroutines.Job {
+        synchronized(refreshJobLock) {
+            val existing = refreshJob
+            if (existing != null && existing.isActive) return existing
+            val job = scope.launch {
+                readFromFile()
+                readBridgeToken()
+            }
+            refreshJob = job
+            return job
+        }
+    }
+
+    private val refreshJobLock = Any()
+    @Volatile private var refreshJob: kotlinx.coroutines.Job? = null
+
+    /**
      * Backwards-compat alias. Older call sites (and any external code)
      * that still call `startPolling` continue to work — same behavior,
      * just no actual polling underneath. Removable in a follow-up once

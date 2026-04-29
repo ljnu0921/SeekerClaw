@@ -1,5 +1,8 @@
 package com.seekerclaw.app.util
 
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import org.junit.After
@@ -400,25 +403,38 @@ class CrossProcessStoreTest {
         val src = locateLiveSource()
         val text = src.readText()
         val writeBlock = Regex(
-            """fun\s+write\s*\(\s*value\s*:\s*T\s*\)\s*\{[\s\S]*?(?=\n\s{4}\}\n)""",
+            """fun\s+write\s*\(\s*value\s*:\s*T\s*\)(?:\s*:\s*Boolean)?\s*\{[\s\S]*?(?=\n\s{4}\}\n)""",
         ).find(text)?.value ?: error("write() function body not found")
         assertTrue(
             "write() must capture `val snapshot: T = cloneSafe(value)` up-front",
             Regex("""val\s+snapshot\s*:\s*T\s*=\s*cloneSafe\s*\(\s*value\s*\)""").containsMatchIn(writeBlock),
         )
         assertTrue(
-            "_state.value must be assigned the up-front snapshot (not re-cloned)",
-            Regex("""_state\.value\s*=\s*snapshot\b""").containsMatchIn(writeBlock),
-        )
-        assertTrue(
-            "disk encode must use the same `snapshot`, not the raw `value`",
-            Regex("""encodeToString\s*\(\s*serializer\s*,\s*snapshot\s*\)""").containsMatchIn(writeBlock),
+            "write() must hand `snapshot` to persistLocked (BAT-513 round-18 refactor)",
+            Regex("""persistLocked\s*\(\s*snapshot\s*\)""").containsMatchIn(writeBlock),
         )
         // Negative pin: the OLD pattern (re-cloning value at the
         // _state assignment) must be gone.
         assertFalse(
             "_state assignment must NOT re-clone value (round-7 fix consolidated to single up-front clone)",
             Regex("""_state\.value\s*=\s*cloneSafe\s*\(\s*value\s*\)""").containsMatchIn(writeBlock),
+        )
+
+        // BAT-513 round-18: the locked-persist body lives in
+        // persistLocked now (shared with update). Verify the SAME-
+        // SNAPSHOT-FOR-BOTH-PERSISTENCE-AND-PUBLISH contract holds at
+        // that helper: encodeToString and _state.value assignment
+        // must both use the parameter-named `snapshot`, not re-clone.
+        val persistBlock = Regex(
+            """private\s+fun\s+persistLocked\s*\(\s*snapshot\s*:\s*T\s*\)\s*:\s*Boolean\s*\{[\s\S]*?(?=\n\s{4}\}\n)""",
+        ).find(text)?.value ?: error("persistLocked() function body not found")
+        assertTrue(
+            "persistLocked must encode the parameter `snapshot` to disk",
+            Regex("""encodeToString\s*\(\s*serializer\s*,\s*snapshot\s*\)""").containsMatchIn(persistBlock),
+        )
+        assertTrue(
+            "persistLocked must publish the parameter `snapshot` to _state.value",
+            Regex("""_state\.value\s*=\s*snapshot\b""").containsMatchIn(persistBlock),
         )
     }
 
@@ -463,35 +479,56 @@ class CrossProcessStoreTest {
     }
 
     @Test
-    fun `drift broadcastChanged is invoked OUTSIDE synchronized writeLock (round-6 lock contention)`() {
-        // BAT-512 (Copilot review fix round-6): sendBroadcast is
-        // system IPC and shouldn't be inside the critical section.
-        // Pin that broadcastChanged is called AFTER the
-        // synchronized(writeLock) block, not inside it.
+    fun `drift broadcastChanged is invoked OUTSIDE synchronized writeLock (round-6 + round-18 lock contention)`() {
+        // BAT-512 (Copilot review fix round-6) + BAT-513 round-18:
+        // sendBroadcast is system IPC and shouldn't be inside the
+        // critical section. Pin that broadcastChanged is called
+        // AFTER the synchronized(writeLock) block, not inside it,
+        // for BOTH write() AND update() — round-18 caught update
+        // holding writeLock across the broadcast (because update's
+        // synchronized block enclosed the call to write(), whose
+        // own broadcast was outside ITS synchronized block but
+        // still inside update's outer one — reentrant monitor).
         val src = locateLiveSource()
         val text = src.readText()
-        val writeBlock = Regex(
-            """fun\s+write\s*\(\s*value\s*:\s*T\s*\)\s*\{[\s\S]*?(?=\n\s{4}\}\n)""",
-        ).find(text)?.value ?: error("write() body not found")
-        // Find the synchronized block boundaries.
-        val syncStart = writeBlock.indexOf("synchronized(writeLock)")
-        assertTrue("synchronized(writeLock) block must exist", syncStart >= 0)
-        // Locate the closing brace of the synchronized block — it's
-        // the `}` at the same indent depth as the `synchronized`
-        // line. Heuristic: find the line `        }` that follows the
-        // try/catch/finally and isn't followed by `.something`.
-        val syncBlockEnd = writeBlock.indexOf("\n        }\n", syncStart)
-        assertTrue("synchronized block close not found", syncBlockEnd >= 0)
-        val outsideTheLock = writeBlock.substring(syncBlockEnd)
-        assertTrue(
-            "broadcastChanged() must be called outside the synchronized block",
-            Regex("""broadcastChanged\s*\(\s*\)""").containsMatchIn(outsideTheLock),
-        )
-        val insideTheLock = writeBlock.substring(syncStart, syncBlockEnd)
-        assertFalse(
-            "broadcastChanged() must NOT remain inside the synchronized block",
-            Regex("""broadcastChanged\s*\(\s*\)""").containsMatchIn(insideTheLock),
-        )
+
+        for ((funName, regex) in listOf(
+            "write" to Regex("""fun\s+write\s*\(\s*value\s*:\s*T\s*\)(?:\s*:\s*Boolean)?\s*\{[\s\S]*?(?=\n\s{4}\}\n)"""),
+            "update" to Regex("""suspend\s+fun\s+update\s*\(\s*transform[\s\S]*?\)\s*:\s*Boolean\s*\{[\s\S]*?(?=\n\s{4}\}\n)"""),
+        )) {
+            val funcBlock = regex.find(text)?.value ?: error("$funName() body not found")
+            val syncStart = funcBlock.indexOf("synchronized(writeLock)")
+            assertTrue("$funName: synchronized(writeLock) block must exist", syncStart >= 0)
+            // Find the matching `}` for the synchronized block by
+            // counting braces from the opening `{`. The block can be
+            // single-line (`synchronized(writeLock) { foo() }`) or
+            // multi-line — line-aligned-indent heuristics broke when
+            // round 18 collapsed write()'s synchronized into a
+            // single-line call to persistLocked.
+            val openBraceAt = funcBlock.indexOf('{', syncStart)
+            assertTrue("$funName: synchronized opening brace not found", openBraceAt >= 0)
+            var depth = 1
+            var i = openBraceAt + 1
+            while (i < funcBlock.length && depth > 0) {
+                when (funcBlock[i]) {
+                    '{' -> depth++
+                    '}' -> depth--
+                }
+                i++
+            }
+            assertTrue("$funName: synchronized closing brace not found", depth == 0)
+            val syncBlockEnd = i // position immediately after the matching `}`
+            val outsideTheLock = funcBlock.substring(syncBlockEnd)
+            assertTrue(
+                "$funName: broadcastChanged() must be called outside the synchronized block",
+                Regex("""broadcastChanged\s*\(\s*\)""").containsMatchIn(outsideTheLock),
+            )
+            val insideTheLock = funcBlock.substring(openBraceAt, syncBlockEnd)
+            assertFalse(
+                "$funName: broadcastChanged() must NOT remain inside the synchronized block",
+                Regex("""broadcastChanged\s*\(\s*\)""").containsMatchIn(insideTheLock),
+            )
+        }
     }
 
     @Test
@@ -624,6 +661,148 @@ class CrossProcessStoreTest {
         // canonical basename check.
         assertTrue("isValidFileName must compare against File(fileName).name",
             Regex("""fileName\s*!=\s*File\s*\(\s*fileName\s*\)\s*\.\s*name""").containsMatchIn(text))
+    }
+
+    // --- BAT-513 Boolean return + synchronized-protected update() ---
+
+    @Test
+    fun `drift write returns Boolean (BAT-513 — failure visibility for callers)`() {
+        // BAT-513 amends the BAT-512 store: `write()` must return Boolean
+        // so callers (Settings UI, Telegram /provider, /model) can
+        // distinguish persisted-success from caught-failure and surface
+        // the difference (snackbar + revert / "couldn't save" reply)
+        // instead of leaving silent optimistic UI state.
+        //
+        // Pin both ends of the contract:
+        //   1) the function signature returns Boolean,
+        //   2) `return didWrite` is the actual return statement (so a
+        //      future refactor that flips the success flag without
+        //      returning it can't sneak through).
+        val src = locateLiveSource()
+        val text = src.readText()
+        assertTrue(
+            "write() must return Boolean (was Unit pre-BAT-513)",
+            Regex("""fun\s+write\s*\(\s*value\s*:\s*T\s*\)\s*:\s*Boolean\s*\{""")
+                .containsMatchIn(text),
+        )
+        // BAT-513 round-27: scope the `return didWrite` check to
+        // write()'s body specifically. After round-18 extracted
+        // persistLocked, update() ALSO contains `return didWrite`
+        // (its outer return), so a global grep would pass even if
+        // write() stopped returning the flag. Extract the write
+        // body via the same regex pattern the other drift tests use.
+        val writeBlock = Regex(
+            """fun\s+write\s*\(\s*value\s*:\s*T\s*\)(?:\s*:\s*Boolean)?\s*\{[\s\S]*?(?=\n\s{4}\}\n)""",
+        ).find(text)?.value ?: error("write() function body not found")
+        assertTrue(
+            "write() body must end by returning the didWrite flag",
+            Regex("""return\s+didWrite\b""").containsMatchIn(writeBlock),
+        )
+    }
+
+    @Test
+    fun `drift update serializes RMW via synchronized writeLock (BAT-513 round-13)`() {
+        // BAT-513 adds `suspend fun update(transform: (T) -> T): Boolean`.
+        // Round 13 review caught that an early Mutex-only design serialized
+        // update-vs-update but missed update-vs-write: a `write()` from
+        // another thread could fire between update's `read()` and
+        // `write(next)`, and update would overwrite it. The fix uses
+        // `synchronized(writeLock)` for the entire RMW so update is atomic
+        // w.r.t. concurrent write() calls too (synchronized is reentrant
+        // on the JVM, so the nested write() call works fine).
+        //
+        // Pin the structural contract: declared as `suspend`, takes a
+        // `(T) -> T` transform, returns Boolean, and the body wraps
+        // read+transform+write in `synchronized(writeLock)` (NOT in a
+        // separate Mutex that wouldn't serialize against write()).
+        val src = locateLiveSource()
+        val text = src.readText()
+        assertTrue(
+            "update must be declared suspend with the (T) -> T transform shape",
+            Regex(
+                """suspend\s+fun\s+update\s*\(\s*transform\s*:\s*\(\s*T\s*\)\s*->\s*T\s*\)\s*:\s*Boolean\b""",
+            ).containsMatchIn(text),
+        )
+        // Round 18 changed update's body from a single-expression
+        // `= synchronized(...)` to a block body that drops the lock
+        // before broadcastChanged. Look for the synchronized(writeLock)
+        // block INSIDE the update body, not the body's top-level
+        // shape.
+        val updateBlock = Regex(
+            """suspend\s+fun\s+update\s*\(\s*transform[\s\S]*?\)\s*:\s*Boolean\s*\{[\s\S]*?(?=\n\s{4}\}\n)""",
+        ).find(text)?.value ?: error("update() function body not found")
+        assertTrue(
+            "update body must contain synchronized(writeLock) so the RMW is atomic w.r.t. write()",
+            Regex("""synchronized\s*\(\s*writeLock\s*\)""").containsMatchIn(updateBlock),
+        )
+        // Negative pin: the OLD pattern (separate Mutex/withLock that
+        // misses update-vs-write contention) must be gone. If a future
+        // refactor brings back a `Mutex()` for update serialization,
+        // this guard fires and forces the maintainer to revisit the
+        // round-13 review thread before re-introducing the bug class.
+        assertFalse(
+            "update must NOT use a separate Mutex (round-13 fix dropped updateMutex)",
+            Regex("""updateMutex\s*=\s*Mutex\s*\(\s*\)""").containsMatchIn(text),
+        )
+        assertFalse(
+            "update body must NOT call updateMutex.withLock (round-13 fix uses synchronized(writeLock) instead)",
+            Regex("""updateMutex\.withLock""").containsMatchIn(text),
+        )
+    }
+
+    @Test
+    fun `production CrossProcessStore update under contention preserves all increments`() {
+        // BAT-513 round-19: drive the REAL CrossProcessStore.update()
+        // implementation, not a mirror. Round 18 left this as a
+        // pattern-mirror test that didn't fail if production atomicity
+        // changed; reviewer correctly flagged that the test was
+        // claiming validation it didn't deliver. The round-19 refactor
+        // adds a JVM-only constructor (filesDir injection, no Android
+        // Context) so unit tests can construct a fully-functional
+        // store and exercise update() under real Dispatchers.Default
+        // contention.
+        //
+        // What this proves about production code:
+        //   - synchronized(writeLock) inside update() actually
+        //     serializes concurrent update() calls (10 increments
+        //     preserved → no lost updates).
+        //   - The persistLocked file-write + _state publish stays
+        //     atomic w.r.t. the read inside the same synchronized
+        //     block.
+        //   - cloneSafe round-trip works at the volume + concurrency
+        //     of the test.
+        //
+        // What this does NOT exercise (those are device tests):
+        //   - FileObserver event delivery
+        //   - BroadcastReceiver register/dispatch
+        //   - Cross-process notification semantics
+        val store = CrossProcessStore(
+            filesDir = workDir,
+            fileName = "rmw-prod.json",
+            serializer = Sample.serializer(),
+            initial = Sample(model = "0"),
+        )
+        // Seed via the production write path so the on-disk state is
+        // a known starting point.
+        assertTrue("seed write succeeds", store.write(Sample(model = "0")))
+
+        runBlocking {
+            val deferreds = (1..10).map {
+                async(kotlinx.coroutines.Dispatchers.Default) {
+                    store.update { s ->
+                        s.copy(model = (s.model.toInt() + 1).toString())
+                    }
+                }
+            }
+            assertTrue("all updates report success", deferreds.awaitAll().all { it })
+        }
+        val finalValue = store.read()
+        assertEquals(
+            "production CrossProcessStore.update must preserve all 10 increments — no lost updates",
+            "10",
+            finalValue.model,
+        )
+        store.close()
     }
 
     // --- helpers (mirror the live class) ---

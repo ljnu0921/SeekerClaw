@@ -132,13 +132,66 @@ import java.util.concurrent.atomic.AtomicBoolean
  *                       FileObserver / receiver threads. Defaults to
  *                       `Dispatchers.IO`.
  */
-class CrossProcessStore<T>(
-    context: Context,
+class CrossProcessStore<T> private constructor(
+    private val filesDirRoot: File,
+    // Null in the test-only constructor: skips FileObserver attach,
+    // BroadcastReceiver register, and broadcastChanged. The store is
+    // still fully functional for read/write/update/reload — exactly
+    // what JVM tests need to drive the production update() under
+    // contention without an Android Context (BAT-513 round-19).
+    private val appContext: Context?,
     private val fileName: String,
     private val serializer: KSerializer<T>,
     initial: T,
-    parentScope: CoroutineScope? = null,
+    parentScope: CoroutineScope?,
 ) {
+    /**
+     * Production constructor. Pins to `applicationContext` so an
+     * Activity/Service Context passed in by mistake can't leak the
+     * BroadcastReceiver/FileObserver for the lifetime of that
+     * component (BAT-512 review fix #6).
+     */
+    constructor(
+        context: Context,
+        fileName: String,
+        serializer: KSerializer<T>,
+        initial: T,
+        parentScope: CoroutineScope? = null,
+    ) : this(
+        filesDirRoot = context.applicationContext.filesDir,
+        appContext = context.applicationContext,
+        fileName = fileName,
+        serializer = serializer,
+        initial = initial,
+        parentScope = parentScope,
+    )
+
+    /**
+     * Test-only constructor (BAT-513 round-19). Bypasses the Android
+     * wiring (FileObserver + BroadcastReceiver + sendBroadcast) so
+     * JVM unit tests can drive the production [read] / [write] /
+     * [update] / [reload] methods against a real tmp filesDir
+     * without instantiating Robolectric or running on a device.
+     * Cross-process notification paths aren't exercised by tests
+     * built with this constructor — those are validated separately
+     * by device tests.
+     */
+    @androidx.annotation.VisibleForTesting
+    internal constructor(
+        filesDir: File,
+        fileName: String,
+        serializer: KSerializer<T>,
+        initial: T,
+        parentScope: CoroutineScope? = null,
+    ) : this(
+        filesDirRoot = filesDir,
+        appContext = null,
+        fileName = fileName,
+        serializer = serializer,
+        initial = initial,
+        parentScope = parentScope,
+    )
+
     init {
         // BAT-512 (Copilot review fix #1): fileName is documented as a
         // basename relative to filesDir. Without enforcement, a caller
@@ -149,13 +202,6 @@ class CrossProcessStore<T>(
             "fileName must be a non-empty basename without path separators or '..': '$fileName'"
         }
     }
-
-    // BAT-512 (Copilot review fix #6): pin to applicationContext so a
-    // caller passing an Activity/Service Context can't leak the
-    // BroadcastReceiver / FileObserver for the lifetime of that
-    // component. The application context survives configuration
-    // changes and process boundaries cleanly.
-    private val appContext: Context = context.applicationContext
 
     // BAT-512 (Copilot review fix #7): own a SupervisorJob so close()
     // can cancel in-flight reload coroutines for the default fresh
@@ -169,8 +215,17 @@ class CrossProcessStore<T>(
     private val coroutineScope: CoroutineScope = parentScope
         ?: CoroutineScope(Dispatchers.IO + ownedJob!!)
 
-    private val file: File = File(appContext.filesDir, fileName)
-    private val tmpFile: File = File(appContext.filesDir, "$fileName.tmp")
+    private val file: File = File(filesDirRoot, fileName)
+    private val tmpFile: File = File(filesDirRoot, "$fileName.tmp")
+    // BAT-513 round-13: writeLock now also serves as the read-modify-write
+    // serialization point for [update]. The earlier design used a separate
+    // kotlinx Mutex for update, which protected update-vs-update but
+    // missed update-vs-write: a `write()` from another thread could fire
+    // between [update]'s `read()` and `write(next)` and the update would
+    // overwrite it. By taking the same `synchronized(writeLock)` for the
+    // entire RMW, update is now atomic w.r.t. concurrent `write()` too.
+    // synchronized is reentrant on the JVM, so update's nested call to
+    // write() (which also takes writeLock) is fine.
     private val writeLock = Any()
 
     private val json = Json {
@@ -316,6 +371,13 @@ class CrossProcessStore<T>(
      * (via [state]) and other-process observers (via FileObserver +
      * broadcast).
      *
+     * Returns `true` IFF the file was persisted AND [_state] published
+     * the new value. Returns `false` on a caught failure (full FS,
+     * permission, IO error, encode failure) — callers translate this
+     * into user-visible feedback (toast / snackbar / Telegram reply);
+     * the store itself never throws so a hot path can't be killed by
+     * a transient FS error. The failure is also logged at ERROR.
+     *
      * Concurrent writes from the same process serialize via [writeLock]
      * — `writeText` to the `.tmp` file plus the
      * `Files.move(..., REPLACE_EXISTING, ATOMIC_MOVE)` (with a non-
@@ -330,7 +392,7 @@ class CrossProcessStore<T>(
      * stored in [_state] so a caller mutating their reference after
      * `write()` returns can't change what observers see.
      */
-    fun write(value: T) {
+    fun write(value: T): Boolean {
         // BAT-512 (Copilot review fix round-7): clone `value` ONCE
         // up-front into a stable snapshot, then derive both the
         // serialized text and the `_state` update from that snapshot.
@@ -341,78 +403,151 @@ class CrossProcessStore<T>(
         // snapshots. Cloning once also avoids the extra encode/decode
         // round-trip cloneSafe used to do for the in-memory copy.
         val snapshot: T = cloneSafe(value)
-        // BAT-512 (Copilot review fix round-6): broadcast OUTSIDE the
-        // critical section. sendBroadcast is a system IPC that can
-        // block briefly; holding writeLock across it amplifies
-        // contention for concurrent writers without protecting any
-        // additional invariant (the file move + _state update are
-        // already atomic w.r.t. observers). This flag tells the
-        // post-lock code whether the write succeeded so it can
-        // broadcast only after a real state change.
-        var didWrite = false
-        synchronized(writeLock) {
-            try {
-                val text = json.encodeToString(serializer, snapshot)
-                tmpFile.writeText(text)
-                // BAT-512 (Copilot review fix): use NIO `Files.move`
-                // with REPLACE_EXISTING + ATOMIC_MOVE so the rename is
-                // atomic AT THE FILESYSTEM LEVEL even when the
-                // destination already exists. The earlier delete +
-                // renameTo fallback opened a window in which
-                // FileObserver fired DELETE, the corresponding reload
-                // landed `initial` in `_state`, and only the
-                // subsequent CREATE/MOVED_TO restored the correct
-                // value — observers briefly saw garbage.
-                //
-                // ATOMIC_MOVE + REPLACE_EXISTING is supported on the
-                // filesystems Android uses (ext4, F2FS). Min SDK 34 so
-                // java.nio.file is available. AtomicMoveNotSupported
-                // can occur on cross-device moves only, which doesn't
-                // happen here (both files are under filesDir on the
-                // same partition); we still degrade gracefully if it
-                // does.
-                try {
-                    java.nio.file.Files.move(
-                        tmpFile.toPath(),
-                        file.toPath(),
-                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                        java.nio.file.StandardCopyOption.ATOMIC_MOVE,
-                    )
-                } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
-                    // Fall back to non-atomic REPLACE_EXISTING — still
-                    // single-syscall (no DELETE event), just not
-                    // strictly atomic if the kernel decides otherwise.
-                    java.nio.file.Files.move(
-                        tmpFile.toPath(),
-                        file.toPath(),
-                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                    )
-                }
-                // BAT-512 (Copilot review fix #4 round-4 + round-7):
-                // publish the same snapshot we just wrote to disk. A
-                // caller mutating their `value` reference after this
-                // returns cannot mutate what StateFlow observers see
-                // (because `snapshot` was cloned at function entry
-                // and is no longer reachable from the caller). And
-                // disk + _state are guaranteed to publish the SAME
-                // snapshot — no race where they diverge if the
-                // caller mutates mid-write.
-                _state.value = snapshot
-                didWrite = true
-            } catch (e: Exception) {
-                Log.e(TAG, "[$fileName] write failed: ${e.message}", e)
-            } finally {
-                // Defensive: clean up a leftover .tmp on the failure path
-                // so we don't accumulate cruft. No-op when the move
-                // succeeded (the source inode is gone).
-                if (tmpFile.exists()) tmpFile.delete()
-            }
-        }
-        // Broadcast OUTSIDE the lock — see the note above the
-        // synchronized block. Skipped on the failure path so a
-        // failed write doesn't tell other-process observers a
-        // change happened that didn't.
+        // BAT-512 (Copilot review fix round-6) + BAT-513 round-18:
+        // broadcast OUTSIDE the critical section. sendBroadcast is a
+        // system IPC that can block briefly; holding writeLock across
+        // it amplifies contention for concurrent writers without
+        // protecting any additional invariant. This now goes through
+        // [persistLocked] which both [write] and [update] share, so
+        // both paths broadcast outside their own synchronized block.
+        val didWrite = synchronized(writeLock) { persistLocked(snapshot) }
         if (didWrite) broadcastChanged()
+        return didWrite
+    }
+
+    /**
+     * Persist [snapshot] to disk and publish to [_state]. CALLER
+     * holds `synchronized(writeLock)` — either [write]'s direct
+     * synchronized block, or [update]'s outer block (reentrant on
+     * the same monitor). The caller is also responsible for
+     * broadcasting AFTER releasing the lock; this helper returns
+     * `true` iff the caller should broadcast.
+     *
+     * Extracted in BAT-513 round-18 to share the locked-persist
+     * logic between write and update without duplication AND so
+     * update can drop the lock before broadcasting (round-18 review
+     * caught update holding writeLock across the broadcast).
+     *
+     * The lock-required precondition isn't enforceable in the
+     * Kotlin/JVM type system; documented here and structurally
+     * obvious from call sites. Both call sites keep the
+     * synchronized block tight to just this call.
+     */
+    private fun persistLocked(snapshot: T): Boolean {
+        return try {
+            val text = json.encodeToString(serializer, snapshot)
+            tmpFile.writeText(text)
+            // BAT-512 (Copilot review fix): use NIO `Files.move`
+            // with REPLACE_EXISTING + ATOMIC_MOVE so the rename is
+            // atomic AT THE FILESYSTEM LEVEL even when the
+            // destination already exists. The earlier delete +
+            // renameTo fallback opened a window in which
+            // FileObserver fired DELETE, the corresponding reload
+            // landed `initial` in `_state`, and only the
+            // subsequent CREATE/MOVED_TO restored the correct
+            // value — observers briefly saw garbage.
+            //
+            // ATOMIC_MOVE + REPLACE_EXISTING is supported on the
+            // filesystems Android uses (ext4, F2FS). Min SDK 34 so
+            // java.nio.file is available. AtomicMoveNotSupported
+            // can occur on cross-device moves only, which doesn't
+            // happen here (both files are under filesDir on the
+            // same partition); we still degrade gracefully if it
+            // does.
+            try {
+                java.nio.file.Files.move(
+                    tmpFile.toPath(),
+                    file.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                )
+            } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+                // Fall back to non-atomic REPLACE_EXISTING — still
+                // single-syscall (no DELETE event), just not
+                // strictly atomic if the kernel decides otherwise.
+                java.nio.file.Files.move(
+                    tmpFile.toPath(),
+                    file.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                )
+            }
+            // BAT-512 (Copilot review fix #4 round-4 + round-7):
+            // publish the same snapshot we just wrote to disk. A
+            // caller mutating their `value` reference after this
+            // returns cannot mutate what StateFlow observers see
+            // (because `snapshot` was cloned at write/update entry
+            // and is no longer reachable from the caller). disk +
+            // _state are guaranteed to publish the SAME snapshot.
+            _state.value = snapshot
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "[$fileName] write failed: ${e.message}", e)
+            false
+        } finally {
+            // Defensive: clean up a leftover .tmp on the failure path
+            // so we don't accumulate cruft. No-op when the move
+            // succeeded (the source inode is gone).
+            if (tmpFile.exists()) tmpFile.delete()
+        }
+    }
+
+    /**
+     * Read-modify-write under the same `synchronized(writeLock)` that
+     * [write] uses, so the entire `read → transform → persistLocked`
+     * sequence is atomic w.r.t. BOTH concurrent `update {}` calls AND
+     * concurrent `write()` calls in the same process. A pre-round-13
+     * design used a separate kotlinx Mutex; that protected
+     * update-vs-update but missed update-vs-write — a `write()` could
+     * fire between this `read()` and `write(next)` and the update
+     * would overwrite it.
+     *
+     * Round 18 split the persistence into [persistLocked] so update
+     * could broadcast OUTSIDE the lock (write's broadcast was already
+     * outside ITS synchronized block, but with update calling write
+     * inside its outer synchronized, the broadcast was still under
+     * update's lock). update now does read+transform+persistLocked
+     * directly, then drops the lock before [broadcastChanged].
+     *
+     * Returns the [persistLocked] result — `true` if the transformed
+     * value persisted, `false` on caught FS failure.
+     *
+     * The [transform] callback is invoked under the lock with the
+     * current persisted value (a fresh deserialized instance from
+     * [read]) and must return the value to persist. Keep transforms
+     * cheap and pure — the lock is held for the duration of the call,
+     * and `synchronized` blocks the OS thread (no suspension allowed
+     * inside).
+     *
+     * Cross-process `update` is still last-writer-wins per filesystem
+     * move semantics; this lock is same-process only. No caller in
+     * the BAT-511 family needs cross-process RMW.
+     *
+     * Declared `suspend` for forward compatibility — callers may
+     * eventually want to invoke this from coroutine contexts that
+     * could later add per-call work (e.g. metrics, tracing) before
+     * the lock acquisition. The current body has no real suspension
+     * points.
+     */
+    suspend fun update(transform: (T) -> T): Boolean {
+        // BAT-513 round-18: broadcast OUTSIDE the synchronized block.
+        // The pre-round-18 design called write() directly inside the
+        // synchronized block, but write()'s own broadcast happened
+        // outside ITS synchronized block — yet still INSIDE update's
+        // outer synchronized block (reentrant monitor). That meant
+        // sendBroadcast() ran while update held writeLock, blocking
+        // other writers/updates on a slow IPC path.
+        //
+        // Fix: do the read + transform + persist inside the lock via
+        // [persistLocked] (sharing the same locked-persist logic with
+        // [write]). Drop the lock, then broadcast.
+        val didWrite = synchronized(writeLock) {
+            val current = read()
+            val next = transform(current)
+            val snapshot: T = cloneSafe(next)
+            persistLocked(snapshot)
+        }
+        if (didWrite) broadcastChanged()
+        return didWrite
     }
 
     /**
@@ -424,18 +559,37 @@ class CrossProcessStore<T>(
      * BAT-512 (Copilot review fix #1): no-op when the store is
      * [closed] so a coroutine in flight on a caller-owned scope
      * (which we don't cancel) can't publish a value after close().
+     *
+     * BAT-513 round-20: read+publish is wrapped in
+     * `synchronized(writeLock)` to prevent a write-vs-reload race.
+     * Without the lock, a reload that started its `read()` BEFORE a
+     * concurrent `write()` completed could publish the stale value
+     * to `_state.value` AFTER the write — regressing in-memory
+     * state. With the lock, reload either completes entirely before
+     * write begins (publishing whatever the file held at that
+     * moment, then write supersedes), or starts AFTER write
+     * released (reading the new value, publishing the same — no-op).
+     * State can never end at a value older than the latest
+     * successful write.
      */
     fun reload() {
         if (closed.get()) return
-        _state.value = read()
+        synchronized(writeLock) {
+            _state.value = read()
+        }
     }
 
     private fun broadcastChanged() {
+        // Test-only constructor leaves appContext null — skip the
+        // broadcast cleanly. Same-process StateFlow observers still
+        // see the update via _state.value emission inside
+        // persistLocked; only cross-process notification is skipped.
+        val ctx = appContext ?: return
         try {
             val intent = Intent(ACTION_STORE_CHANGED)
-                .setPackage(appContext.packageName)
+                .setPackage(ctx.packageName)
                 .putExtra(EXTRA_FILE_NAME, fileName)
-            appContext.sendBroadcast(intent)
+            ctx.sendBroadcast(intent)
         } catch (e: Exception) {
             // Broadcast failure is non-fatal — FileObserver in the other
             // process will still pick up the file change.
@@ -444,6 +598,12 @@ class CrossProcessStore<T>(
     }
 
     private fun startWatching() {
+        // Test-only constructor (appContext == null) skips the Android
+        // wiring entirely — JVM tests don't have a Looper for FileObserver
+        // and the broadcast receiver registration would NPE without a
+        // real Context. Same-process behaviour (StateFlow updates from
+        // local writes) is unaffected.
+        if (appContext == null) return
         attachFileObserver()
         registerBroadcastReceiver()
     }
@@ -515,8 +675,12 @@ class CrossProcessStore<T>(
                 }
             }
         }
+        // appContext is non-null here — registerBroadcastReceiver is
+        // only called from startWatching(), which already returns early
+        // for the test-only (appContext == null) constructor.
+        val ctx = appContext ?: return
         ContextCompat.registerReceiver(
-            appContext,
+            ctx,
             r,
             IntentFilter(ACTION_STORE_CHANGED),
             ContextCompat.RECEIVER_NOT_EXPORTED,
@@ -559,10 +723,19 @@ class CrossProcessStore<T>(
         fileObserver?.stopWatching()
         fileObserver = null
         receiver?.let {
-            try {
-                appContext.unregisterReceiver(it)
-            } catch (_: Exception) {
-                // Already unregistered, or never registered (test paths).
+            // appContext is null in the test-only constructor where the
+            // receiver was never registered — receiver is itself null
+            // there too, so this whole block is unreachable in that
+            // path. Guard the unregister anyway so a future maintainer
+            // can't trip an NPE by adding a register call without a
+            // context.
+            val ctx = appContext
+            if (ctx != null) {
+                try {
+                    ctx.unregisterReceiver(it)
+                } catch (_: Exception) {
+                    // Already unregistered, or never registered (test paths).
+                }
             }
         }
         receiver = null

@@ -13,6 +13,8 @@ import android.util.Log
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.core.content.ContextCompat
 import com.seekerclaw.app.BuildConfig
+import com.seekerclaw.app.state.RuntimeState
+import com.seekerclaw.app.state.RuntimeStateStore
 import com.seekerclaw.app.util.LogCollector
 import com.seekerclaw.app.util.LogLevel
 import org.json.JSONArray
@@ -121,6 +123,76 @@ object ConfigManager {
         }
     }
 
+    /**
+     * Public facade over [broadcastConfigChanged] + [configVersion]
+     * bump for callers that updated config-relevant state by a path
+     * other than [saveConfig] / [reconcileWithAgentSettings] (e.g.
+     * BAT-513's [com.seekerclaw.app.state.RuntimeStateStore]
+     * collector mirror, which writes prefs from the cross-process
+     * file). Without this, a cross-process write of runtime fields
+     * lands in prefs but in-process Compose screens that read via
+     * [loadConfig] don't recompose until manual remount.
+     *
+     * The [configVersion] bump dispatches to the main thread when
+     * we're not already on it. `mutableIntStateOf` is the Compose
+     * snapshot state Compose recompositions observe; mutating it
+     * from a background thread can land mid-snapshot in the UI
+     * process and produce a confused recomposition. The
+     * RuntimeStateStore collector runs on `Dispatchers.IO`, so
+     * this dispatch is the gate that keeps Compose state mutations
+     * single-threaded. The broadcast goes outside the main-thread
+     * gate — it's a system IPC that doesn't need main-thread
+     * affinity.
+     */
+    fun signalConfigChanged(context: Context) {
+        bumpConfigVersionOnMain()
+        broadcastConfigChanged(context)
+    }
+
+    /**
+     * Increment [configVersion] on the main thread regardless of where
+     * we're called from. Centralizes the main-thread dispatch so every
+     * mutation of this Compose snapshot state is consistent — saveConfig,
+     * reconcileWithAgentSettings, OAuth token saves, individual setters,
+     * [signalConfigChanged] (the BAT-513 collector path), AND the
+     * [ACTION_CONFIG_CHANGED] broadcast receiver in SeekerClawApplication
+     * all route through here. Without centralization, a future caller
+     * running on `Dispatchers.IO` or a bridge handler thread could
+     * mutate `mutableIntStateOf` mid-snapshot and produce a confused
+     * recomposition.
+     *
+     * `internal` so the broadcast receiver (in a different package but
+     * the same module) can call it without re-broadcasting — receivers
+     * are reacting to a broadcast another process already sent, so a
+     * second broadcast here would loop.
+     */
+    internal fun bumpConfigVersionOnMain() {
+        // Internal mutation site — the only place outside this helper
+        // that touches configVersion directly. Reads as "set to current
+        // value + 1" rather than the `++` shorthand so the
+        // codebase-wide replace-all that routes other call sites
+        // through this helper can't accidentally trap these lines.
+        if (android.os.Looper.myLooper() == mainHandler.looper) {
+            configVersion.intValue = configVersion.intValue + 1
+        } else {
+            // BAT-513 round-25: reuse the cached mainHandler instead of
+            // allocating `Handler(Looper.getMainLooper())` per call.
+            // configVersion bumps fire from saveConfig, reconcile,
+            // OAuth saves, individual setters, the BAT-513 collector
+            // mirror, AND the ACTION_CONFIG_CHANGED receiver — moderate
+            // frequency, but per-call allocation adds avoidable GC
+            // pressure. Lazy init pays nothing if every caller happens
+            // to land on main.
+            mainHandler.post {
+                configVersion.intValue = configVersion.intValue + 1
+            }
+        }
+    }
+
+    private val mainHandler: android.os.Handler by lazy {
+        android.os.Handler(android.os.Looper.getMainLooper())
+    }
+
     private const val PREFS_NAME = "seekerclaw_prefs"
     private const val KEY_API_KEY_ENC = "api_key_enc"
     private const val KEY_BOT_TOKEN_ENC = "bot_token_enc"
@@ -219,11 +291,74 @@ object ConfigManager {
             .apply()
     }
 
-    fun saveConfig(context: Context, config: AppConfig) {
+    /**
+     * Persist [config] to [SharedPreferences] (encrypted fields via
+     * [KeystoreHelper]) AND mirror the runtime fields
+     * (provider/authType/model) into [com.seekerclaw.app.state.RuntimeStateStore]
+     * so the `:node` process picks them up via the cross-process file
+     * (BAT-513). The runtime-state write is what determines this
+     * function's return value:
+     *
+     *  - `true` — prefs persisted AND the runtime-state file write
+     *    returned `true`. UI flows can navigate forward / clear
+     *    optimistic state.
+     *  - `false` — prefs commit failed OR the runtime-state file
+     *    write failed. UI flows should surface a Toast/Snackbar and
+     *    revert any optimistic UI state via
+     *    [com.seekerclaw.app.state.RuntimeStateStore.read].
+     *
+     * Pre-BAT-513 callers that ignore the return value continue to
+     * compile (Boolean values can be discarded) — they retain the
+     * pre-BAT-513 fire-and-forget behaviour.
+     */
+    fun saveConfig(context: Context, config: AppConfig): Boolean {
+        // BAT-513: validate the (provider, authType) matrix BEFORE any
+        // persistence. Without this, the matrix gate inside
+        // RuntimeStateStore.write would only fire AFTER prefs.commit
+        // had already written the invalid combo to SharedPreferences,
+        // leaving prefs and runtime_state.json diverged. Up-front gate
+        // means an invalid combo never reaches disk anywhere.
+        if (!RuntimeStateStore.isValidPair(config.provider, config.authType)) {
+            LogCollector.append(
+                "[Config] saveConfig rejected invalid (provider=${config.provider}, " +
+                    "authType=${config.authType}) before persistence",
+                LogLevel.WARN,
+            )
+            return false
+        }
+
+        // BAT-513: snapshot the OLD runtime field values so we can roll
+        // back if RuntimeStateStore.write fails after prefs.commit
+        // succeeds. Without this, an FS error on the runtime-state path
+        // would leave prefs holding the new runtime fields (which the
+        // legacy code path reads) while runtime_state.json still has
+        // the old values — the two persistent stores would diverge,
+        // and a downgrade would land on the new prefs values that
+        // never reached the cross-process file. Rolling back on
+        // failure makes saveConfig atomic at the runtime-fields level
+        // (other fields commit unconditionally — they don't cross-
+        // process sync, so partial commit is the same as today's
+        // pre-BAT-513 behaviour).
+        val sp = prefs(context)
+        val oldProvider = sp.getString(KEY_PROVIDER, null)
+        val oldAuthType = sp.getString(KEY_AUTH_TYPE, null)
+        val oldModel = sp.getString(KEY_MODEL, null)
+        // Also snapshot KEY_SETUP_COMPLETE: saveConfig sets it to `true`
+        // unconditionally (it's the entry point for both fresh setup and
+        // post-setup re-saves). If the runtime-state write later fails on
+        // a fresh setup, leaving KEY_SETUP_COMPLETE flipped to `true`
+        // would let MainActivity skip Setup on next launch even though
+        // the user's setup screen blocked them on the failure. For an
+        // existing user mid-edit, the snapshot is already `true` so the
+        // rollback is a no-op (true → true). The only behavioural change
+        // is on first-install failures, which now correctly stay in the
+        // "setup not complete" state until a successful retry.
+        val oldSetupComplete = sp.getBoolean(KEY_SETUP_COMPLETE, false)
+
         val encApiKey = KeystoreHelper.encrypt(config.anthropicApiKey)
         val encBotToken = KeystoreHelper.encrypt(config.telegramBotToken)
 
-        val editor = prefs(context).edit()
+        val editor = sp.edit()
             .putString(KEY_API_KEY_ENC, Base64.encodeToString(encApiKey, Base64.NO_WRAP))
             .putString(KEY_BOT_TOKEN_ENC, Base64.encodeToString(encBotToken, Base64.NO_WRAP))
             .putString(KEY_OWNER_ID, config.telegramOwnerId)
@@ -359,30 +494,145 @@ object ConfigManager {
         editor.putString(KEY_OPENAI_OAUTH_EXPIRES_AT, config.openaiOAuthExpiresAt)
 
         val persisted = editor.commit()
-        if (persisted) {
-            configVersion.intValue++
-            // Keep agent_settings.json overlay in sync with prefs we just
-            // wrote. Without this, prior `/provider` Telegram commands leave
-            // a stale provider/authType/model in the overlay; the next
-            // loadConfig's reconcileWithAgentSettings sees overlay≠prefs
-            // and adopts the STALE overlay back into prefs — silently
-            // reverting whatever Settings UI / Setup / OAuth flow just
-            // saved. By syncing here, the overlay is only "ahead" of
-            // prefs when the legitimate /provider Telegram flow wrote
-            // overlay without touching prefs (which is exactly when the
-            // reconcile is supposed to fire). Pass `configOverride=config`
-            // so writeAgentSettingsJson skips its own loadConfig
-            // round-trip (which would re-trigger the reconcile we're
-            // trying to keep idle). See PR #339 device-test regression.
-            writeAgentSettingsJson(context, configOverride = config)
-            // Notify the OTHER process — main-process UI relies on this
-            // to refresh after :node-process writes (e.g. /provider
-            // Telegram switch's service-start reconcile). Same-process
-            // observers already saw the configVersion bump above.
-            broadcastConfigChanged(context)
-        } else {
+        if (!persisted) {
             LogCollector.append("[Config] Failed to persist config (commit=false)", LogLevel.ERROR)
+            return false
         }
+        bumpConfigVersionOnMain()
+        // BAT-513 round-9: writeAgentSettingsJson DEFERRED to after
+        // RuntimeStateStore.write succeeds. The overlay also persists
+        // provider/authType/model, and reconcileWithAgentSettings would
+        // re-adopt a NEW overlay back into prefs on the next loadConfig
+        // — undoing the rollback we do below if RuntimeStateStore.write
+        // fails. By moving the overlay write past the
+        // RuntimeStateStore.write success gate, the failure path simply
+        // doesn't write the overlay, so there's nothing to roll back
+        // there. broadcastConfigChanged also moves to the success path
+        // so other-process observers don't get a "config changed"
+        // signal for a save that's about to be reverted.
+        // BAT-513: persist the cross-process runtime state file so the
+        // `:node` process picks up provider/authType/model via
+        // runtime-state.js without waiting for a service restart. The
+        // RuntimeStateStore.write also re-emits via its StateFlow, and
+        // its observe-and-mirror collector will see the new value
+        // already matches prefs (we wrote them above) and skip the
+        // mirror — the redundancy guard is what makes the dual write
+        // free.
+        //
+        // ATOMICITY: if RuntimeStateStore.write fails (FS error), roll
+        // back the prefs runtime fields to their pre-saveConfig values
+        // so prefs and runtime_state.json don't diverge on the runtime
+        // fields. Without rollback, prefs would hold the new runtime
+        // fields while runtime_state.json kept the old ones — a
+        // downgrade would land on prefs values that never reached the
+        // cross-process file. The IllegalArgumentException catch is
+        // now defense-in-depth (the up-front matrix gate at the top
+        // of saveConfig should have prevented invalid combos from
+        // reaching here); same rollback applies.
+        //
+        // PROCESS GUARD: RuntimeStateStore.init only runs in the main
+        // process (SeekerClawApplication.onCreate gates it on
+        // isMainProcess). In `:node`, isInitialized is false and
+        // RuntimeStateStore.write would always return false → saveConfig
+        // would always fail in `:node` even when prefs commit succeeded,
+        // breaking existing AndroidBridge / service-process callers
+        // (round-12 review finding). Skip the runtime-state write +
+        // rollback path in `:node`; runtime_state.json gets its sync
+        // from the direct runtime-state.js write inside Telegram
+        // /provider and /model handlers.
+        val runtimeWritten = if (RuntimeStateStore.isInitialized) try {
+            RuntimeStateStore.write(
+                RuntimeState(
+                    provider = config.provider,
+                    authType = config.authType,
+                    model = config.model,
+                ),
+            )
+        } catch (e: IllegalArgumentException) {
+            LogCollector.append(
+                "[Config] saveConfig produced invalid RuntimeState (defense-in-depth): " +
+                    "${e.message}",
+                LogLevel.WARN,
+            )
+            false
+        } else {
+            // `:node` process — RuntimeStateStore not initialized.
+            // Treat as "no-op success" so saveConfig completes the
+            // prefs+overlay+broadcast path normally. runtime_state.json
+            // sync in `:node` happens at the runtime-state.js write
+            // sites (/provider, /model), not here.
+            true
+        }
+        if (!runtimeWritten) {
+            // Roll back prefs runtime fields AND KEY_SETUP_COMPLETE to
+            // pre-save snapshot. Use commit() (synchronous, returns
+            // success) rather than apply() (async, fire-and-forget) so
+            // saveConfig can't return false to the caller while the
+            // rollback is still pending on disk — a quick process kill
+            // between return and disk flush would otherwise leave
+            // KEY_SETUP_COMPLETE stuck `true` on first-install failures
+            // or runtime fields half-rolled-back. Rolling back
+            // KEY_SETUP_COMPLETE matters for the first-install failure
+            // case: SetupScreen blocks on `false`, but without rollback
+            // prefs would say "setup complete" → MainActivity would
+            // skip Setup on next launch, leaving the user stranded
+            // with an unconfigured agent. For existing users (snapshot
+            // already true), the rollback is a no-op.
+            val rollback = sp.edit()
+            if (oldProvider != null) rollback.putString(KEY_PROVIDER, oldProvider)
+            else rollback.remove(KEY_PROVIDER)
+            if (oldAuthType != null) rollback.putString(KEY_AUTH_TYPE, oldAuthType)
+            else rollback.remove(KEY_AUTH_TYPE)
+            if (oldModel != null) rollback.putString(KEY_MODEL, oldModel)
+            else rollback.remove(KEY_MODEL)
+            rollback.putBoolean(KEY_SETUP_COMPLETE, oldSetupComplete)
+            val rollbackOk = rollback.commit()
+            if (!rollbackOk) {
+                // Synchronous commit failed (rare — usually means the
+                // disk is genuinely full). Log loudly; the partial
+                // rollback may have landed depending on which fields
+                // SharedPreferences flushed before failing. The caller
+                // still gets `false` so the UI surfaces the failure.
+                LogCollector.append(
+                    "[Config] Rollback commit() returned false — prefs may be in inconsistent state " +
+                        "(some runtime fields possibly half-rolled-back)",
+                    LogLevel.ERROR,
+                )
+            }
+            // Bump configVersion AGAIN so the UI recomposes with the
+            // rolled-back runtime fields (it already recomposed once
+            // post-commit with the failed-but-persisted values; a
+            // second bump corrects the snapshot).
+            bumpConfigVersionOnMain()
+            LogCollector.append(
+                "[Config] RuntimeStateStore.write failed — rolled back prefs runtime fields " +
+                    "to (provider=$oldProvider, authType=$oldAuthType, model=$oldModel) " +
+                    "and KEY_SETUP_COMPLETE to $oldSetupComplete (commit_ok=$rollbackOk)",
+                LogLevel.WARN,
+            )
+            return false
+        }
+        // BAT-513 round-9: write the overlay AND broadcast the change
+        // ONLY after both prefs commit + RuntimeStateStore.write
+        // succeeded. The overlay persists provider/authType/model too;
+        // writing it before the runtime-state write would mean a
+        // failure-path rollback would also need to revert the
+        // overlay (and the next loadConfig's reconcileWithAgentSettings
+        // would re-adopt the unreverted overlay back into prefs).
+        // Deferring keeps all three persistent stores (prefs, overlay,
+        // runtime_state.json) atomic at the runtime-fields level —
+        // either all updated together or all left at the prior values.
+        //
+        // configOverride=config: skip the loadConfig round-trip
+        // writeAgentSettingsJson would otherwise do, which would
+        // re-trigger reconcile (PR #339 device-test regression fix).
+        writeAgentSettingsJson(context, configOverride = config)
+        // Notify the OTHER process — main-process UI relies on this
+        // to refresh after :node-process writes (e.g. /provider
+        // Telegram switch's service-start reconcile). Same-process
+        // observers already saw the configVersion bump above.
+        broadcastConfigChanged(context)
+        return true
     }
 
     /**
@@ -796,7 +1046,7 @@ object ConfigManager {
         // is the canonical path here, where :node's ConfigManager.
         // configVersion bumps but main-process UI needs the broadcast
         // below to know.
-        configVersion.intValue++
+        bumpConfigVersionOnMain()
         broadcastConfigChanged(context)
 
         LogCollector.append(
@@ -806,11 +1056,62 @@ object ConfigManager {
                 "model=${if (modelChanged) "$resolvedModel (was ${fromPrefs.model})" else fromPrefs.model}"
         )
 
-        return fromPrefs.copy(
+        val reconciled = fromPrefs.copy(
             provider = if (providerChanged) validProvider!! else fromPrefs.provider,
             authType = if (authChanged) validAuthType!! else fromPrefs.authType,
             model = if (modelChanged) resolvedModel else fromPrefs.model,
         )
+        // BAT-513: keep runtime_state.json in sync with the prefs we just
+        // reconciled. Without this, the legacy agent_settings.json overlay
+        // path could update prefs while the new RuntimeStateStore-backed
+        // file goes stale, and the next `:node` startup would read the
+        // stale file via runtime-state.js and overwrite our reconciled
+        // prefs back. RuntimeStateStore.write is a no-op (returns false)
+        // if init() hasn't run yet — that's fine for the `:node` process,
+        // which doesn't init RuntimeStateStore. The collector's
+        // redundancy guard ensures prefs aren't double-mirrored. Wrap
+        // in try/catch so a (theoretically unreachable) invalid combo
+        // out of reconcile doesn't crash this hot path; the prefs side
+        // is already updated and the agent stays operational.
+        //
+        // Capture and log the Boolean so a transient FS failure (full
+        // storage etc.) surfaces — without this, runtime_state.json
+        // could go stale relative to prefs without any signal,
+        // hiding the divergence until the next successful write.
+        //
+        // Gate on RuntimeStateStore.isInitialized: reconcile fires in
+        // BOTH the main process and `:node`, but RuntimeStateStore.init
+        // is only called in the main process. In `:node`, write() would
+        // always return false (store is null) — that would produce a
+        // misleading WARN every reconcile call there. The :node side
+        // doesn't need this mirror anyway: Telegram-originated
+        // /provider/model commands write runtime_state.json directly
+        // via runtime-state.js, so the reconcile→runtime_state path
+        // is a genuinely main-process-only sync of the legacy overlay
+        // back into the new file.
+        if (RuntimeStateStore.isInitialized) try {
+            val runtimeWritten = RuntimeStateStore.write(
+                RuntimeState(
+                    provider = reconciled.provider,
+                    authType = reconciled.authType,
+                    model = reconciled.model,
+                ),
+            )
+            if (!runtimeWritten) {
+                LogCollector.append(
+                    "[Config] Reconcile: RuntimeStateStore.write returned false — " +
+                        "runtime_state.json may be stale vs prefs until next successful write",
+                    LogLevel.WARN,
+                )
+            }
+        } catch (e: IllegalArgumentException) {
+            LogCollector.append(
+                "[Config] Reconcile produced invalid RuntimeState — runtime_state.json " +
+                    "left untouched (prefs still updated): ${e.message}",
+                LogLevel.WARN,
+            )
+        }
+        return reconciled
     }
 
     /**
@@ -917,14 +1218,27 @@ object ConfigManager {
 
         val persisted = editor.commit()
         if (persisted) {
-            configVersion.intValue++
+            bumpConfigVersionOnMain()
         } else {
             LogCollector.append("[Config] Failed to persist OAuth tokens (commit=false)", LogLevel.ERROR)
         }
     }
 
-    fun updateConfigField(context: Context, field: String, value: String) {
-        val config = loadConfig(context) ?: return
+    /**
+     * Update a single config field and persist via [saveConfig].
+     *
+     * Returns the persistence result from [saveConfig] — `true` on
+     * full success (prefs commit + RuntimeStateStore write), `false`
+     * on any failure (including when no config exists yet, or when
+     * the runtime-state file write failed). Pre-BAT-513 callers that
+     * ignore the return value continue to compile (Boolean values
+     * are discardable in Kotlin); UI flows that touch runtime fields
+     * (`provider`, `authType`, `model`) should check the return so a
+     * failed save doesn't leave the UI displaying the optimistic
+     * value while the cross-process file is still on the old one.
+     */
+    fun updateConfigField(context: Context, field: String, value: String): Boolean {
+        val config = loadConfig(context) ?: return false
         val updated = when (field) {
             "anthropicApiKey" -> config.copy(anthropicApiKey = value)
             "setupToken" -> config.copy(setupToken = value)
@@ -970,13 +1284,13 @@ object ConfigManager {
             "openaiOAuthRefresh" -> config.copy(openaiOAuthRefresh = value)
             "openaiOAuthEmail" -> config.copy(openaiOAuthEmail = value)
             "openaiOAuthExpiresAt" -> config.copy(openaiOAuthExpiresAt = value)
-            else -> return
+            else -> return false
         }
         // saveConfig now syncs the agent_settings.json overlay
         // automatically (writes prefs + overlay atomically), so the
         // separate writeAgentSettingsJson call previously here is no
         // longer needed. See saveConfig for the architectural fix.
-        saveConfig(context, updated)
+        return saveConfig(context, updated)
     }
 
     fun saveOwnerId(context: Context, ownerId: String): Boolean {
@@ -1018,7 +1332,7 @@ object ConfigManager {
             // Also update SharedPreferences for backward compatibility
             val key = if (channel == "discord") KEY_DISCORD_OWNER_ID else KEY_OWNER_ID
             prefs(context).edit().putString(key, ownerId).apply()
-            configVersion.intValue++
+            bumpConfigVersionOnMain()
 
             LogCollector.append("[Config] Owner ID saved to file for channel=$channel")
             return true
@@ -1050,7 +1364,7 @@ object ConfigManager {
     fun clearConfig(context: Context) {
         prefs(context).edit().clear().apply() // Clears all prefs including MCP servers
         KeystoreHelper.deleteKey()
-        configVersion.intValue++
+        bumpConfigVersionOnMain()
     }
 
     fun clearOpenAIOAuth(context: Context) {
@@ -1061,7 +1375,7 @@ object ConfigManager {
             .remove("openai_oauth_email") // legacy plaintext key — clean up on sign-out
             .remove(KEY_OPENAI_OAUTH_EXPIRES_AT)
             .apply()
-        configVersion.intValue++
+        bumpConfigVersionOnMain()
     }
 
     /**
@@ -1308,7 +1622,7 @@ object ConfigManager {
         prefs(context).edit()
             .putString(KEY_ENV_VARS_ENC, Base64.encodeToString(enc, Base64.NO_WRAP))
             .apply()
-        configVersion.intValue++
+        bumpConfigVersionOnMain()
     }
 
     /**
@@ -1368,7 +1682,7 @@ object ConfigManager {
         prefs(context).edit()
             .putString(KEY_MCP_SERVERS_ENC, Base64.encodeToString(enc, Base64.NO_WRAP))
             .apply()
-        configVersion.intValue++
+        bumpConfigVersionOnMain()
     }
 
     fun loadMcpServers(context: Context): List<McpServerConfig> {
@@ -1407,7 +1721,7 @@ object ConfigManager {
             .putString(KEY_WALLET_ADDRESS, address)
             .putString(KEY_WALLET_LABEL, label)
             .apply()
-        configVersion.intValue++
+        bumpConfigVersionOnMain()
         writeWalletConfig(context)
     }
 
@@ -1416,7 +1730,7 @@ object ConfigManager {
             .remove(KEY_WALLET_ADDRESS)
             .remove(KEY_WALLET_LABEL)
             .apply()
-        configVersion.intValue++
+        bumpConfigVersionOnMain()
         val walletFile = File(File(context.filesDir, "workspace"), "solana_wallet.json")
         if (walletFile.exists()) walletFile.delete()
     }

@@ -4,7 +4,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { CHANNEL, workDir, PROVIDER, AUTH_TYPE, OPENAI_AUTH_TYPE, resolveActiveModel, config: _config } = require('./config');
+const { CHANNEL, workDir, PROVIDER, AUTH_TYPE, OPENAI_AUTH_TYPE, resolveActiveModel, runtimeState: _runtimeState, config: _config } = require('./config');
 const { stripSilentReply, containsSilentReply } = require('./silent-reply');
 const modelCatalog = require('./model-catalog');
 const { buildHelpLines } = require('./telegram-commands');
@@ -551,8 +551,47 @@ async function handleModelCommand(chatId, args) {
         deps.log(`[/model] Failed to write agent_settings.json: ${e.message}`, 'ERROR');
         return `❌ Couldn't save — ${e.message}`;
     }
-    deps.log(`[/model] Switched to ${v.model} (provider=${state.provider}, auth=${state.authType})`, 'INFO');
-    return `✓ Switched to \`${v.model}\`. Takes effect on your next message.`;
+    // BAT-513: also persist to runtime_state.json so the main UI process
+    // picks up the change via FileObserver and the prefs shadow stays
+    // in sync for rollback. Write the full state (provider+authType+model)
+    // because the BAT-513 file is a single object — leaving model out
+    // of a /model write would mean the file's other fields could go
+    // stale relative to the overlay. False return is logged but doesn't
+    // block the success reply: the overlay write above is the primary
+    // live-update mechanism (the per-turn ai.js resolver reads it),
+    // so the UI/cross-process sync degrading to next-restart isn't a
+    // correctness regression — just a UX one we surface as a warning.
+    let runtimeOk = true;
+    try {
+        runtimeOk = _runtimeState.write({
+            provider: state.provider,
+            authType: state.authType,
+            model: v.model,
+        });
+    } catch (e) {
+        runtimeOk = false;
+        deps.log(`[/model] runtime_state.json write threw: ${e.message}`, 'ERROR');
+    }
+    if (!runtimeOk) {
+        deps.log(`[/model] runtime_state.json write returned false — UI may show stale model until a later write succeeds`, 'WARN');
+    }
+    deps.log(`[/model] Switched to ${v.model} (provider=${state.provider}, auth=${state.authType}, runtime_state_ok=${runtimeOk})`, 'INFO');
+    // The agent_settings.json overlay was written successfully — the
+    // model takes effect on the next message regardless of the
+    // runtime_state.json failure (Node's per-turn resolveActiveModel
+    // reads the overlay, not runtime_state.json). The UI is the
+    // surface that observes runtime_state.json (via Kotlin's
+    // FileObserver → RuntimeStateStore.state → Settings screen);
+    // when our write to it fails, the UI keeps showing the previous
+    // value. A service restart doesn't fix it — Node's
+    // resolveActiveModel pulls from the overlay regardless, and
+    // re-running this command WOULD fix it (retry the FS write).
+    // Recovery is to retry /model later (or free up storage if the
+    // FS write was rejected).
+    const warningSuffix = runtimeOk
+        ? ''
+        : '\n⚠ App settings UI may show stale model until you /model again or free up storage.';
+    return `✓ Switched to \`${v.model}\`. Takes effect on your next message.${warningSuffix}`;
 }
 
 // ============================================================================
@@ -701,6 +740,86 @@ async function handleProviderCommand(chatId, args, messageId = null) {
         return `❌ Couldn't save — ${e.message}`;
     }
 
+    // BAT-513: snapshot runtime_state.json BEFORE the write so a failed
+    // restart later (bridge fail / sendMessage fail) can revert it
+    // alongside the overlay revert. Without this, the overlay reverts
+    // but runtime_state.json keeps the new (provider, authType, model)
+    // — the main UI Settings screen would then show the NEW provider
+    // while the running Node process is still on the OLD one, a
+    // half-switched state worse than today's overlay-only revert.
+    //
+    // IMPORTANT: parse the file directly here instead of using
+    // `_runtimeState.read()`. The store helper returns the seeded
+    // DEFAULTS on missing/decode failure (correct for hot-read
+    // paths) — but if we treat that as "the prior state" and then
+    // write it back on revert, we'd be persisting DEFAULTS as if
+    // they were the user's previous setting, masking a missing or
+    // corrupt file with a fake history. By parsing raw, missing /
+    // decode failure → `null` → revert path skips the runtime_state
+    // write entirely (the file stays as it was before the /provider
+    // attempt, which is the correct revert).
+    //
+    // ALSO validate the parsed object's shape and matrix BEFORE
+    // accepting it as prevRuntimeState. A parseable-but-invalid
+    // object (missing fields, or a (provider, authType) combo
+    // outside the matrix) would otherwise become a truthy
+    // `prevRuntimeState`; the revert path's `_runtimeState.write`
+    // call would then throw on the matrix gate, the `.catch` would
+    // log WARN, and runtime_state.json would stay STUCK on the new
+    // (provider, authType, model) — exactly the half-switched
+    // state this snapshot is supposed to prevent. Treat invalid
+    // parsed content as "no valid prior file" → null → revert path
+    // skips the write.
+    // BAT-513 round-7: also track whether the file EXISTED before our
+    // write. If the file didn't exist (e.g. first install where the
+    // main UI process's RuntimeStateStore.init migration hasn't run
+    // yet — the `:node` process has no way to gate on that), our own
+    // `_runtimeState.write(...)` below CREATES the file. On a
+    // restart-failure revert with `prevRuntimeState == null`, the
+    // current code path skips the runtime-state write — but that
+    // would leave the FILE WE JUST CREATED on disk advertising the
+    // NEW provider, while the overlay reverts to the OLD one and
+    // the running adapter stays on OLD. Same half-switched state
+    // the snapshot is supposed to prevent.
+    //
+    // Fix: track `prevFileExisted` here, then on revert delete the
+    // file we created when there was no valid prior state.
+    const prevFileExisted = fs.existsSync(_runtimeState.filePath);
+    const prevRuntimeState = (() => {
+        try {
+            if (!prevFileExisted) return null;
+            const parsed = JSON.parse(fs.readFileSync(_runtimeState.filePath, 'utf8'));
+            if (!parsed || typeof parsed !== 'object') return null;
+            if (typeof parsed.provider !== 'string' || typeof parsed.authType !== 'string'
+                || typeof parsed.model !== 'string') {
+                return null;
+            }
+            if (!_runtimeState.validateMatrix(parsed.provider, parsed.authType)) {
+                return null;
+            }
+            return parsed;
+        } catch (_) {
+            return null;
+        }
+    })();
+    const runtimeStateModelToWrite = newModel || state.model;
+    try {
+        const ok = _runtimeState.write({
+            provider: newProvider,
+            authType: newAuthType,
+            model: runtimeStateModelToWrite,
+        });
+        if (!ok) {
+            try { writeAgentSettingsPatch(revertPatch); } catch (_) {}
+            deps.log(`[/provider] runtime_state.json write returned false — reverting overlay, no restart`, 'ERROR');
+            return `❌ Couldn't save provider/model. State unchanged.`;
+        }
+    } catch (e) {
+        try { writeAgentSettingsPatch(revertPatch); } catch (_) {}
+        deps.log(`[/provider] runtime_state.json write threw (${e.message}) — reverting overlay, no restart`, 'ERROR');
+        return `❌ Couldn't save — ${e.message}. State unchanged.`;
+    }
+
     deps.log(`[/provider] Switching to ${newProvider}/${newAuthType} (model=${newModel}); restart pending`, 'INFO');
 
     const displayProv = modelCatalog.displayNameForProvider(newProvider);
@@ -741,16 +860,29 @@ async function handleProviderCommand(chatId, args, messageId = null) {
         deps.androidBridgeCall('/service/restart', {}, 5000).catch((err) => {
             _restartPending = false;
             deps.log(`[/provider] /service/restart bridge call failed: ${err && err.message}`, 'ERROR');
-            // Revert the overlay so the process doesn't keep running with
-            // the OLD adapter while overlay metadata advertises the NEW
-            // one. Without this, `resolveActiveProviderState` (and any
-            // post-failure Kotlin-side reconcile on a manual restart)
-            // would diverge from the actually-active adapter.
+            // Revert BOTH the overlay AND runtime_state.json so the
+            // process doesn't keep running with the OLD adapter while
+            // either file's metadata advertises the NEW one. Without
+            // this, `resolveActiveProviderState` (overlay) and the
+            // main UI Settings screen (runtime_state.json) would each
+            // diverge from the actually-active adapter and from each
+            // other.
             try {
                 writeAgentSettingsPatch(revertPatch);
             } catch (e) {
                 deps.log(`[/provider] overlay revert failed (${e && e.message}); agent_settings.json may be half-switched`, 'WARN');
             }
+            // BAT-513: also revert runtime_state.json so the UI shows
+            // the OLD provider, matching the still-running adapter.
+            // Three branches:
+            //   - Valid prior state present → write it back
+            //   - File didn't exist pre-write but we created it →
+            //     unlink so the UI returns to "no file → fall back
+            //     to config.json" (matches pre-/provider behaviour)
+            //   - File existed but parsed as invalid → leave it; we
+            //     can't restore content we never had. Logged so the
+            //     half-switched state is visible.
+            revertRuntimeStateFile();
             // Restart didn't fire — tell the user so they don't wait
             // forever for a restart that never happens.
             deps.sendMessage(
@@ -767,7 +899,42 @@ async function handleProviderCommand(chatId, args, messageId = null) {
         } catch (e) {
             deps.log(`[/provider] overlay revert failed (${e && e.message})`, 'WARN');
         }
+        revertRuntimeStateFile();
     });
+
+    // BAT-513 round-7: shared revert helper for both restart-failure
+    // callbacks above. Handles the three cases (valid prior state,
+    // file-didnt-exist-pre-write, file-existed-but-invalid) so neither
+    // callback leaves runtime_state.json advertising the NEW provider
+    // when the running adapter has reverted to OLD.
+    function revertRuntimeStateFile() {
+        if (prevRuntimeState) {
+            try { _runtimeState.write(prevRuntimeState); } catch (e) {
+                deps.log(`[/provider] runtime_state revert failed (${e && e.message}); UI may show stale provider`, 'WARN');
+            }
+            return;
+        }
+        if (!prevFileExisted) {
+            // We created the file in this /provider attempt. Delete
+            // it so the UI's RuntimeStateStore re-emits the
+            // last-valid value (the seed or whatever survived in
+            // its StateFlow), and Node startup falls back to
+            // config.json on next service start.
+            try {
+                if (fs.existsSync(_runtimeState.filePath)) {
+                    fs.unlinkSync(_runtimeState.filePath);
+                }
+            } catch (e) {
+                deps.log(`[/provider] runtime_state unlink failed (${e && e.message}); UI may show NEW provider while running on OLD`, 'WARN');
+            }
+            return;
+        }
+        // File existed pre-write but its content was invalid (parsed
+        // as not-an-object, missing fields, or matrix violation). We
+        // overwrote it with the new (valid) state; can't restore
+        // invalid content. Log so the divergence is visible.
+        deps.log(`[/provider] no valid prior runtime_state to restore — file kept as NEW; UI may show stale until next save`, 'WARN');
+    }
 
     // We've handled the reply ourselves — tell the dispatcher not to send it again.
     return { __handled: true };

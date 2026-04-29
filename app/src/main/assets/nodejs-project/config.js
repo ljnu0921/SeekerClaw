@@ -165,8 +165,85 @@ const DISCORD_OWNER_ID = config.discordOwnerId ? String(config.discordOwnerId).t
 let OWNER_ID = CHANNEL === 'discord'
     ? (config.discordOwnerId ? String(config.discordOwnerId).trim() : '')
     : (config.ownerId ? String(config.ownerId).trim() : '');
+// BAT-513: load the cross-process runtime state file (provider /
+// authType / model). This is the new source of truth — Telegram
+// `/provider` and `/model` write to it, the main UI process's
+// RuntimeStateStore mirrors it back to SharedPreferences. config.json
+// is the cold-start fallback (Kotlin regenerates it on every service
+// start from prefs + Keystore), so a fresh install with no
+// runtime_state.json yet still boots correctly.
+//
+// IMPORTANT: read here via raw `JSON.parse(fs.readFileSync(...))` instead
+// of `_runtimeState.read()`. The cross-process-store helper deliberately
+// SWALLOWS decode errors and returns defaults — that's correct for the
+// per-store hot read path (reader gets a usable value, never crashes),
+// but WRONG for our fallback chain. If `runtime_state.json` is corrupt,
+// `_runtimeState.read()` would return `runtime-state.DEFAULTS`
+// (`{claude, api_key, claude-opus-4-7}`) which would silently OVERRIDE
+// whatever `config.json` has — masking the corruption AND leaking
+// defaults into a user's actual config. Inline JSON.parse so we can
+// distinguish "decoded cleanly" from "fell back to defaults" and treat
+// the failure case as "file effectively missing → fall back to
+// config.json". The store handle is still kept for write paths
+// (createStore preserved its own atomicity contract).
+const _runtimeStateModule = require('./runtime-state');
+const _runtimeState = _runtimeStateModule.open(workDir);
+let _runtimeStateValues = null;
+if (fs.existsSync(_runtimeState.filePath)) {
+    try {
+        const _raw = fs.readFileSync(_runtimeState.filePath, 'utf8');
+        const _parsed = JSON.parse(_raw);
+        // Guard: JSON.parse can legitimately return non-objects (a file
+        // containing the literal `null`, or `42`, or `"string"` parses
+        // cleanly). Without this check, `_parsed.provider` on `null`
+        // crashes Node startup with TypeError. Treat any non-object
+        // (including null) the same as decode failure: log + fall
+        // through to config.json.
+        const _isObj = !!_parsed && typeof _parsed === 'object' && !Array.isArray(_parsed);
+        // Defense-in-depth: validate the FULL RuntimeState shape — the
+        // (provider, authType) matrix AND that `model` is a string.
+        // Without the model check, a manually-edited file with provider/
+        // authType present but `model` missing or non-string would
+        // accept the file as "valid" and downstream reads of
+        // `_runtimeStateValues.model` would yield `undefined` (logs
+        // would print "model=undefined" and the per-provider default
+        // would silently take over). The "runtime_state.json is valid"
+        // branch must correspond to a complete persisted RuntimeState,
+        // matching the Kotlin RuntimeState data class which has all
+        // three fields as non-null Strings.
+        if (_isObj && typeof _parsed.provider === 'string' && typeof _parsed.authType === 'string'
+            && typeof _parsed.model === 'string'
+            && _runtimeStateModule.validateMatrix(_parsed.provider, _parsed.authType)) {
+            _runtimeStateValues = _parsed;
+            log(`[Config] Loaded runtime_state.json: provider=${_runtimeStateValues.provider} authType=${_runtimeStateValues.authType} model=${_runtimeStateValues.model}`, 'DEBUG');
+        } else {
+            const _provider = _isObj ? _parsed.provider : '<not-an-object>';
+            const _authType = _isObj ? _parsed.authType : '<not-an-object>';
+            const _model = _isObj ? _parsed.model : '<not-an-object>';
+            log(`[Config] runtime_state.json has invalid content (provider=${_provider}, authType=${_authType}, model=${_model}) — falling back to config.json`, 'WARN');
+            _runtimeStateValues = null;
+        }
+    } catch (e) {
+        // Decode failure (corrupt JSON, partial write surviving rename
+        // failure, manual edit gone wrong). Fall back to config.json
+        // — DO NOT silently substitute the runtime-state DEFAULTS.
+        log(`[Config] runtime_state.json decode failed (${e.message}) — falling back to config.json`, 'WARN');
+        _runtimeStateValues = null;
+    }
+} else {
+    log('[Config] runtime_state.json not present — falling back to config.json values', 'DEBUG');
+}
+
 const _SUPPORTED_PROVIDERS = new Set(['claude', 'openai', 'openrouter', 'custom']);
-const _rawProvider = (typeof config.provider === 'string' && config.provider.trim()) ? config.provider.trim().toLowerCase() : 'claude';
+// Resolution order: runtime_state.json (live, BAT-513) → config.json (cold-start).
+// Fall back to 'claude' if neither has a valid value.
+const _runtimeProvider = (_runtimeStateValues && typeof _runtimeStateValues.provider === 'string')
+    ? _runtimeStateValues.provider.trim().toLowerCase()
+    : '';
+const _configProvider = (typeof config.provider === 'string' && config.provider.trim())
+    ? config.provider.trim().toLowerCase()
+    : '';
+const _rawProvider = _runtimeProvider || _configProvider || 'claude';
 const PROVIDER = _SUPPORTED_PROVIDERS.has(_rawProvider) ? _rawProvider : 'claude';
 // ANTHROPIC_KEY is derived after AUTH_TYPE is computed (below) so it can
 // pick the right credential field. Kotlin now writes raw `anthropicApiKey`
@@ -185,7 +262,15 @@ const _SUPPORTED_OPENAI_AUTH_TYPES = new Set(['api_key', 'oauth']);
 const _LEGACY_OPENAI_AUTH_TYPE_ALIASES = new Map([
     ['setup_token', 'api_key'],
 ]);
-const _rawAuthType = typeof config.authType === 'string' ? config.authType.trim().toLowerCase() : '';
+// BAT-513: authType resolves from runtime_state.json first, then
+// config.json. Same fallback chain as PROVIDER above.
+const _runtimeAuthType = (_runtimeStateValues && typeof _runtimeStateValues.authType === 'string')
+    ? _runtimeStateValues.authType.trim().toLowerCase()
+    : '';
+const _configAuthType = typeof config.authType === 'string'
+    ? config.authType.trim().toLowerCase()
+    : '';
+const _rawAuthType = _runtimeAuthType || _configAuthType;
 let AUTH_TYPE = _rawAuthType || 'api_key';
 
 if (PROVIDER === 'openai' && _LEGACY_OPENAI_AUTH_TYPE_ALIASES.has(AUTH_TYPE)) {
@@ -227,7 +312,17 @@ const _defaultModel = PROVIDER === 'openai' ? 'gpt-5.4'
     : PROVIDER === 'openrouter' ? 'anthropic/claude-sonnet-4-6'
     : PROVIDER === 'custom' ? ''
     : 'claude-opus-4-7';
-const MODEL = config.model || _defaultModel;
+// BAT-513: model resolves from runtime_state.json first, then
+// config.json, then the per-provider safe default. The agent_settings.json
+// overlay path (resolveActiveModel) still applies AFTER this for live
+// `/model` updates within a process lifetime; once the BAT-511 family
+// fully migrates, the overlay path can be retired in favour of
+// runtime-state.js per-turn reads.
+const _runtimeModel = (_runtimeStateValues && typeof _runtimeStateValues.model === 'string'
+    && _runtimeStateValues.model.trim())
+    ? _runtimeStateValues.model.trim()
+    : '';
+const MODEL = _runtimeModel || config.model || _defaultModel;
 const AGENT_NAME = config.agentName || 'SeekerClaw';
 
 /**
@@ -636,6 +731,11 @@ module.exports = {
 
     // Config object (for accessing optional API keys etc.)
     config,
+
+    // BAT-513: handle on the cross-process runtime state file so
+    // command handlers (`/model`, `/provider` in message-handler.js)
+    // can write live updates without re-deriving the file path.
+    runtimeState: _runtimeState,
 
     // Primary constants
     BOT_TOKEN,

@@ -1195,7 +1195,38 @@ fun SettingsScreen(
                         discordOwnerId = importedConfig.discordOwnerId.ifBlank { existing.discordOwnerId },
                         channel = importedConfig.channel.ifBlank { existing.channel },
                     ) else importedConfig
-                    ConfigManager.saveConfig(context, merged)
+                    val savedOk = ConfigManager.saveConfig(context, merged)
+                    if (!savedOk) {
+                        // BAT-513: saveConfig returned false — could be prefs
+                        // commit failure OR RuntimeStateStore.write failure
+                        // OR an invalid (provider, authType) caught at the
+                        // matrix gate. In every case, the cross-process
+                        // file may diverge from what prefs hold for the
+                        // runtime fields. Treat this as a HARD FAILURE of
+                        // the import flow: surface an error, keep the
+                        // dialog open so the user can retry, and don't
+                        // proceed to the success steps (autoStart toggle,
+                        // restart dialog, "Config imported" toast). Same
+                        // pattern as ProviderConfigScreen.switchProvider's
+                        // round-3 fix — UI must reflect what actually
+                        // landed, not the optimistic merge.
+                        LogCollector.append(
+                            "[ConfigImport] saveConfig returned false — import treated as failed",
+                            LogLevel.ERROR,
+                        )
+                        configImportError = "Couldn't apply config — try again or free up storage"
+                        Toast.makeText(
+                            context,
+                            "Couldn't apply config. Try again or free up storage.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        return@TextButton
+                    }
+                    // Read prefs only after the save is confirmed — avoids
+                    // an extra prefs read on the failure path AND avoids
+                    // briefly observing a rolled-back intermediate state
+                    // (rollback uses commit(), so the read here always
+                    // reflects the post-success state).
                     val savedConfig = ConfigManager.loadConfig(context)
                     LogCollector.append(
                         "[ConfigImport] Saved snapshot: ${ConfigManager.redactedSnapshot(savedConfig)}"
