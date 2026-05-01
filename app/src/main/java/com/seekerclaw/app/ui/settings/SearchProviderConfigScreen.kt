@@ -2,6 +2,7 @@ package com.seekerclaw.app.ui.settings
 
 import android.content.Intent
 import android.net.Uri
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
@@ -19,9 +20,11 @@ import androidx.compose.material3.HorizontalDivider
 
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -38,8 +41,14 @@ import com.seekerclaw.app.config.ConfigManager
 import com.seekerclaw.app.config.SearchProviderInfo
 import com.seekerclaw.app.config.availableSearchProviders
 import com.seekerclaw.app.config.searchProviderById
+import com.seekerclaw.app.state.AgentPreferencesStore
 import com.seekerclaw.app.ui.theme.RethinkSans
 import com.seekerclaw.app.ui.theme.SeekerClawColors
+import com.seekerclaw.app.util.LogCollector
+import com.seekerclaw.app.util.LogLevel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun SearchProviderConfigScreen(onBack: () -> Unit) {
@@ -47,7 +56,20 @@ fun SearchProviderConfigScreen(onBack: () -> Unit) {
     val configVer by ConfigManager.configVersion
     var config by remember(configVer) { mutableStateOf(ConfigManager.loadConfig(context)) }
 
-    val activeProvider: SearchProviderInfo = searchProviderById(config?.searchProvider ?: "brave")
+    // BAT-515 v3 §4 + R14: bind activeProvider directly to the
+    // AgentPreferencesStore StateFlow so cross-process writes (Telegram
+    // /provider when we add it, Node-side switch from the future
+    // session_status flow) flow through to the UI without a configVersion
+    // bump. The optimistic local override gives instant visual feedback
+    // on tap while the IO dispatch persists. Note: SearchProviderConfigScreen
+    // is a main-process-only UI surface, so AgentPreferencesStore.isInitialized
+    // is always true here — no fallback to config?.searchProvider needed.
+    val agentPrefs by AgentPreferencesStore.state.collectAsState()
+    val scope = rememberCoroutineScope()
+    var optimisticProvider by remember(agentPrefs.searchProvider) { mutableStateOf<String?>(null) }
+    val effectiveProvider = optimisticProvider ?: agentPrefs.searchProvider
+    val activeProvider: SearchProviderInfo = searchProviderById(effectiveProvider)
+
     var editField by remember { mutableStateOf<String?>(null) }
     var editLabel by remember { mutableStateOf("") }
     var editValue by remember { mutableStateOf("") }
@@ -101,7 +123,73 @@ fun SearchProviderConfigScreen(onBack: () -> Unit) {
                             .fillMaxWidth()
                             .clickable {
                                 if (!isActive) {
-                                    saveField("searchProvider", provider.id, needsRestart = true)
+                                    // BAT-515 v3 §4 + R14/R17/R24: optimistic
+                                    // local override + IO-dispatched atomic
+                                    // update. Switching is LIVE — `:node`
+                                    // reads `agent_preferences.json` per
+                                    // web_search call, so the next search
+                                    // uses the new provider without a
+                                    // service restart. R24 reasoning
+                                    // applies: AgentPreferencesStore.update
+                                    // re-reads inside the writeLock so a
+                                    // concurrent cross-process write isn't
+                                    // clobbered by a stale `current` from
+                                    // outside the lock. R17: clear the
+                                    // optimistic override on failure rather
+                                    // than reverting to the prior id — the
+                                    // canonical state may have changed
+                                    // mid-flight.
+                                    optimisticProvider = provider.id
+                                    scope.launch(Dispatchers.IO) {
+                                        // R10 Copilot: capture the
+                                        // failure cause for the log
+                                        // path so a field issue is
+                                        // diagnosable from device logs
+                                        // (FS error vs validation
+                                        // error are different bugs to
+                                        // chase).
+                                        var validationError: String? = null
+                                        val ok = try {
+                                            AgentPreferencesStore.update {
+                                                it.copy(searchProvider = provider.id)
+                                            }
+                                        } catch (e: IllegalArgumentException) {
+                                            validationError = e.message
+                                            false
+                                        }
+                                        withContext(Dispatchers.Main) {
+                                            if (!ok) {
+                                                optimisticProvider = null
+                                                // R10 Copilot: surface
+                                                // the failure so a
+                                                // silent revert
+                                                // doesn't look like
+                                                // the tap was
+                                                // ignored. Toast for
+                                                // user-visible feedback
+                                                // (mirrors the failure-
+                                                // surface pattern other
+                                                // Settings screens use
+                                                // for irrecoverable
+                                                // saves); LogCollector
+                                                // entry for post-hoc
+                                                // triage when a user
+                                                // reports "the picker
+                                                // doesn't stick".
+                                                Toast.makeText(
+                                                    context,
+                                                    "Couldn't switch search provider — try again",
+                                                    Toast.LENGTH_SHORT,
+                                                ).show()
+                                                LogCollector.append(
+                                                    "[Settings] Search provider switch to '${provider.id}' failed " +
+                                                        (validationError?.let { "(validation: $it)" }
+                                                            ?: "(FS error or store uninitialized)"),
+                                                    LogLevel.WARN,
+                                                )
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             .padding(horizontal = 16.dp, vertical = 14.dp),
@@ -141,7 +229,25 @@ fun SearchProviderConfigScreen(onBack: () -> Unit) {
             SectionLabel("${activeProvider.displayName} Settings")
             Spacer(modifier = Modifier.height(10.dp))
 
-            val activeApiKey: String? = config?.activeSearchApiKey
+            // R1 Copilot: derive the API key from `effectiveProvider`
+            // (the optimistic value), NOT `config.activeSearchApiKey`
+            // (which still reads the lagging `config.searchProvider`).
+            // During the optimistic window between the tap and the
+            // configVersion bump, `activeProvider.displayName` shows
+            // the new provider while `config.activeSearchApiKey`
+            // would still resolve to the OLD provider's key — a
+            // confusing visible mismatch. Looking up via
+            // `effectiveProvider` keeps the section label, masked-key
+            // value, and "missing key" warning all internally
+            // consistent for whichever provider is currently
+            // displayed as Active.
+            val activeApiKey: String? = when (effectiveProvider) {
+                "perplexity" -> config?.perplexityApiKey
+                "exa" -> config?.exaApiKey
+                "tavily" -> config?.tavilyApiKey
+                "firecrawl" -> config?.firecrawlApiKey
+                else -> config?.braveApiKey
+            }
             val isKeyMissing = activeApiKey.isNullOrBlank()
 
             Column(

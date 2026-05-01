@@ -188,6 +188,13 @@ let OWNER_ID = CHANNEL === 'discord'
 // (createStore preserved its own atomicity contract).
 const _runtimeStateModule = require('./runtime-state');
 const _runtimeState = _runtimeStateModule.open(workDir);
+// BAT-515: open the agent-preferences handle alongside runtime-state.
+// `getAgentName` / `getSearchProvider` below read this per-call so live
+// edits from the Settings UI (cross-process write to
+// agent_preferences.json) flow into the running agent on the next
+// inbound message — no service restart needed.
+const _agentPreferencesModule = require('./agent-preferences');
+const _agentPreferences = _agentPreferencesModule.open(workDir);
 let _runtimeStateValues = null;
 if (fs.existsSync(_runtimeState.filePath)) {
     try {
@@ -323,7 +330,86 @@ const _runtimeModel = (_runtimeStateValues && typeof _runtimeStateValues.model =
     ? _runtimeStateValues.model.trim()
     : '';
 const MODEL = _runtimeModel || config.model || _defaultModel;
-const AGENT_NAME = config.agentName || 'SeekerClaw';
+
+// BAT-515: agentName + searchProvider are no longer startup-frozen
+// constants — they're resolved per-call via the precedence chain below
+// so a Settings UI edit (cross-process write to agent_preferences.json)
+// takes effect on the next AI turn / next web_search call without a
+// service restart. See agent-preferences.js for the file shape and
+// AgentPreferencesStore.kt (Kotlin singleton) for the writer-side
+// contract.
+//
+// Precedence per BAT-515 v3 §3:
+//   1. agent_preferences.json (live, validated by readLiveOrNull) —
+//      what Settings/Telegram-flow writes update.
+//   2. config.json `agentName` / `searchProvider` (cold-start
+//      fallback) — what saveConfig.writeConfigJson last wrote. Stays
+//      readable across service restarts even if the live file is
+//      genuinely absent or corrupt.
+//   3. Hardcoded fallback ('MyAgent' / 'brave') — unreachable under
+//      normal flow because saveConfig writes the cold-start keys for
+//      any user past Setup. R9 Copilot: lock-step with
+//      `AgentPreferences.DEFAULT_AGENT_NAME` (Kotlin) and
+//      `agent-preferences.js DEFAULTS.agentName` so the agent
+//      reports the same name across all three sources if the
+//      precedence chain bottoms out.
+
+// R1 Copilot: normalize + validate the cold-start fallback. Without
+// this, a malformed `config.json` field could escape past the live
+// readLiveOrNull check and reach callers — `tools/web.js` would hit
+// the `default:` branch with "Unknown search provider X", and
+// `/status` could surface a whitespace-only agent name. The live
+// path goes through readLiveOrNull which already enforces these
+// rules; the fallbacks need the same.
+function _normalizeAgentName(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return trimmed ? trimmed : null;
+}
+
+function _normalizeSearchProvider(value) {
+    if (typeof value !== 'string') return null;
+    const normalized = value.trim().toLowerCase();
+    // Reuse the same allowlist agent-preferences.js's readLiveOrNull
+    // applies — keeps the live-vs-cold-start gates symmetric so a
+    // value that the live file would reject can't slip through the
+    // fallback either.
+    return _agentPreferencesModule.KNOWN_SEARCH_PROVIDERS.has(normalized)
+        ? normalized
+        : null;
+}
+
+function getAgentName() {
+    const live = _agentPreferences.readLiveOrNull();
+    const liveName = live ? _normalizeAgentName(live.agentName) : null;
+    if (liveName) return liveName;
+    const coldName = _normalizeAgentName(config.agentName);
+    if (coldName) return coldName;
+    // R9 Copilot: lock-step with the shared default. Pre-BAT-515 this
+    // returned 'SeekerClaw' (a Node-only value that diverged from
+    // Kotlin's `AgentPreferences.DEFAULT_AGENT_NAME = "MyAgent"` and
+    // `agent-preferences.js DEFAULTS.agentName = "MyAgent"`). The
+    // unreachable-under-normal-flow caveat still holds (saveConfig
+    // writes both the live file and config.json for any user past
+    // Setup) but keeping all three sources in sync means a
+    // hypothetical full-corruption scenario doesn't surface
+    // inconsistent agent names across `:node` startup banner,
+    // `/status`, and the Android UI.
+    return _agentPreferencesModule.DEFAULTS.agentName;
+}
+
+function getSearchProvider() {
+    const live = _agentPreferences.readLiveOrNull();
+    const liveProvider = live ? _normalizeSearchProvider(live.searchProvider) : null;
+    if (liveProvider) return liveProvider;
+    const coldProvider = _normalizeSearchProvider(config.searchProvider);
+    if (coldProvider) return coldProvider;
+    // R9 Copilot: lock-step with the shared default (currently
+    // 'brave' — same as the prior literal, but reading from the
+    // module so a future default change happens in one place across
+    // Kotlin + Node).
+    return _agentPreferencesModule.DEFAULTS.searchProvider;
+}
 
 /**
  * Resolve the currently-active model — the agent_settings.json overlay
@@ -460,7 +546,7 @@ if (!OWNER_ID) {
         'This is expected on first run; use the Android setup flow to set or reset the owner.', 'WARN');
 } else {
     const authLabel = PROVIDER === 'claude' ? (AUTH_TYPE === 'setup_token' ? 'setup-token' : 'api-key') : 'api-key';
-    log(`Agent: ${AGENT_NAME} | Provider: ${PROVIDER} | Model: ${MODEL} | Auth: ${authLabel} | Owner: ${OWNER_ID}`, 'DEBUG');
+    log(`Agent: ${getAgentName()} | Provider: ${PROVIDER} | Model: ${MODEL} | Auth: ${authLabel} | Owner: ${OWNER_ID}`, 'DEBUG');
 }
 
 function parseCustomHeaders(raw) {
@@ -758,7 +844,13 @@ module.exports = {
     AUTH_TYPE,
     MODEL,
     resolveActiveModel,
-    AGENT_NAME,
+    // BAT-515: per-call getters replace the startup-frozen `AGENT_NAME` /
+    // `config.searchProvider` reads. Consumers (main.js startup banner,
+    // message-handler /status, tools/session.js session_status,
+    // tools/web.js web_search) call these per-turn so a Settings UI
+    // edit takes effect on the next AI turn without a service restart.
+    getAgentName,
+    getSearchProvider,
     BRIDGE_TOKEN,
     USER_AGENT,
     MCP_SERVERS,

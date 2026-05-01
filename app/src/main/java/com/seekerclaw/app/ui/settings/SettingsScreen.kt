@@ -358,10 +358,26 @@ fun SettingsScreen(
         }
     }
 
-    // Fields whose value is re-read live from agent_settings.json on the Node
-    // side (no service restart needed). Keep in sync with live-pickup readers
-    // in main.js (heartbeat) and ai.js (maxStepsPerTurn).
-    val liveUpdateFields = setOf("maxStepsPerTurn", "heartbeatIntervalMinutes")
+    // Fields the `:node` process re-reads live without a service restart.
+    // Two routes feed this set:
+    //   1. agent_settings.json overlay — main.js (heartbeat) and ai.js
+    //      (maxStepsPerTurn) read these per-turn from the workspace
+    //      overlay file written by ConfigManager.writeAgentSettingsJson.
+    //   2. agent_preferences.json (BAT-515) — agent-preferences.js
+    //      `getAgentName()` / `getSearchProvider()` read this per-call
+    //      from the CrossProcessStore-backed file. saveConfig dual-writes
+    //      to AgentPreferencesStore, the Settings UI provider switch
+    //      writes to it directly via the BAT-549 R14/R17/R24 optimistic
+    //      pattern.
+    // R3 Copilot: header comment kept in sync with both routes so a
+    // future field addition to either store doesn't accidentally
+    // get classified by the obsolete "agent_settings.json" wording.
+    val liveUpdateFields = setOf(
+        "maxStepsPerTurn",            // → agent_settings.json overlay
+        "heartbeatIntervalMinutes",   // → agent_settings.json overlay
+        "agentName",                  // → agent_preferences.json (BAT-515)
+        "searchProvider",             // → agent_preferences.json (BAT-515)
+    )
 
     fun saveField(field: String, value: String) {
         ConfigManager.updateConfigField(context, field, value)
