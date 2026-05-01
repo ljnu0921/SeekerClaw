@@ -67,6 +67,19 @@ const LOAD_TARGETS = [
     // gated behind `open(workDir).read()`.
     'mcp-servers.js',
     'internal-control-server.js',
+    // BAT-549: pure helpers — reasoning-redact.js exports redaction utilities
+    // (crypto only, no IO); reasoning-gating.js exports a model-gating regex
+    // table + a pure messages-array filter (no IO, no timers).
+    // reasoning-recovery.js does fs.* writes only when its functions are
+    // CALLED — top-level require has no IO side effects, so it's safe to
+    // load here.
+    'reasoning-redact.js',
+    'reasoning-gating.js',
+    'reasoning-recovery.js',
+    // BAT-549 Commit 3d: signature algorithm — pure (crypto + JSON.parse),
+    // no top-level IO. Loaded here so the smoke harness catches a syntax
+    // or top-level throw on every commit.
+    'custom-config-signature.js',
 ];
 
 // Files skipped intentionally. Most modules depend on config.js (which

@@ -8,7 +8,7 @@ const crypto = require('crypto');
 // ── Imports from other SeekerClaw modules ──────────────────────────────────
 
 const {
-    workDir, MODEL, resolveActiveModel, PROVIDER, CHANNEL, ANTHROPIC_KEY, OPENAI_KEY, OPENROUTER_KEY, CUSTOM_KEY, CUSTOM_BASE_URL, OPENROUTER_FALLBACK_MODEL, OPENROUTER_MODEL_CONTEXT, OPENROUTER_FALLBACK_CONTEXT, AUTH_TYPE, OPENAI_AUTH_TYPE,
+    workDir, MODEL, resolveActiveModel, PROVIDER, CHANNEL, ANTHROPIC_KEY, OPENAI_KEY, OPENROUTER_KEY, CUSTOM_KEY, CUSTOM_BASE_URL, CUSTOM_FORMAT, OPENROUTER_FALLBACK_MODEL, OPENROUTER_MODEL_CONTEXT, OPENROUTER_FALLBACK_CONTEXT, AUTH_TYPE, OPENAI_AUTH_TYPE,
     REACTION_GUIDANCE, REACTION_NOTIFICATIONS, MEMORY_DIR,
     CONFIRM_REQUIRED, TOOL_RATE_LIMITS, TOOL_STATUS_MAP,
     API_TIMEOUT_RETRIES, API_TIMEOUT_BACKOFF_MS, API_TIMEOUT_MAX_BACKOFF_MS,
@@ -17,7 +17,9 @@ const {
     getOwnerId,
     USER_ENV_KEYS,
     config: _config,
+    runtimeState: _runtimeState,
 } = require('./config');
+const { reasoningSupportFor } = require('./model-catalog');
 
 const { redactSecrets } = require('./security');
 // Channel abstraction — routes to telegram.js or discord.js based on config
@@ -26,6 +28,11 @@ const channel = require('./channel');
 const { sentMessageCache, SENT_CACHE_TTL } = require('./telegram');
 // deferStatus is Telegram-specific (inline status messages); no-op on other channels
 const deferStatus = CHANNEL === 'telegram' ? require('./telegram').deferStatus : () => ({ cleanup: async () => {} });
+// BAT-549 Commit 6: extended-thinking indicator. Telegram-only per v4
+// contract; Discord (and any future channel) gets a no-op stub so the
+// chat() call site stays uniform. Discord display work is deferred to
+// a future ticket.
+const deferThinkingStatus = CHANNEL === 'telegram' ? require('./telegram').deferThinkingStatus : () => ({ cleanup: async () => {} });
 const { httpStreamingRequest, httpOpenAIStreamingRequest, httpChatCompletionsStreamingRequest } = require('./http');
 const { getAdapter } = require('./providers');
 const { androidBridgeCall } = require('./bridge');
@@ -40,6 +47,10 @@ const { findMatchingSkills, loadSkills } = require('./skills');
 const { getDb, markDbDirty, markDbSummaryDirty, indexMemoryFiles, saveSession, getRecentSessions } = require('./database');
 const { saveCheckpoint, cleanupChatCheckpoints } = require('./task-store');
 const loopDetector = require('./loop-detector');
+// BAT-549: adaptive 3-step quarantine recovery for reasoning-content 400s
+const _reasoningRecovery = require('./reasoning-recovery');
+// BAT-549 R3: fingerprint for sanitized error logging (no raw payloads)
+const { fingerprint: _reasoningFingerprint } = require('./reasoning-redact');
 
 // ── Injected dependencies (set from main.js at startup) ───────────────────
 // These break circular deps and reference things that still live in main.js
@@ -88,9 +99,14 @@ async function visionAnalyzeImage(imageBase64, prompt, maxTokens = 400) {
             visionBlock,
         ]
     }];
-    const apiMessages = adapter.toApiMessages(neutralMessages);
+    // BAT-549 R2 thread 3 same-class sweep: capture model ONCE so
+    // toApiMessages's Custom gating decision matches what formatRequest
+    // sends. Two `resolveActiveModel()` calls between these lines could
+    // otherwise return different values mid-turn.
+    const visionModel = resolveActiveModel();
+    const apiMessages = adapter.toApiMessages(neutralMessages, visionModel);
     const systemBlocks = adapter.formatSystemPrompt('You are a vision assistant.', '', AUTH_TYPE);
-    const body = adapter.formatRequest(resolveActiveModel(), cappedMaxTokens, systemBlocks, apiMessages, []);
+    const body = adapter.formatRequest(visionModel, cappedMaxTokens, systemBlocks, apiMessages, []);
 
     const res = await claudeApiCall(body, 'vision');
 
@@ -295,9 +311,31 @@ function getConversation(chatId) {
     return conversations.get(chatId);
 }
 
-function addToConversation(chatId, role, content) {
+// R5 thread 2: addToConversation's `extra` field is allowlisted, NOT
+// merged-with-blocklist. Earlier draft used `if (key === 'role' ||
+// key === 'content') continue;` which left `__proto__`/`constructor`/
+// `prototype` open as prototype-pollution vectors if a future caller
+// ever forwarded provider-derived data into `extra`. Allowlist
+// approach is safer + more explicit about intent.
+const _ADD_TO_CONV_ALLOWED_EXTRAS = ['reasoningBlocks'];
+
+function addToConversation(chatId, role, content, extra = null) {
     const conv = getConversation(chatId);
-    conv.push({ role, content });
+    // BAT-549 R2 thread 5: allow optional extra fields (e.g.
+    // reasoningBlocks) to be persisted on assistant messages added at the
+    // final-response site so a non-tool final answer's reasoning content
+    // survives across turns/checkpoints. The default `null` keeps the
+    // call sig backward compatible — existing callers (user messages,
+    // fallback assistant strings) don't pass it.
+    const entry = { role, content };
+    if (extra && typeof extra === 'object') {
+        for (const key of _ADD_TO_CONV_ALLOWED_EXTRAS) {
+            if (Object.prototype.hasOwnProperty.call(extra, key)) {
+                entry[key] = extra[key];
+            }
+        }
+    }
+    conv.push(entry);
     // Keep last N messages
     while (conv.length > MAX_HISTORY) {
         conv.shift();
@@ -350,22 +388,44 @@ async function generateSessionSummary(chatId) {
     const systemBlocks = adapter.formatSystemPrompt(
         'You are a session summarizer. Output ONLY the summary, no preamble.', '', AUTH_TYPE
     );
+    // BAT-549 R2 thread 3 same-class sweep: pass the resolved model to
+    // toApiMessages so Custom gating matches the body's model.
+    const summaryModel = resolveActiveModel();
     const summaryMessages = adapter.toApiMessages([{
         role: 'user',
         content: 'Summarize this conversation in 3-5 bullet points. Focus on: decisions made, tasks completed, new information learned, action items. Skip: greetings, small talk, repeated information. Format: markdown bullets, concise, factual.\n\n' + summaryInput
-    }]);
-    const body = adapter.formatRequest(resolveActiveModel(), 500, systemBlocks, summaryMessages, []);
+    }], summaryModel);
+    const body = adapter.formatRequest(summaryModel, 500, systemBlocks, summaryMessages, []);
 
     const res = await claudeApiCall(body, chatId, { background: true });
     if (res.status !== 200) {
+        // BAT-549 R11 thread 2: same redaction shape as the chat() error
+        // path — error bodies can echo reasoning content / signatures /
+        // encrypted_content; raw payload must not enter logs. Sanitized
+        // status + type/code + length + fingerprint only.
+        // R2-of-2a Copilot: handle string + Buffer bodies too (plaintext/
+        // HTML error pages from upstream CDNs would otherwise log
+        // msgLen=0 msgFp=- and lose ALL diagnostic signal).
         const d = res.data;
-        let reason;
-        if (d?.error?.message) reason = d.error.message;
-        else if (typeof d === 'string') reason = d.slice(0, 200);
-        else if (d) try { reason = JSON.stringify(d).slice(0, 200); } catch (_) { reason = String(d).slice(0, 200); }
-        else reason = 'No error details';
-        reason = reason.replace(/[\r\n]+/g, ' ').trim();
-        log(`[SessionSummary] API ${res.status}: ${reason}`, 'WARN');
+        const errType = (d && d.error && d.error.type) || 'unknown';
+        const errCode = (d && d.error && d.error.code) || null;
+        let errMsg = '';
+        if (typeof d === 'string') {
+            errMsg = d;
+        } else if (Buffer.isBuffer(d)) {
+            errMsg = d;
+        } else if (d) {
+            errMsg = (d.error && d.error.message) || d.message || '';
+        }
+        // R6 Copilot: report msgLen in UTF-8 BYTES (not JS String code-point
+        // length) so the value aligns with what _reasoningFingerprint hashes.
+        // Without this, non-ASCII error messages produce a length value
+        // that disagrees with the fingerprint's hash domain, causing
+        // surprising diagnostics when triaging multi-byte error bodies.
+        const errMsgLen = typeof errMsg === 'string' ? Buffer.byteLength(errMsg, 'utf8')
+            : Buffer.isBuffer(errMsg) ? errMsg.length : 0;
+        const errMsgFp = _reasoningFingerprint(errMsg);
+        log(`[SessionSummary] API ${res.status}: type=${errType} code=${errCode || '-'} msgLen=${errMsgLen} msgFp=${errMsgFp}`, 'WARN');
         return null;
     }
 
@@ -1122,6 +1182,37 @@ function buildSystemBlocks(matchedSkills = [], chatId = null, activeModel = MODE
             lines.push('Auth mode: **API Key** — the user configured an OpenAI platform API key. Requests route through api.openai.com. To switch to ChatGPT OAuth (free with a Plus/Pro subscription), the user can change auth type in Settings > AI Provider > OpenAI.');
         }
         lines.push('');
+    }
+
+    // BAT-549 Commit 5: agent self-knowledge of reasoning capability.
+    // Per CLAUDE.md "Agent Self-Awareness" rule — when we add a feature
+    // the agent only knows what we tell it. Read RuntimeState fresh
+    // each prompt build so the agent's self-description matches
+    // what's actually being sent on the next request.
+    try {
+        const _rtState = (typeof _runtimeState !== 'undefined' && _runtimeState) ? _runtimeState.read() : null;
+        const reasoningOn = !!(_rtState && _rtState.reasoningEnabled);
+        const displayOn = !!(_rtState && _rtState.reasoningDisplayInChat);
+        const _support = (() => {
+            const auth = PROVIDER === 'openai' ? OPENAI_AUTH_TYPE : AUTH_TYPE;
+            try { return reasoningSupportFor(PROVIDER, activeModel, auth); }
+            catch (_) { return 'unknown'; }
+        })();
+        lines.push('## Reasoning (Extended Thinking)');
+        lines.push(`Your active model's reasoning support: \`${_support}\` (yes/no/unknown).`);
+        lines.push(`User's "Extended Thinking" toggle: \`${reasoningOn ? 'on' : 'off'}\`.`);
+        lines.push(`User's "Display reasoning in chat" toggle: \`${displayOn ? 'on' : 'off'}\`.`);
+        if (_support === 'yes' && reasoningOn) {
+            lines.push('You are running with extended thinking enabled — take time for thorough multi-step analysis when warranted. Your thinking is preserved across tool calls within a turn (Anthropic interleaved thinking / OpenAI Responses encrypted_content / OpenRouter reasoning_details).');
+        } else if (_support === 'no') {
+            lines.push('Your model does not support extended thinking — the toggle is a no-op for you. Respond normally.');
+        } else if (_support === 'unknown') {
+            lines.push('Your model is not in the registry. Whether extended thinking takes effect depends on your gateway/provider — assume it does not unless the user has confirmed otherwise.');
+        }
+        lines.push('Users can toggle these any time via Settings > Reasoning OR via Telegram `/think on|off|show|hide`. The active state above reflects what was persisted at the START of THIS turn — a mid-turn toggle takes effect on the next user message.');
+        lines.push('');
+    } catch (_) {
+        // Defensive: never let self-knowledge prompt failures take down chat()
     }
 
     // Runtime limitations (behavioral — device/version info is in PLATFORM.md)
@@ -1928,8 +2019,11 @@ async function summarizeOldMessages(messages, chatId, turnId, modelOverride) {
         const summarySystem = PROVIDER === 'claude'
             ? [{ type: 'text', text: summaryInstruction }]
             : summaryInstruction;
-        const apiMessages = adapter.toApiMessages(summaryPrompt);
-        const body = adapter.formatRequest(modelOverride || MODEL, 256, summarySystem, apiMessages, []);
+        // BAT-549 R2 thread 3 same-class sweep: pass the resolved model
+        // so Custom gating matches the body's model.
+        const summarizeModel = modelOverride || MODEL;
+        const apiMessages = adapter.toApiMessages(summaryPrompt, summarizeModel);
+        const body = adapter.formatRequest(summarizeModel, 256, summarySystem, apiMessages, []);
 
         // Select streaming function based on provider protocol
         const streamFn = adapter.streamProtocol === 'chat-completions'
@@ -2045,6 +2139,17 @@ async function chat(chatId, userMessage, options = {}) {
     const taskId = crypto.randomBytes(8).toString('hex');
     setActiveTask(chatId, taskId);
 
+    // BAT-549 R6 thread 2: when invoked via /resume, the OLD checkpoint's
+    // taskId (the one we restored conversation state from) is on
+    // `options.resumedFromTaskId`. Reasoning-content-400 recovery uses
+    // it to quarantine the actual problematic on-disk file rather than
+    // chat()'s freshly-minted taskId (which has no checkpoint until
+    // after the first tool round). For non-resume turns, this is null
+    // and recovery degrades cleanly: no checkpoint to mutate, just
+    // truncate in-memory.
+    const resumedFromTaskId = (options && typeof options.resumedFromTaskId === 'string')
+        ? options.resumedFromTaskId : null;
+
     // userMessage can be a string or an array of content blocks (for vision)
     // Extract text for skill matching (skip for resume — don't trigger skills)
     const textForSkills = options.isResume ? '' : (
@@ -2109,7 +2214,15 @@ async function chat(chatId, userMessage, options = {}) {
     _summarizedThisTurn.delete(chatId);
     if (global._discoveredToolsByChat) global._discoveredToolsByChat.delete(chatId); // Reset discovered tools
 
+    // BAT-549: `messages` stays `const` because we MUST mutate the
+    // existing array in place — `conversations` map (in-memory state)
+    // holds a reference to it; reassigning would diverge state and
+    // subsequent addToConversation() calls would append to the old
+    // array. The recovery path uses `messages.splice(0, messages.length,
+    // ...newMessages)` to truncate without breaking the reference
+    // (Copilot R1 thread 1, BAT-549 PR #354).
     const messages = getConversation(chatId);
+    let _reasoningRecoveryStep = 0;
 
     // P2.4b: Extract original goal from conversation for checkpoint persistence.
     // On resume, this lets the agent know exactly what it was trying to accomplish.
@@ -2122,6 +2235,11 @@ async function chat(chatId, userMessage, options = {}) {
     // Call Claude API with tool use loop
     let response;
     let stepCount = 0;
+    // BAT-549 R2 thread 5: hoisted from `parsed.reasoningBlocks` inside
+    // the while loop. After break-on-no-tool-calls, we lose `parsed`'s
+    // scope, so capture the final response's blocks here so the
+    // addToConversation(final) at end-of-turn can persist them.
+    let lastParsedReasoningBlocks = [];
     // Read maxStepsPerTurn from agent_settings.json each turn so the user's
     // Settings change takes effect on the next chat() call (no service restart).
     // Mirrors getHeartbeatIntervalMs() in main.js. Clamped to [10, 100]; invalid
@@ -2191,14 +2309,226 @@ async function chat(chatId, userMessage, options = {}) {
             // Defensive: re-sanitize after trim to fix any orphaned tool pairs
             if (trimPasses > 0) sanitizeConversation(messages, turnId);
 
-            // Convert neutral messages to provider API format for the request
-            const apiMessages = adapter.toApiMessages(messages);
-            const body = adapter.formatRequest(activeModel, 4096, systemBlocks, apiMessages, formattedTools);
+            // BAT-549 Commit 3c: build per-turn request options from the LIVE
+            // RuntimeState (read fresh each turn so a Settings toggle takes
+            // effect on the next turn without service restart) plus the
+            // registry's reasoningSupport tri-state. Each adapter decides
+            // whether/how to honor these — see adapter formatRequest /
+            // toApiMessages for the per-provider semantics. The "yes/no/unknown"
+            // resolver gates "yes" tightly: a "no" or "unknown" model never
+            // gets the request param, even if the user toggle is on (registry
+            // is the source of truth for what a given model supports).
+            //
+            // Per-provider registry inputs:
+            //   - openai → OPENAI_AUTH_TYPE (oauth model list ≠ api_key list)
+            //   - anthropic → AUTH_TYPE (api_key vs setup_token)
+            //   - openrouter → freeform → always "unknown"
+            //   - custom → freeform under its OWN id → always "unknown",
+            //              but when CUSTOM_FORMAT === 'responses' the actual
+            //              transport IS OpenAI Responses. Resolve through the
+            //              delegate provider id ('openai') so a known-yes
+            //              model id (e.g., 'gpt-5.4' on a Custom-Responses
+            //              gateway) can light up the user toggle path. Use
+            //              authType 'api_key' since Custom never carries an
+            //              OAuth/Codex credential. Without this delegate-id
+            //              resolution, the user toggle would be permanently
+            //              dead on Custom-Responses (R6 Copilot finding 1).
+            const _liveRtState = (() => {
+                try { return _runtimeState ? _runtimeState.read() : null; }
+                catch (_) { return null; }
+            })();
+            let _registryProviderId = adapter.id;
+            let _authForRegistry;
+            if (adapter.id === 'openai') {
+                _authForRegistry = OPENAI_AUTH_TYPE;
+            } else if (adapter.id === 'custom' && CUSTOM_FORMAT === 'responses') {
+                _registryProviderId = 'openai';
+                _authForRegistry = 'api_key';
+            } else {
+                _authForRegistry = AUTH_TYPE;
+            }
+            const requestOptions = {
+                reasoningEnabled: !!(_liveRtState && _liveRtState.reasoningEnabled),
+                reasoningSupport: reasoningSupportFor(_registryProviderId, activeModel, _authForRegistry),
+                customEchoOverride: !!(_liveRtState && _liveRtState.customEchoReasoning),
+            };
 
-            const res = await claudeApiCall(body, chatId, { turnId, iteration: stepCount });
+            // Convert neutral messages to provider API format for the request.
+            // BAT-549 R2 thread 3: pass `activeModel` as 2nd arg so the
+            // Custom adapter's gating decision uses the SAME model the
+            // request will be sent with (avoids race with a mid-turn
+            // agent_settings.json overlay). Other adapters ignore the
+            // extra arg.
+            // BAT-549 Commit 3c: pass `requestOptions` as 3rd arg so the
+            // Custom adapter can read `customEchoOverride` (replaces the
+            // hardcoded `false` from Commit 1). Other adapters ignore it.
+            const apiMessages = adapter.toApiMessages(messages, activeModel, requestOptions);
+            const body = adapter.formatRequest(activeModel, 4096, systemBlocks, apiMessages, formattedTools, requestOptions);
+
+            // BAT-549 Commit 6: extended-thinking status indicator.
+            // Per v4 contract, the bubble appears ONLY when all three
+            // gates align — the toggle is on, the registry confirms
+            // reasoning support for this model, AND extended thinking
+            // is actually enabled. Anything less and the indicator
+            // would lie ("Thinking..." for a model that isn't).
+            // The bubble is rendered via the `deferThinkingStatus`
+            // helper (telegram.js) which has a 500ms debounce (so
+            // fast non-thinking turns never flash) and NO min-visible
+            // hold (so cleanup never delays the final answer).
+            const showThinkingStatus = !!(
+                requestOptions
+                && requestOptions.reasoningEnabled === true
+                && requestOptions.reasoningSupport === 'yes'
+                && _liveRtState
+                && _liveRtState.reasoningDisplayInChat === true
+            );
+            const thinkingStatus = showThinkingStatus
+                ? deferThinkingStatus(chatId)
+                : { cleanup: async () => {} };
+
+            let res;
+            try {
+                res = await claudeApiCall(body, chatId, { turnId, iteration: stepCount });
+            } finally {
+                // Codex v3/v4 sign-off adjustment: cleanup is
+                // fire-and-forget. Awaiting it inline would gate
+                // response delivery on the bubble-delete network
+                // round-trip — the whole point of the no-min-hold
+                // helper is so the answer can flow IMMEDIATELY.
+                // The .catch swallows so a deletion failure never
+                // surfaces to the user; status is bonus UX.
+                thinkingStatus.cleanup().catch(() => {});
+            }
 
             if (res.status !== 200) {
-                log(`API error: ${res.status} - ${JSON.stringify(res.data)}`, 'ERROR');
+                // BAT-549 R3 thread 2: error bodies can echo reasoning
+                // content, encrypted_content, signatures, or other
+                // sensitive snippets. Log only a minimal sanitized
+                // summary at ERROR level. Mobile logs end up in bug
+                // reports/screenshots — never dump arbitrary provider
+                // payloads. The sanitized summary still gives ops a
+                // useful failure signal (status, error type/code, msg
+                // length + fingerprint).
+                // R2 of Commit 2a: handle string/Buffer res.data too — some
+                // providers (or upstream CDNs) return plaintext/HTML error
+                // bodies. Without this, msgLen=0 / msgFp=- and the log
+                // loses ALL diagnostic signal. Strings are still safe to
+                // fingerprint via _reasoningFingerprint (it's
+                // length+sha256[:8], no raw content).
+                const errType = (res.data && res.data.error && res.data.error.type) || 'unknown';
+                const errCode = (res.data && res.data.error && res.data.error.code) || null;
+                let errMsg = '';
+                if (typeof res.data === 'string') {
+                    errMsg = res.data;
+                } else if (Buffer.isBuffer(res.data)) {
+                    errMsg = res.data; // _reasoningFingerprint handles Buffer
+                } else if (res.data) {
+                    errMsg = (res.data.error && res.data.error.message)
+                        || res.data.message
+                        || '';
+                }
+                // R6 Copilot: UTF-8 byte length to align with the
+                // fingerprint's hash domain (see [SessionSummary] log
+                // path above for the same fix; same reasoning applies).
+                const errMsgLen = typeof errMsg === 'string' ? Buffer.byteLength(errMsg, 'utf8')
+                    : Buffer.isBuffer(errMsg) ? errMsg.length : 0;
+                const errMsgFp = _reasoningFingerprint(errMsg);
+                log(`API error: status=${res.status} type=${errType} code=${errCode || '-'} msgLen=${errMsgLen} msgFp=${errMsgFp}`, 'ERROR');
+
+                // BAT-549: detect "reasoning_content must be passed back" 400
+                // and run adaptive 3-step quarantine recovery before bubbling
+                // up to the user. Tracks _reasoningRecoveryStep on the closure
+                // so a same-error 400 retry escalates to the next step.
+                //
+                // Copilot R1 thread 1: must mutate the EXISTING messages
+                // array in place (via splice) so the `conversations` map's
+                // reference stays valid. Reassigning `messages = …` would
+                // diverge in-memory conversation state — subsequent pushes
+                // and addToConversation() calls would update the wrong
+                // array.
+                //
+                // R4 thread 1: the previous version pushed `[System:
+                // <note>]` as a `{role:'user'}` message before retrying.
+                // That had two bugs: (a) for step 2/3 the user's actual
+                // current prompt may have been quarantined out, leaving
+                // the system note as the model's only user input, and
+                // (b) even when the user prompt survived, the note
+                // became the LAST user message so the model responded
+                // to the note rather than the original question.
+                //
+                // The fix: ensure the current turn's user message is
+                // present as the last user-role entry after truncation
+                // (re-append it if recovery removed it), and do NOT
+                // inject the systemNote into messages. The note is
+                // recovery metadata — it could surface to the user via
+                // Telegram in a future commit, but it must NOT enter
+                // the model's prompt context.
+                // R7 + R8 thread 2: handle non-string userMessage cheaply.
+                // chat() accepts userMessage as either a string OR an
+                // array of content blocks (vision/multipart, possibly
+                // multi-MB base64 image payloads). Reference equality is
+                // sufficient AND OOM-safe because:
+                //   - addToConversation builds `{role, content: userMessage}`
+                //     adopting the original reference verbatim
+                //   - splice(...result.newMessages) preserves entries by
+                //     reference (spread is shallow; quarantine slices are
+                //     shallow too — refs are unchanged)
+                //   - For string userMessage, `===` is value equality
+                //   - For array userMessage, `===` is reference equality
+                //     against the SAME object the user-message entry holds
+                // R7's JSON.stringify fallback was unnecessary overkill
+                // and would re-stringify a multi-MB payload on every retry.
+                const _userMessageEq = (a, b) => a === b;
+                const _applyRecovery = (result) => {
+                    messages.splice(0, messages.length, ...result.newMessages);
+                    // Re-append the current turn's user message if recovery
+                    // removed it. Step 1 cuts AFTER the last user message so
+                    // it's preserved; step 2 cuts at the earliest assistant
+                    // tool-call turn and may remove it; step 3 is full reset.
+                    const last = messages[messages.length - 1];
+                    const lastIsCurrentUser = last
+                        && last.role === 'user'
+                        && _userMessageEq(last.content, userMessage);
+                    if (!lastIsCurrentUser) {
+                        messages.push({ role: 'user', content: userMessage });
+                    }
+                    // result.systemNote intentionally not injected — it's
+                    // recovery metadata for potential user-facing surfaces
+                    // (Telegram reply), not model prompt context.
+                };
+                if (_reasoningRecovery.isReasoningContent400(res.status, res.data)) {
+                    // R5 thread 1: loop escalation until a step returns
+                    // ok=true OR step 3 has been attempted.
+                    let recovered = false;
+                    while (_reasoningRecoveryStep < 3 && !recovered) {
+                        _reasoningRecoveryStep++;
+                        // R6 thread 2: ALSO quarantine the resumed-from
+                        // checkpoint (if any) — its conversationSlice on
+                        // disk is what a future /resume would re-load.
+                        // The fresh taskId checkpoint is mutated for the
+                        // current run; the resumed-from checkpoint is
+                        // mutated to prevent re-load of the bad slice.
+                        if (resumedFromTaskId && resumedFromTaskId !== taskId) {
+                            _reasoningRecovery.quarantineActiveSegment({
+                                chatId, messages, workDir,
+                                taskId: resumedFromTaskId,
+                                step: _reasoningRecoveryStep, log,
+                            });
+                        }
+                        const result = _reasoningRecovery.quarantineActiveSegment({
+                            chatId, messages, workDir, taskId,
+                            step: _reasoningRecoveryStep, log,
+                        });
+                        if (result.ok) {
+                            log(`[ReasoningRecovery] Step ${_reasoningRecoveryStep} truncated at index ${result.cutIndex}; retrying turn`, 'WARN');
+                            _applyRecovery(result);
+                            recovered = true;
+                        }
+                    }
+                    if (recovered) continue;
+                    log(`[ReasoningRecovery] All 3 recovery steps returned ok=false — bubbling error to user`, 'ERROR');
+                }
+
                 const errClass = classifyApiError(res.status, res.data);
                 const userText = errClass.userMessage || `API error: ${res.status}`;
                 log(`[OutputPath] ${JSON.stringify({
@@ -2210,12 +2540,31 @@ async function chat(chatId, userMessage, options = {}) {
                 throw httpErr;
             }
 
+            // BAT-549 R6 thread 1: reset recovery step counter after every
+            // successful response. _reasoningRecoveryStep is per-chat()
+            // call, but a single chat() turn can fire multiple API calls
+            // (tool-use rounds, summary fallback). Without this reset, a
+            // later 400 in the same turn would start at the previous
+            // step (e.g. step 2) and over-truncate even though the
+            // previous round succeeded — each independent 400 episode
+            // should re-attempt step 1 first.
+            _reasoningRecoveryStep = 0;
+
             // BAT-315: Parse response through adapter into neutral format
             const parsed = adapter.fromApiResponse(res.data);
             // Keep raw response for fallback text extraction later
             response = res.data;
             response._parsed = parsed;
 
+            // BAT-549 R2 thread 5: capture final-response reasoning blocks
+            // OUTSIDE the loop scope so the end-of-turn addToConversation
+            // (which fires AFTER `break` below for text-only responses)
+            // can persist them. For tool-call rounds the messages.push
+            // below already preserves blocks; this hoist is specifically
+            // for the text-only final-answer path.
+            lastParsedReasoningBlocks = Array.isArray(parsed.reasoningBlocks)
+                ? parsed.reasoningBlocks
+                : [];
 
             if (parsed.toolCalls.length === 0) {
                 break;
@@ -2231,10 +2580,18 @@ async function chat(chatId, userMessage, options = {}) {
             stepCount++;
 
             // Add assistant's response to history in neutral format
+            // BAT-549: thread reasoningBlocks through so the next turn's
+            // toApiMessages() can emit them back at the wire shape each
+            // adapter requires. Adapters that don't capture reasoning
+            // (claude.js / openai.js pre-Commit-2) return undefined here;
+            // `|| []` keeps the field stable so checkpoint serialization
+            // doesn't churn the schema between turns. Empty array is the
+            // documented "no reasoning preserved" sentinel.
             messages.push({
                 role: 'assistant',
                 content: parsed.text || '',
                 toolCalls: parsed.toolCalls,
+                reasoningBlocks: Array.isArray(parsed.reasoningBlocks) ? parsed.reasoningBlocks : [],
             });
 
             // DeerFlow P1: If this is the final loop-break iteration, ignore any tool calls
@@ -2466,7 +2823,8 @@ async function chat(chatId, userMessage, options = {}) {
                 role: 'user',
                 content: '[System: All tool operations are complete. Briefly summarize what was done and the results for the user. You MUST respond with text — do not use tools or return empty.]'
             }];
-            const summaryApiMsgs = adapter.toApiMessages(summaryNeutral);
+            // BAT-549 R2 thread 3: same activeModel as the body.
+            const summaryApiMsgs = adapter.toApiMessages(summaryNeutral, activeModel);
 
             const summaryRes = await claudeApiCall(
                 adapter.formatRequest(activeModel, 4096, systemBlocks, summaryApiMsgs, []),
@@ -2481,6 +2839,18 @@ async function chat(chatId, userMessage, options = {}) {
                     const cleaned = stripSilentReply(summaryParsed.text);
                     if (cleaned) {
                         textContent = { text: cleaned };
+                        // BAT-549 Copilot 2a finding 4: when the summary call's
+                        // text is consumed as the final assistant message,
+                        // associate THIS call's reasoningBlocks with that
+                        // message — otherwise lastParsedReasoningBlocks (set
+                        // from the prior no-text response) would attach stale
+                        // blocks to the summary message at the end-of-turn
+                        // addToConversation. Empty array if summary didn't
+                        // think — which is the correct "no reasoning preserved"
+                        // sentinel for that turn.
+                        lastParsedReasoningBlocks = Array.isArray(summaryParsed.reasoningBlocks)
+                            ? summaryParsed.reasoningBlocks
+                            : [];
                     } else {
                         log('Summary returned SILENT_REPLY token (any form) — falling through to fallback', 'DEBUG');
                     }
@@ -2526,8 +2896,17 @@ async function chat(chatId, userMessage, options = {}) {
         // the checkpoint must survive for a retry.
         if (stepCount > 0) cleanupChatCheckpoints(chatId);
 
-        // Update conversation history with final response
-        addToConversation(chatId, 'assistant', assistantMessage);
+        // Update conversation history with final response.
+        // BAT-549 R2 thread 5: thread reasoningBlocks through so a non-
+        // tool final answer's reasoning content survives across turns
+        // and into checkpoint snapshots. R2-of-2a Copilot: ALWAYS persist
+        // the field (even when empty) so checkpoint schema is stable
+        // turn-over-turn — every assistant message either has populated
+        // reasoningBlocks or has [] as the documented sentinel. The
+        // mid-loop messages.push at line ~2410 already does this for
+        // tool-use rounds; this matches that contract.
+        addToConversation(chatId, 'assistant', assistantMessage,
+            { reasoningBlocks: lastParsedReasoningBlocks });
 
         // Session summary tracking (BAT-57)
         {

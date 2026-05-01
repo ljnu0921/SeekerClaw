@@ -13,6 +13,7 @@ import android.util.Log
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.core.content.ContextCompat
 import com.seekerclaw.app.BuildConfig
+import com.seekerclaw.app.state.CustomConfigSignature
 import com.seekerclaw.app.state.RuntimeState
 import com.seekerclaw.app.state.RuntimeStateStore
 import com.seekerclaw.app.util.LogCollector
@@ -540,14 +541,79 @@ object ConfigManager {
         // rollback path in `:node`; runtime_state.json gets its sync
         // from the direct runtime-state.js write inside Telegram
         // /provider and /model handlers.
+        // BAT-549 Commit 3d: preserve the BAT-549 RuntimeState fields
+        // across this write. Pre-3d this constructed RuntimeState with
+        // only (provider, authType, model), letting the data class
+        // defaults clobber reasoningEnabled / reasoningDisplayInChat /
+        // customEchoReasoning / customConfigSignature back to their
+        // factory values on every saveConfig. With 3d we read the
+        // current state first, carry the BAT-549 fields forward, AND
+        // recompute the Custom-config signature: when the signature
+        // changes (user edited Custom config), reset
+        // customEchoReasoning to false (the override is gateway-
+        // specific; a new gateway must re-opt-in).
+        //
+        // R26 Copilot: use atomic RuntimeStateStore.update {} so the
+        // BAT-549 fields can't be lost-update-clobbered by a
+        // concurrent writer (Telegram /think handler, future /resume,
+        // another saveConfig in flight from a different process). The
+        // transform runs INSIDE the CrossProcessStore writeLock — the
+        // `current` value passed in is the latest persisted state at
+        // the moment of write, so reasoningEnabled/reasoningDisplayInChat
+        // and any future BAT-549 fields are preserved verbatim except
+        // for the Custom-signature reset path we explicitly handle.
+        //
+        // saveConfig itself is non-suspend (called from Settings and
+        // post-OAuth flows that don't currently hold a CoroutineScope),
+        // so we wrap the suspend update via `runBlocking` on
+        // Dispatchers.IO. saveConfig already does multiple synchronous
+        // SharedPreferences commit() calls; one more blocking call to
+        // CrossProcessStore (which itself just synchronously writes
+        // a tmp file + atomic-renames) doesn't change the latency
+        // profile. Future refactor to suspend-saveConfig is in scope
+        // for a separate cleanup PR.
+        //
+        // Custom-signature reset:
+        //   - Only recompute when config.provider == "custom" because
+        //     AppConfig has no separate "customModel" field; config.model
+        //     is the active model, which represents Custom only when
+        //     on Custom. Switching providers and back must NOT reset
+        //     the override — only direct edits to Custom config fields.
+        //   - When the new sig != current.customConfigSignature, reset
+        //     customEchoReasoning to false (gateway-specific contract;
+        //     see RuntimeState.kt KDoc). Otherwise carry forward.
+        var loggedSigReset = false
         val runtimeWritten = if (RuntimeStateStore.isInitialized) try {
-            RuntimeStateStore.write(
-                RuntimeState(
-                    provider = config.provider,
-                    authType = config.authType,
-                    model = config.model,
-                ),
-            )
+            kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.IO) {
+                RuntimeStateStore.update { current ->
+                    val newCustomSig = if (config.provider == "custom") {
+                        CustomConfigSignature.compute(
+                            customModel = config.model,
+                            customBaseUrl = config.customBaseUrl,
+                            customFormat = config.customFormat,
+                            customHeaders = config.customHeaders,
+                        )
+                    } else {
+                        current.customConfigSignature
+                    }
+                    val customSigChanged = config.provider == "custom"
+                        && current.customConfigSignature != newCustomSig
+                    val newCustomEcho = if (customSigChanged) false else current.customEchoReasoning
+                    if (customSigChanged && current.customEchoReasoning) {
+                        loggedSigReset = true
+                    }
+                    current.copy(
+                        provider = config.provider,
+                        authType = config.authType,
+                        model = config.model,
+                        // reasoningEnabled / reasoningDisplayInChat
+                        // are preserved verbatim from `current` — no
+                        // change in saveConfig.
+                        customEchoReasoning = newCustomEcho,
+                        customConfigSignature = newCustomSig,
+                    )
+                }
+            }
         } catch (e: IllegalArgumentException) {
             LogCollector.append(
                 "[Config] saveConfig produced invalid RuntimeState (defense-in-depth): " +
@@ -562,6 +628,22 @@ object ConfigManager {
             // sync in `:node` happens at the runtime-state.js write
             // sites (/provider, /model), not here.
             true
+        }
+        // R4 Copilot: gate the reset-log on `runtimeWritten`. The
+        // `loggedSigReset` flag is set inside the `update {}`
+        // transform, but the transform can run even when the
+        // ultimate `update()` returns false (FS write failure
+        // after the in-lock state mutation). Logging unconditionally
+        // would tell the user "reset to false" even though the
+        // reset never persisted — misleading. Gating on
+        // `runtimeWritten` ensures the log only fires when the
+        // change actually reached disk.
+        if (loggedSigReset && runtimeWritten) {
+            LogCollector.append(
+                "[Config] BAT-549: Custom config signature changed — reset " +
+                    "customEchoReasoning to false (re-enable in Settings on the new gateway)",
+                LogLevel.INFO,
+            )
         }
         if (!runtimeWritten) {
             // Roll back prefs runtime fields AND KEY_SETUP_COMPLETE to

@@ -19,6 +19,33 @@ const { log } = require('../config');
  *   { role:'assistant', content:[{type:'text',text:'...'},{type:'tool_use',id,name,input}] }
  *   { role:'user', content:[{type:'tool_result', tool_use_id, content}] }
  */
+// BAT-549 Commit 2: collect Anthropic-stamped thinking/redacted_thinking
+// wire blocks from a stored assistant message's reasoningBlocks. These
+// must be echoed back UNCHANGED + IN ORDER on tool-use turns or the
+// signature fails server-side validation. Returns an array of wire
+// objects suitable for splicing into the front of content[].
+//
+// Activation: only blocks where sourceAdapter === 'claude' (i.e. captured
+// by THIS adapter from a previous Anthropic turn). Other-provider blocks
+// (custom/openrouter) pass through silently — they don't belong here.
+function _collectClaudeWireBlocks(msg) {
+    if (!msg || !Array.isArray(msg.reasoningBlocks)) return [];
+    const out = [];
+    for (const blk of msg.reasoningBlocks) {
+        if (!blk || blk.sourceAdapter !== 'claude') continue;
+        if (typeof blk.wire !== 'object' || blk.wire === null || Array.isArray(blk.wire)) continue;
+        const t = blk.wire.type;
+        if (t !== 'thinking' && t !== 'redacted_thinking') continue;
+        // Verify the shape minimally so a corrupted checkpoint can't
+        // submit nonsense: thinking needs string `thinking` + signature;
+        // redacted_thinking needs string `data`.
+        if (t === 'thinking' && (typeof blk.wire.thinking !== 'string' || typeof blk.wire.signature !== 'string')) continue;
+        if (t === 'redacted_thinking' && typeof blk.wire.data !== 'string') continue;
+        out.push(blk.wire);
+    }
+    return out;
+}
+
 function toApiMessages(messages) {
     const out = [];
     let pendingToolResults = [];
@@ -49,16 +76,25 @@ function toApiMessages(messages) {
         }
 
         if (msg.role === 'assistant') {
-            // If content is already a Claude-native array (legacy checkpoint), pass through
+            // If content is already a Claude-native array (legacy checkpoint), pass through.
+            // Such arrays may already include thinking blocks — don't re-emit from
+            // reasoningBlocks here because that would double-up.
             if (Array.isArray(msg.content)) {
                 out.push({ role: 'assistant', content: msg.content });
                 continue;
             }
+            // BAT-549 Commit 2: thinking/redacted_thinking blocks come FIRST
+            // in content[]. Echo only on tool-use turns (toolCalls present)
+            // — that's the Anthropic contract. For text-only assistant
+            // turns the thinking is captured but not replayed.
+            const hasToolCalls = Array.isArray(msg.toolCalls) && msg.toolCalls.length > 0;
+            const thinkingWire = hasToolCalls ? _collectClaudeWireBlocks(msg) : [];
             const content = [];
+            for (const w of thinkingWire) content.push(w);
             if (msg.content) {
                 content.push({ type: 'text', text: msg.content });
             }
-            if (msg.toolCalls && msg.toolCalls.length > 0) {
+            if (hasToolCalls) {
                 for (const tc of msg.toolCalls) {
                     content.push({
                         type: 'tool_use',
@@ -92,7 +128,16 @@ function toApiMessages(messages) {
 /**
  * Parse Claude API response into neutral format.
  * @param {object} raw - Raw Claude response (data field from httpStreamingRequest)
- * @returns {{ text: string|null, toolCalls: Array, stopReason: string, usage: object }}
+ * @returns {{ text, toolCalls, reasoningBlocks, stopReason, usage }}
+ *
+ * BAT-549 Commit 2: also captures `thinking` and `redacted_thinking`
+ * content blocks verbatim into `reasoningBlocks[]` (raw wire payloads,
+ * never re-normalized — Codex v3 finding 1). Required for tool-use
+ * loops with extended thinking enabled: Anthropic server-validates
+ * the `signature` field on every echoed block, so we MUST preserve
+ * them byte-exact + in original order. The `toApiMessages` path on the
+ * NEXT request splices these wire blocks back into the assistant
+ * message's content[] when the message has tool_calls.
  */
 function fromApiResponse(raw) {
     const content = raw.content || [];
@@ -103,9 +148,29 @@ function fromApiResponse(raw) {
         .filter(c => c.type === 'tool_use')
         .map(c => ({ id: c.id, name: c.name, input: c.input || {} }));
 
+    // BAT-549 Commit 2: capture thinking + redacted_thinking blocks
+    // verbatim — preserves the signature byte-exactly so a future
+    // request that echoes them passes Anthropic's server-side
+    // validation. raw.id is the message id (turn id from Anthropic).
+    const reasoningBlocks = [];
+    const turnId = (raw && typeof raw.id === 'string') ? raw.id : null;
+    const sourceModel = (raw && typeof raw.model === 'string') ? raw.model : null;
+    for (const c of content) {
+        if (!c || (c.type !== 'thinking' && c.type !== 'redacted_thinking')) continue;
+        reasoningBlocks.push({
+            schemaVersion: 1,
+            provider: 'anthropic',
+            sourceAdapter: 'claude',
+            sourceModel,
+            turnId,
+            wire: c, // verbatim block; signature stays unchanged
+        });
+    }
+
     return {
         text,
         toolCalls,
+        reasoningBlocks,
         stopReason: raw.stop_reason || 'end_turn',
         usage: raw.usage || {},
     };
@@ -155,8 +220,17 @@ function formatTools(tools) {
 
 /**
  * Build full Claude API request body.
+ *
+ * BAT-549 Commit 3c: the optional 6th `requestOptions` arg gates extended
+ * thinking. Emit `body.thinking` only when BOTH the user toggle
+ * (`reasoningEnabled === true`) AND the registry confirms the model
+ * supports it (`reasoningSupport === "yes"`). The "yes" gate is critical:
+ *   - Haiku 4.5 returns 400 if `thinking` is sent → registry says "no".
+ *   - Unknown models default to "unknown" → don't send (avoid surprise 400).
+ * Existing call sites (vision/summary) that don't pass requestOptions get
+ * the same no-`thinking` behavior as before — additive change.
  */
-function formatRequest(model, maxTokens, systemBlocks, messages, tools) {
+function formatRequest(model, maxTokens, systemBlocks, messages, tools, requestOptions) {
     const body = {
         model,
         max_tokens: maxTokens,
@@ -165,6 +239,17 @@ function formatRequest(model, maxTokens, systemBlocks, messages, tools) {
         messages,
     };
     if (tools && tools.length > 0) body.tools = tools;
+    if (requestOptions
+        && requestOptions.reasoningEnabled === true
+        && requestOptions.reasoningSupport === 'yes') {
+        // budget_tokens is the upper bound on thinking output. 16K is the
+        // BAT-549 v4.1 default — large enough for non-trivial multi-step
+        // reasoning, capped well under Claude 4.x's 32K thinking ceiling
+        // so a runaway thinking pass doesn't burn the entire 200K context
+        // window before the user-facing response. Future Settings UI may
+        // expose this; until then it's a sensible single value.
+        body.thinking = { type: 'enabled', budget_tokens: 16000 };
+    }
     return JSON.stringify(body);
 }
 
@@ -177,12 +262,20 @@ function buildHeaders(apiKey, authType) {
         ? { 'Authorization': `Bearer ${apiKey}` }
         : { 'x-api-key': apiKey };
 
+    // BAT-549 Commit 3c: include the `interleaved-thinking-2025-05-14` beta
+    // so the API accepts replayed `thinking` blocks AFTER `tool_use` blocks
+    // on the next turn. Without this, a tool-loop turn that splices the
+    // captured thinking back into content[] would be rejected. Adding it
+    // is a no-op when reasoning is OFF — the beta only activates when the
+    // request actually emits thinking blocks. Safe-by-default for both
+    // setup_token and api_key auth modes.
+    const betaTags = authType === 'setup_token'
+        ? 'prompt-caching-2024-07-31,oauth-2025-04-20,interleaved-thinking-2025-05-14'
+        : 'prompt-caching-2024-07-31,interleaved-thinking-2025-05-14';
     return {
         'Content-Type': 'application/json',
         'anthropic-version': '2023-06-01',
-        'anthropic-beta': authType === 'setup_token'
-            ? 'prompt-caching-2024-07-31,oauth-2025-04-20'
-            : 'prompt-caching-2024-07-31',
+        'anthropic-beta': betaTags,
         ...auth,
     };
 }

@@ -21,8 +21,49 @@ const { log, OPENROUTER_FALLBACK_MODEL } = require('../config');
  *   { role:'assistant', content:'text', tool_calls:[{id, type:'function', function:{name,arguments}}] }
  *   { role:'tool', tool_call_id:'tc_1', content:'...' }
  */
-function toApiMessages(messages) {
+// BAT-549 R1 of Commit 2a Copilot: gating that the Custom adapter uses
+// must also apply to NATIVE OpenRouter when the user configures a
+// DeepSeek-flavored model (`deepseek/deepseek-r1-0528` etc.). The
+// detect helper recognises both `deepseek/...` OR-prefixed ids and
+// bare `deepseek-...` ids.
+//
+// R2-of-2a Copilot: scope clarified. The gating decision below applies
+// ONLY to the bare `reasoning_content` field (DeepSeek-flavored,
+// where R1 rejects echo with 400). The `reasoning_details[]` array is
+// OpenRouter's NORMALIZED reasoning shape — provider-agnostic, with
+// format-discriminator entries that OpenRouter expects to round-trip
+// verbatim. We always echo `reasoning_details[]` when present (never
+// gated). Per OpenRouter's docs this is the contract regardless of
+// underlying model family.
+const { detectCustomEchoBehavior } = require('../reasoning-gating');
+
+function toApiMessages(messages, activeModel, requestOptions) {
     const out = [];
+
+    // Per-request echo policy for the bare `reasoning_content` field only.
+    // - R1 → 'strip' (server returns 400 if echoed)
+    // - V4 → 'echo-on-tool-loop' (server returns 400 if NOT echoed)
+    // - unknown → 'unknown' (capture-only — don't risk a 400 by echoing
+    //   a bare reasoning_content field on a model whose contract we
+    //   haven't tested)
+    //
+    // Native (non-Custom-delegated) gating uses override=false so a
+    // stale `customEchoReasoning=true` flag from a prior Custom session
+    // doesn't change behavior on native OpenRouter sessions. The
+    // override is per-Custom-config-tuple by design (see
+    // CustomConfigSignature).
+    const nativeEchoBehavior = detectCustomEchoBehavior(activeModel, false);
+    // Per-Custom-delegated gating respects the user's override toggle
+    // (R15 Copilot). When Custom delegates to OpenRouter (chat-
+    // completions format) AND the user has enabled "Echo reasoning
+    // to gateway" for an unknown model id, we promote 'unknown' to
+    // 'echo-on-tool-loop' for THAT specific block class only — keyed
+    // on `delegateAdapter === 'openrouter'` so we never let a
+    // Custom-only flag affect native OpenRouter blocks even within
+    // the same conversation history.
+    const customOverride = !!(requestOptions
+        && requestOptions.customEchoOverride === true);
+    const customDelegatedEchoBehavior = detectCustomEchoBehavior(activeModel, customOverride);
 
     for (const msg of messages) {
         if (msg.role === 'tool') {
@@ -63,6 +104,63 @@ function toApiMessages(messages) {
                     type: 'function',
                     function: { name: tc.name, arguments: JSON.stringify(tc.input || {}) },
                 }));
+            }
+
+            // BAT-549 (v4.1 Codex finding 6): reasoning_details[] attaches
+            // to the assistant message INSIDE messages[], not request top-
+            // level. Echo every block whose source adapter (or delegated
+            // adapter, when invoked from Custom) is openrouter — these are
+            // the wire payloads OpenRouter expects to round-trip verbatim.
+            // Custom's stripReasoningForCustomGating clears reasoningBlocks
+            // upstream when DeepSeek R1 / unknown models are configured.
+            if (Array.isArray(msg.reasoningBlocks) && msg.reasoningBlocks.length > 0) {
+                const details = [];
+                let plainReasoningContent = null;
+                for (const blk of msg.reasoningBlocks) {
+                    if (!blk || !blk.wire) continue;
+                    // R11 thread 1: validate wire is a plain object before
+                    // dereferencing. A corrupted/older checkpoint (or future
+                    // adapter) could store `wire` as a string, number, or
+                    // array — pushing those into reasoning_details would
+                    // produce an invalid request payload that the upstream
+                    // provider would reject. Skip anything that isn't a
+                    // plain object.
+                    if (typeof blk.wire !== 'object' || Array.isArray(blk.wire)) continue;
+                    const srcOk = blk.sourceAdapter === 'openrouter'
+                        || blk.delegateAdapter === 'openrouter';
+                    if (!srcOk) continue;
+                    // R15 Copilot: pick the gating behavior keyed on
+                    // whether this is a Custom-delegated block. Custom-
+                    // delegated blocks (delegateAdapter==='openrouter')
+                    // honor the per-Custom override; native OpenRouter
+                    // blocks ignore it (override is per-Custom-config-tuple
+                    // by design).
+                    const blockEchoBehavior = blk.delegateAdapter === 'openrouter'
+                        ? customDelegatedEchoBehavior
+                        : nativeEchoBehavior;
+                    // OpenRouter native shape — push verbatim
+                    if (blk.wire.reasoning_content === undefined) {
+                        details.push(blk.wire);
+                    } else if (typeof blk.wire.reasoning_content === 'string') {
+                        // DeepSeek-via-OpenRouter style — emit the field at message
+                        // level (chat-completions DeepSeek expects this on the
+                        // assistant turn alongside tool_calls). R1-of-2a Copilot:
+                        // gate by model. R1 family rejects echoed reasoning_content
+                        // with 400; V4 family requires it; unknown stays
+                        // capture-only. Custom is fine here too because
+                        // stripReasoningForCustomGating clears reasoningBlocks
+                        // upstream when the Custom-side gating says strip — we
+                        // only see blocks that survived that filter.
+                        if (blockEchoBehavior === 'echo-on-tool-loop') {
+                            plainReasoningContent = blk.wire.reasoning_content;
+                        }
+                        // 'strip' or 'unknown' → silently drop reasoning_content
+                        // from this request. The block stays in checkpoint state
+                        // for forensics and future re-evaluation.
+                    }
+                }
+                if (details.length > 0) entry.reasoning_details = details;
+                if (plainReasoningContent !== null) entry.reasoning_content = plainReasoningContent;
             }
 
             out.push(entry);
@@ -112,10 +210,23 @@ function toApiMessages(messages) {
 /**
  * Parse Chat Completions response into neutral format.
  * Works for both streamed (accumulated) and non-streamed responses.
+ *
+ * BAT-549: also captures reasoning content from the response message into
+ * `reasoningBlocks` (raw wire payloads, never re-normalized — Codex v3
+ * finding). Captures both shapes that show up here:
+ *  - `message.reasoning_details[]` — native OpenRouter sum-type with `format`
+ *    discriminator; echoed verbatim on the next request
+ *  - `message.reasoning_content` (string) — DeepSeek-style; surfaces here
+ *    when Custom delegates Chat Completions to OpenRouter pointed at DeepSeek
+ *
+ * Both are stamped with `provider: 'openrouter'`. The Custom adapter wraps
+ * this and re-stamps to `provider: 'custom'` per v4.1 finding 5 — this
+ * function is the canonical OpenRouter parse path; Custom is responsible for
+ * its own re-stamping.
  */
 function fromApiResponse(raw) {
     const choice = raw.choices?.[0];
-    if (!choice) return { text: null, toolCalls: [], stopReason: 'end_turn', usage: raw.usage || {} };
+    if (!choice) return { text: null, toolCalls: [], reasoningBlocks: [], stopReason: 'end_turn', usage: raw.usage || {} };
 
     const message = choice.message || {};
     const text = message.content || null;
@@ -133,6 +244,39 @@ function fromApiResponse(raw) {
         return { id: tc.id || `tc_or_${idx}`, name: tc.function?.name || 'unknown', input };
     });
 
+    // BAT-549: capture reasoning content verbatim into reasoningBlocks.
+    // Two shapes show up on this code path:
+    //   1. message.reasoning_details[] — native OpenRouter sum-type
+    //   2. message.reasoning_content   — DeepSeek (when Custom delegates here)
+    // Both stored with raw `wire` preserved; the Custom adapter wraps and
+    // re-stamps provider/sourceAdapter on its own pass.
+    const reasoningBlocks = [];
+    const turnId = raw.id || message.id || null;
+    if (Array.isArray(message.reasoning_details) && message.reasoning_details.length > 0) {
+        for (const detail of message.reasoning_details) {
+            reasoningBlocks.push({
+                schemaVersion: 1,
+                provider: 'openrouter',
+                sourceAdapter: 'openrouter',
+                sourceModel: raw.model || null,
+                turnId,
+                wire: detail,
+            });
+        }
+    }
+    if (typeof message.reasoning_content === 'string' && message.reasoning_content.length > 0) {
+        // DeepSeek-style reasoning; preserve verbatim — Custom wrapper will
+        // re-stamp `provider: 'custom'` and apply model-gating before echo.
+        reasoningBlocks.push({
+            schemaVersion: 1,
+            provider: 'openrouter',
+            sourceAdapter: 'openrouter',
+            sourceModel: raw.model || null,
+            turnId,
+            wire: { reasoning_content: message.reasoning_content },
+        });
+    }
+
     // Map finish_reason → neutral stopReason
     const fr = choice.finish_reason;
     let stopReason = 'end_turn';
@@ -140,7 +284,7 @@ function fromApiResponse(raw) {
     else if (fr === 'length') stopReason = 'max_tokens';
     else if (fr === 'content_filter') stopReason = 'content_filter';
 
-    return { text, toolCalls, stopReason, usage: raw.usage || {} };
+    return { text, toolCalls, reasoningBlocks, stopReason, usage: raw.usage || {} };
 }
 
 // ── System prompt ───────────────────────────────────────────────────────────
@@ -186,7 +330,7 @@ function formatTools(tools) {
  * supported providers (Anthropic, DeepSeek, Gemini, Grok, Groq).
  * Providers that don't support caching silently ignore it.
  */
-function formatRequest(model, maxTokens, systemPrompt, messages, tools) {
+function formatRequest(model, maxTokens, systemPrompt, messages, tools, requestOptions) {
     const body = {
         model,
         stream: true,
@@ -195,6 +339,22 @@ function formatRequest(model, maxTokens, systemPrompt, messages, tools) {
         cache_control: { type: 'ephemeral' },
     };
     if (tools && tools.length > 0) body.tools = tools;
+
+    // BAT-549 Commit 3c: emit `reasoning:{effort:"medium"}` only when both
+    // the user toggle is on AND the registry confirms the model supports
+    // it. OpenRouter is freeform in the registry resolver — `reasoningSupport`
+    // resolves to "unknown" for every OR-prefixed model ID, so the toggle
+    // is currently a no-op on OpenRouter. The branch lives here so a future
+    // build that learns specific OR model IDs (e.g. registering
+    // `openai/gpt-5.4` under the openrouter provider with reasoningSupport:
+    // "yes") can flip it on without further adapter changes. Until then
+    // OpenRouter relies on the OR-side default behavior of any reasoning
+    // models the user picks (most pass through provider defaults).
+    if (requestOptions
+        && requestOptions.reasoningEnabled === true
+        && requestOptions.reasoningSupport === 'yes') {
+        body.reasoning = { effort: 'medium' };
+    }
 
     // Model fallback: if configured, use models array for auto-failover.
     // OpenRouter tries the first model, falls back on context errors,

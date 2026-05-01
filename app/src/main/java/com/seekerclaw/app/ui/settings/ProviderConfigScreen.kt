@@ -2,6 +2,7 @@ package com.seekerclaw.app.ui.settings
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -16,6 +17,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import com.seekerclaw.app.ui.components.SeekerClawScaffold
+import com.seekerclaw.app.ui.components.SeekerClawSwitch
+import com.seekerclaw.app.state.RuntimeStateStore
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.RadioButtonDefaults
@@ -23,6 +26,7 @@ import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -48,6 +52,7 @@ import com.seekerclaw.app.ui.components.MorphActionButton
 import com.seekerclaw.app.ui.components.rememberOpenAIOAuthController
 import com.seekerclaw.app.ui.theme.Sizing
 import com.seekerclaw.app.config.ConfigManager
+import com.seekerclaw.app.config.ModelRegistry
 import com.seekerclaw.app.config.availableModels
 import com.seekerclaw.app.config.availableProviders
 import com.seekerclaw.app.config.OPENROUTER_DEFAULT_MODEL
@@ -542,6 +547,23 @@ fun ProviderConfigScreen(onBack: () -> Unit) {
                         )
                     }
                 }
+            }
+
+            // BAT-549: unified Reasoning section. Master toggles
+            // (Extended thinking, Show thinking status) apply to
+            // ALL providers — the registry's `reasoningSupport`
+            // tri-state decides whether they take effect for the
+            // active model. "Show thinking status" controls a
+            // temporary "Thinking..." Telegram bubble during
+            // extended-thinking turns; reasoning content is never
+            // rendered in chat (v4 contract). The per-Custom
+            // advanced override (Echo reasoning to gateway) is
+            // only meaningful when on Custom and renders only then.
+            Spacer(modifier = Modifier.height(28.dp))
+            SectionLabel("Reasoning")
+            Spacer(modifier = Modifier.height(10.dp))
+            CardSurface {
+                ReasoningSectionInlined(activeProvider = activeProvider)
             }
 
             // Connection test
@@ -1342,4 +1364,234 @@ fun OpenRouterModelEditDialog(
         containerColor = SeekerClawColors.Surface,
         shape = shape,
     )
+}
+
+/**
+ * BAT-549: unified Reasoning section card. Master toggles for
+ * Extended thinking and Show thinking status (cross-provider,
+ * RuntimeState-backed) plus, when on Custom, the per-Custom Echo
+ * reasoning to gateway override. Moved here from SettingsScreen so
+ * all reasoning controls live next to the AI Provider config they
+ * affect (UX feedback from Beka 2026-04-30 — top-level Settings
+ * was the wrong home).
+ *
+ * BAT-549 Commit 6 / v4 contract: the "Show thinking status" toggle
+ * does NOT render reasoning content in chat. It controls a temporary
+ * "Thinking..." Telegram bubble during extended-thinking turns; no
+ * blockquotes, no reasoning summaries, no second messages. Reasoning
+ * content stays preserved in checkpoint state for tool-loop replay,
+ * but is never surfaced to the user.
+ */
+@Composable
+private fun ReasoningSectionInlined(activeProvider: String) {
+    val rtState by RuntimeStateStore.state.collectAsState()
+    val scope = rememberCoroutineScope()
+
+    var optimisticEnabled by remember(rtState.reasoningEnabled) { mutableStateOf<Boolean?>(null) }
+    var optimisticDisplay by remember(rtState.reasoningDisplayInChat) { mutableStateOf<Boolean?>(null) }
+    val reasoningEnabled = optimisticEnabled ?: rtState.reasoningEnabled
+    val reasoningDisplay = optimisticDisplay ?: rtState.reasoningDisplayInChat
+
+    val support = remember(rtState.provider, rtState.model, rtState.authType) {
+        ModelRegistry.reasoningSupportFor(rtState.provider, rtState.model, rtState.authType)
+    }
+
+    Column {
+        ReasoningToggleRow(
+            label = "Extended thinking",
+            description = "Ask supported models to do extended thinking before answering. No effect on models without reasoning support.",
+            checked = reasoningEnabled,
+            onCheckedChange = { newValue ->
+                optimisticEnabled = newValue
+                runReasoningUpdate(scope, { it.copy(reasoningEnabled = newValue) }) { ok ->
+                    if (!ok) optimisticEnabled = null
+                }
+            },
+        )
+        ReasoningToggleRow(
+            label = "Show thinking status",
+            description = "Shows a small \"Thinking...\" status while the model is using extended thinking. Reasoning details are never shown.",
+            checked = reasoningDisplay,
+            onCheckedChange = { newValue ->
+                optimisticDisplay = newValue
+                runReasoningUpdate(scope, { it.copy(reasoningDisplayInChat = newValue) }) { ok ->
+                    if (!ok) optimisticDisplay = null
+                }
+            },
+        )
+
+        // No-op-for-this-model hint, only when the user has just enabled
+        // the master toggle on a non-yes model (less noise when off).
+        val hint = when (support) {
+            "no" -> "Active model does not support extended thinking — toggle has no effect."
+            "unknown" -> "Active model is not in the registry. Toggle has no effect unless your gateway supports it."
+            else -> null
+        }
+        if (hint != null && reasoningEnabled) {
+            Text(
+                text = hint,
+                fontFamily = RethinkSans,
+                fontSize = 12.sp,
+                color = SeekerClawColors.TextSecondary,
+                lineHeight = 18.sp,
+                modifier = Modifier.padding(top = 4.dp, bottom = 4.dp),
+            )
+        }
+
+        // Per-Custom override row only when on Custom provider.
+        if (activeProvider == "custom") {
+            Spacer(modifier = Modifier.height(8.dp))
+            HorizontalDivider(color = Color(0xFFFFFFFF).copy(alpha = 0.06f))
+            Spacer(modifier = Modifier.height(8.dp))
+            CustomEchoReasoningRow()
+        }
+    }
+}
+
+/**
+ * Master-toggle row used by [ReasoningSectionInlined]. Two-line layout
+ * (label + description) so users see what each toggle does without
+ * tapping an info icon.
+ */
+@Composable
+private fun ReasoningToggleRow(
+    label: String,
+    description: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(
+                text = label,
+                fontFamily = RethinkSans,
+                fontSize = 14.sp,
+                color = SeekerClawColors.TextPrimary,
+            )
+            Text(
+                text = description,
+                fontFamily = RethinkSans,
+                fontSize = 11.sp,
+                color = SeekerClawColors.TextDim,
+                lineHeight = 16.sp,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+        }
+        SeekerClawSwitch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+        )
+    }
+}
+
+/**
+ * Atomic field-local RuntimeStateStore.update on Dispatchers.IO.
+ * Mirrors the helper in SettingsScreen — duplicated here so this
+ * file is self-contained after the move-from-Settings UX refactor.
+ */
+private fun runReasoningUpdate(
+    scope: kotlinx.coroutines.CoroutineScope,
+    transform: (com.seekerclaw.app.state.RuntimeState) -> com.seekerclaw.app.state.RuntimeState,
+    callback: (Boolean) -> Unit,
+) {
+    scope.launch(Dispatchers.IO) {
+        val ok = try {
+            RuntimeStateStore.update(transform)
+        } catch (_: IllegalArgumentException) {
+            false
+        }
+        withContext(Dispatchers.Main) { callback(ok) }
+    }
+}
+
+/**
+ * BAT-549 Commit 3e: per-Custom advanced override toggle. Reads/writes
+ * RuntimeState.customEchoReasoning. When `true`, the Custom adapter's
+ * gating promotes "unknown" gateways to "echo-on-tool-loop", forcing
+ * `reasoning_content` to be echoed back on subsequent tool-use turns.
+ *
+ * Default OFF. The wrong setting → 400 loop on the next tool round
+ * (some gateways reject the echo, some require it). Only enable if you
+ * know your gateway requires the echo and the model id doesn't match
+ * the known DeepSeek-V4 regex (e.g., a self-hosted V4 fork or a brand-
+ * new V4-shaped model).
+ *
+ * The toggle automatically resets to false when the user edits any of
+ * (model | baseUrl | format | sortedHeaderKeys) — the
+ * [com.seekerclaw.app.state.CustomConfigSignature] change-detector
+ * triggered by ConfigManager.saveConfig (Commit 3d).
+ */
+@Composable
+private fun CustomEchoReasoningRow() {
+    // R14 Copilot: observe the StateFlow so cross-process updates
+    // (Commit 3d's signature reset, future Telegram commands, etc.)
+    // flow through to the UI. Optimistic local override gives instant
+    // visual feedback on tap while the IO dispatch persists.
+    val rtState by RuntimeStateStore.state.collectAsState()
+    val scope = rememberCoroutineScope()
+    var optimistic by remember(rtState.customEchoReasoning) { mutableStateOf<Boolean?>(null) }
+    val checked = optimistic ?: rtState.customEchoReasoning
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = "Echo reasoning to gateway",
+                fontFamily = RethinkSans,
+                fontSize = 14.sp,
+                color = SeekerClawColors.TextPrimary,
+            )
+            Text(
+                text = "Force reasoning_content echo on tool-loop turns. Required for gateways that need it (e.g., DeepSeek-V4 forks). Wrong setting → 400 loop. Resets when you edit gateway config.",
+                fontFamily = RethinkSans,
+                fontSize = 11.sp,
+                color = SeekerClawColors.TextDim,
+                lineHeight = 16.sp,
+                modifier = Modifier.padding(top = 2.dp, end = 8.dp),
+            )
+        }
+        SeekerClawSwitch(
+            checked = checked,
+            onCheckedChange = { newValue ->
+                optimistic = newValue
+                // R14 Copilot: dispatch off the main thread so fsync
+                // can't trip StrictMode or jank the UI.
+                // R24 Copilot: use RuntimeStateStore.update for atomic
+                // field-local read-modify-write — `write(rtState.copy(...))`
+                // would clobber a concurrent cross-process write (Commit
+                // 3d's signature reset triggered from ConfigManager,
+                // future Telegram commands). update {} re-reads the
+                // latest persisted state INSIDE the lock so only the
+                // customEchoReasoning field is mutated.
+                scope.launch(Dispatchers.IO) {
+                    val ok = try {
+                        RuntimeStateStore.update { it.copy(customEchoReasoning = newValue) }
+                    } catch (_: IllegalArgumentException) {
+                        false
+                    }
+                    withContext(Dispatchers.Main) {
+                        // R17 Copilot: clear the optimistic override on
+                        // failure rather than negating newValue. A
+                        // concurrent cross-process update could change
+                        // the canonical value in the meantime — clearing
+                        // the override is always correct because
+                        // rtState reflects whatever's currently
+                        // persisted on disk.
+                        if (!ok) optimistic = null
+                    }
+                }
+            },
+        )
+    }
 }

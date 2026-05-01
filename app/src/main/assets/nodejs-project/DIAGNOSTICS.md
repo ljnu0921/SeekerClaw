@@ -371,3 +371,52 @@ grep -i "rate limit.*mcp\|rate limit.*exceeded" node_debug.log | tail -10
 **Diagnosis:** The grid is a fixed 26-week window ending with the current week. Today's cell sits at whatever row corresponds to today's weekday (Mon=row 0, Sun=row 6). Future days in the current week are intentionally blank (Color.Transparent) — not a bug. Clipping on the actual right edge was fixed in PR #304 by switching to weight-based cells (BAT-500). If clipping reappears, it's likely a regression in `MessageActivityHeatmap` in `SystemScreen.kt`.
 **Fix:** This is a UI bug path, not a data bug. Ask the user for a screenshot and the device model + app version, then file a bug.
 
+## Reasoning (Extended Thinking)
+
+BAT-549 introduced reasoning content preservation across all 4 providers, plus a user-facing "Extended thinking" toggle and a "Show thinking status" indicator. Reasoning content itself is never rendered in chat — the indicator is a temporary "Thinking..." Telegram bubble that appears during extended-thinking turns and is deleted when the response arrives. The reasoning subsystem has several moving pieces — this section is the playbook for diagnosing each.
+
+### `/think on` Toggled But Model Doesn't Think Differently
+**Symptoms:** User toggled `/think on` (or Settings > AI Provider > Reasoning > Extended thinking ON) but responses look the same as before.
+**Diagnosis:** The toggle is a no-op for models the registry doesn't list as supporting reasoning (Haiku 4.5; any freeform / unregistered model id). Run `/think` (no args) — it surfaces a user-facing hint when the active model isn't supported, e.g. "This model does not support extended thinking..." or "This model is not in SeekerClaw's known model list...". The agent's system prompt also exposes this state — the agent itself can tell the user.
+**Fix:**
+- "does not support" hint: switch to a yes-supporting model (Opus 4.7, Sonnet 4.6, GPT-5.4/5.5, Codex models) via `/model` or Settings.
+- "not in known model list" hint: this is the safe default for models not in the registry. If the user is on Custom and knows their gateway supports thinking, ask them to confirm — the request param genuinely isn't sent because the registry is the source of truth (a "thinking" status that lies about whether thinking is happening would be worse than no status).
+
+### Custom + DeepSeek V4: 400 Loop on `/resume` After Tool Calls
+**Symptoms:** User on Custom provider with a DeepSeek V4 model gets `400` errors after tool calls, often in a loop after `/resume`.
+**Diagnosis:** Pre-BAT-549 the Custom adapter stripped V4's `reasoning_content` field from the next request, but V4 REQUIRES it echoed back after a tool call. Commit 1 added model-gating: V4 now echoes, R1 strips, unknown captures-only. The 400-loop should be impossible on the current build for V4 ids matching `deepseek-v4*` (case-insensitive, with or without `deepseek/` OR-prefix).
+**Fix:**
+- Confirm the model id matches the V4 regex (the agent can grep `reasoning-gating.js` for the exact pattern).
+- If the user is on a V4 fork with a non-matching id (e.g., `my-deepseek-v4-fork`): toggle `/think echo on` (Custom-only, force echo on tool-loop) OR enable in Settings > AI Provider > Custom > Advanced (Reasoning) > "Echo reasoning to gateway".
+- If still failing: the 400 message likely contains "reasoning_content must be passed back" — the adaptive 3-step quarantine recovery (last-user → earliest-tool-call → full reset) auto-runs and saves a forensic dump under `<workDir>/recovery/` (file pattern: `<chatId>-<timestamp>-step<N>[-task<id>].json`).
+
+### Custom + R1 (DeepSeek-Reasoner): 400 With "Reasoning Content Echoed"
+**Symptoms:** User on Custom provider with DeepSeek-R1 / DeepSeek-Reasoner gets `400` with a message about reasoning_content being unexpected.
+**Diagnosis:** OPPOSITE of V4 — R1 REJECTS echoed reasoning_content. Commit 1's gating returns `'strip'` for R1 ids; the strip should run pre-delegation.
+**Fix:**
+- Verify the model id matches the R1 regex (`/(?:^|\/)deepseek-(?:reasoner|r1)(?:-|$)/i`).
+- Check the user has NOT enabled the per-Custom echo override (`/think echo on` flips it from chat; Settings > AI Provider > Custom > Advanced (Reasoning) flips it from the UI). The override resets automatically when the user edits any signed Custom config field (model | baseUrl | format | header keys), so if they recently swapped from V4 to R1 the override should already be off — but confirm with `/think` (no args) which surfaces the current value.
+
+### "Show Thinking Status" Toggled But No "Thinking..." Bubble Appears
+**Symptoms:** User toggled "Show thinking status" on (Settings > AI Provider > Reasoning, or `/think show`) but the temporary "Thinking..." Telegram bubble never appears during turns.
+**Diagnosis:** The bubble requires ALL THREE gates: `reasoningEnabled === true`, `reasoningDisplayInChat === true`, AND `reasoningSupport === 'yes'` for the active model. If any are missing, the bubble is suppressed by design (a "Thinking..." status that lies about whether thinking is happening would be worse than no status). Common gaps:
+- `reasoningEnabled` is off → toggle on Settings > Reasoning > Extended thinking, OR `/think on`
+- Active model is `Haiku 4.5` → `reasoningSupport=no` → toggle is a true no-op for that model; switch model
+- Active model is on Custom (any model) or OpenRouter (any model) → freeform registry → `reasoningSupport=unknown` → bubble stays suppressed because "thinking" can't be reliably promised
+- The bubble has a 500ms debounce — if the model responds in under 500ms, the bubble never shows even when all gates align (by design — fast turns shouldn't flash)
+**Fix:** Confirm via `/think` (no-args) which surfaces the current toggle states and a "not in known model list" / "does not support" hint when applicable. The contract is "status is shown when extended thinking IS happening AND the user opted in" — anything else is silenced.
+
+### Reasoning Content Doesn't Render in Chat (Why "Show Thinking Status" Doesn't Show Reasoning Text)
+**Symptoms:** User toggled "Show thinking status" expecting to see the model's reasoning summary in chat (like Claude.ai's expandable thinking blocks), but only sees a temporary "Thinking..." bubble.
+**Diagnosis:** This is by design per the BAT-549 v4 contract. The toggle controls a status indicator only — reasoning content (summaries, encrypted_content, raw thinking text) is NEVER displayed in chat. Reasoning IS preserved in checkpoint state for tool-loop replay (that's what BAT-549's provider-preservation work is for) but it's not surfaced to the user. PM call: reasoning content rendering has streaming/lifecycle/privacy implications that warrant a separate ticket if/when revisited.
+**Fix:** Tell the user "Reasoning details are never shown" (matches the Settings helper text). The thinking-status bubble is the visible signal that extended thinking happened.
+
+### `customConfigSignature` Reset The Echo Override After A Spurious Edit
+**Symptoms:** User reports that the "Echo reasoning to gateway" toggle reset to OFF after they "barely changed anything" in the Custom config.
+**Diagnosis:** The signature hashes the trimmed values of customModel | customBaseUrl | customFormat | sortedLowercaseHeaderKeys. Any visible character change (including trailing slash, scheme case, header key add/remove) resets the override. ApiKey changes do NOT (key rotation is common). Header VALUE changes do NOT (would persist a leakable digest).
+**Fix:** Confirm the user's expectation matches the contract — "any visible edit resets the override" is intentional defense-in-depth (gateway-A's echo contract may not match gateway-B's). If they want to reduce reset-frequency, recommend keeping all whitespace consistent in their Settings entries.
+
+### Reasoning Logs Show `len=N fp=XXXXXXXX` Instead of Raw Text
+**Symptoms:** User looking at logs (or sending a bug report screenshot) doesn't see any reasoning content — just length + 8-char hex fingerprints.
+**Diagnosis:** This is BY DESIGN. `reasoning-redact.js` is the centralized redaction helper for reasoning logs. Mobile logs end up in bug-report screenshots — raw thinking text, signatures, and encrypted_content MUST never leak there. The fingerprint is enough for ops to confirm "the same reasoning block was seen / replayed across turns" without revealing content.
+**Fix:** No fix needed — log redaction is intentional. The "Show thinking status" toggle (Settings > AI Provider > Reasoning) gives the user a visible indicator that thinking is happening, but it does NOT reveal reasoning content. Reasoning text is never displayed to the user in this build (v4 contract).

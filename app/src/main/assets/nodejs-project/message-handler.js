@@ -364,7 +364,14 @@ Platform: \`${platform}\``;
 
             // Checkpoint stays on disk — chat() will call cleanupChatCheckpoints()
             // on successful completion.
-            return { __resumeFallthrough: true, originalGoal: full.originalGoal || null };
+            // BAT-549 R6 thread 2: forward the resumed-from taskId so chat()
+            // can quarantine THIS file if the 400 fires on the first API
+            // call (common on /resume — there's no fresh checkpoint yet).
+            return {
+                __resumeFallthrough: true,
+                originalGoal: full.originalGoal || null,
+                resumedFromTaskId: cp.taskId,
+            };
         }
 
         case '/model': {
@@ -373,6 +380,10 @@ Platform: \`${platform}\``;
 
         case '/provider': {
             return await handleProviderCommand(chatId, args, messageId);
+        }
+
+        case '/think': {
+            return await handleThinkCommand(chatId, args);
         }
 
         default:
@@ -1012,6 +1023,12 @@ async function handleMessage(normalized) {
         // P2.4: resume flag — set by /resume handler, passed to chat() as option
         let isResume = false;
         let resumeGoal = null;
+        // BAT-549 R6 thread 2: the OLD checkpoint's taskId (the one we
+        // resumed FROM); forwarded to chat() so reasoning-content-400
+        // recovery can quarantine the actual problematic file rather
+        // than chat()'s freshly-minted taskId (which has no on-disk
+        // checkpoint when the 400 fires on the first API call).
+        let resumedFromTaskId = null;
 
         // Check for commands (use combinedText so /commands work even in replies)
         if (combinedText.startsWith('/')) {
@@ -1034,6 +1051,13 @@ async function handleMessage(normalized) {
                 // not as a user message (system directives are authoritative).
                 isResume = true;
                 resumeGoal = response.originalGoal || null;
+                // BAT-549 R6 thread 2: forward the OLD checkpoint's taskId so
+                // chat()'s reasoning-content 400 recovery path can quarantine
+                // it. Otherwise a /resume that triggers a 400 would mutate
+                // only chat()'s freshly-minted taskId (which has no on-disk
+                // checkpoint yet), and a future /resume would re-load the
+                // original bad slice.
+                resumedFromTaskId = response.resumedFromTaskId || null;
                 text = 'continue';
             } else if (response) {
                 await deps.sendMessage(chatId, response, messageId);
@@ -1192,7 +1216,7 @@ async function handleMessage(normalized) {
             }
         }
 
-        let response = await deps.chat(chatId, userContent, { isResume, originalGoal: resumeGoal, statusReaction });
+        let response = await deps.chat(chatId, userContent, { isResume, originalGoal: resumeGoal, statusReaction, resumedFromTaskId });
 
         // Strip protocol tokens the agent may have mixed into content (BAT-279)
         // Uses centralized silent-reply.js helper (BAT-488) that also handles
@@ -1275,6 +1299,145 @@ function handleReactionUpdate(reaction) {
     }).catch(e => deps.log(`Reaction queue error: ${e.message}`, 'ERROR'));
     deps.chatQueues.set(chatId, task);
     task.then(() => { if (deps.chatQueues.get(chatId) === task) deps.chatQueues.delete(chatId); });
+}
+
+// ============================================================================
+// /think HANDLER (BAT-549 Commit 4)
+// Toggles RuntimeState reasoning fields from Telegram. Mirrors the
+// Settings UI Reasoning section so power users can flip without
+// leaving the chat:
+//   /think                — show current state of all 3 toggles + active model's reasoningSupport
+//   /think on             — set reasoningEnabled=true
+//   /think off            — set reasoningEnabled=false
+//   /think show           — set reasoningDisplayInChat=true
+//   /think hide           — set reasoningDisplayInChat=false
+// ============================================================================
+
+async function handleThinkCommand(chatId, args) {
+    // R23 Copilot: tokenize on whitespace instead of matching the
+    // exact trimmed-and-lowercased string. Pre-fix `'echo   on'`
+    // (multiple spaces) or `'echo\non'` (user's keyboard inserted a
+    // newline) hit the unknown-subcommand path even though the
+    // intent was clearly `/think echo on`. Token-array matching
+    // tolerates any inter-token whitespace as well as trailing
+    // whitespace from copy-paste.
+    const raw = (args || '').trim().toLowerCase();
+    const tokens = raw.length > 0 ? raw.split(/\s+/) : [];
+    const subcommand = tokens.join(' '); // canonical single-space form
+    const current = _runtimeState.read();
+
+    // No args → status display
+    if (tokens.length === 0) {
+        const modelCatalog = require('./model-catalog');
+        // Use current.authType from the live RuntimeState (R21
+        // contract preserved): the startup constants snapshot at
+        // Node startup and don't reflect mid-session /provider
+        // switches, but RuntimeState is the source of truth.
+        const support = modelCatalog.reasoningSupportFor(
+            current.provider,
+            current.model,
+            current.authType,
+        );
+        const lines = [];
+        // BAT-549 Commit 6 / v4 PM addendum: rewrite to user-facing
+        // language. No more `reasoningSupport=yes/no/unknown` raw
+        // field exposure, no "request-side enablement" jargon, no
+        // "render reasoning summaries in chat" (we now show only a
+        // status, never content). Custom block hidden unless the
+        // user is actually on Custom — keeps the default output
+        // tight for the 95% case.
+        lines.push('**Thinking settings**');
+        lines.push('');
+        lines.push(`Extended thinking: ${current.reasoningEnabled ? 'On' : 'Off'}`);
+        lines.push(`Thinking status: ${current.reasoningDisplayInChat ? 'On' : 'Off'}`);
+        lines.push(`Active model: \`${current.model}\``);
+        if (support === 'no') {
+            lines.push('');
+            lines.push('This model does not support extended thinking, so these settings will not affect responses on this model.');
+        } else if (support === 'unknown') {
+            lines.push('');
+            lines.push('This model is not in SeekerClaw\'s known model list, so extended thinking may not be available.');
+        }
+        lines.push('');
+        lines.push('**Commands:**');
+        lines.push('`/think on` — turn extended thinking on');
+        lines.push('`/think off` — turn extended thinking off');
+        lines.push('`/think show` — show Thinking... status when thinking is used');
+        lines.push('`/think hide` — hide Thinking... status');
+        // Custom-only block (PM addendum): only surface when active
+        // provider is `custom`. The /think echo on|off subcommands
+        // remain functional for users who know the syntax even
+        // off-Custom — we just don't advertise them in the default
+        // status because they're irrelevant outside Custom.
+        if (current.provider === 'custom') {
+            lines.push('');
+            lines.push('**Custom gateway**');
+            lines.push(`Echo reasoning metadata: ${current.customEchoReasoning ? 'On' : 'Off'}`);
+            lines.push('`/think echo on` — turn on custom gateway echo');
+            lines.push('`/think echo off` — turn off custom gateway echo');
+        }
+        return lines.join('\n');
+    }
+
+    // Map subcommand → field+value patch. `subcommand` is the
+    // single-space-canonicalized token form so 'echo   on' and 'echo on'
+    // both match.
+    const patch = {};
+    let action = '';
+    switch (subcommand) {
+        case 'on':
+            patch.reasoningEnabled = true;
+            action = 'Extended thinking enabled.';
+            break;
+        case 'off':
+            patch.reasoningEnabled = false;
+            action = 'Extended thinking disabled.';
+            break;
+        case 'show':
+            patch.reasoningDisplayInChat = true;
+            action = 'Thinking... status will appear during extended thinking.';
+            break;
+        case 'hide':
+            patch.reasoningDisplayInChat = false;
+            action = 'Thinking... status hidden.';
+            break;
+        case 'echo on':
+            patch.customEchoReasoning = true;
+            action = 'Custom gateway echo enabled.';
+            if (current.provider !== 'custom') {
+                action += ' Note: only takes effect when provider=custom; you are currently on \`' + current.provider + '\`.';
+            }
+            break;
+        case 'echo off':
+            patch.customEchoReasoning = false;
+            action = 'Custom gateway echo disabled.';
+            break;
+        default:
+            return `❌ Unknown subcommand \`${subcommand}\`. Try \`/think\` for usage.`;
+    }
+
+    // Write through RuntimeStateStore — partial-update semantics preserve
+    // other fields (including provider/authType/model and the per-Custom
+    // override + signature). The merge layer in runtime-state.js handles
+    // the partial-update contract.
+    let ok = true;
+    try {
+        ok = _runtimeState.write({
+            provider: current.provider,
+            authType: current.authType,
+            model: current.model,
+            ...patch,
+        });
+    } catch (e) {
+        deps.log(`[/think] runtime_state.json write threw: ${e.message}`, 'ERROR');
+        return `❌ Couldn't save — ${e.message}`;
+    }
+    if (!ok) {
+        deps.log(`[/think] runtime_state.json write returned false`, 'WARN');
+        return `❌ Couldn't save (filesystem error). Try again or check storage.`;
+    }
+    deps.log(`[/think] ${subcommand} (${JSON.stringify(patch)})`, 'INFO');
+    return `✓ ${action} Takes effect on your next message.`;
 }
 
 module.exports = { init, handleCommand, handleMessage, handleReactionUpdate };

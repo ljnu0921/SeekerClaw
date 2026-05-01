@@ -47,10 +47,25 @@
 const path = require('path');
 const { createStore } = require('./cross-process-store');
 
+// BAT-549 Commit 3b: dual-side defaults must mirror Kotlin's
+// RuntimeState data class defaults. New fields default to false / null
+// so updating from a pre-BAT-549 build does NOT silently flip on
+// reasoning capability (cost / behavior change). The DEFAULTS-merge
+// happens in this module's `read()` (see below) — `cross-process-store`
+// itself returns the raw `JSON.parse(text)` when the file exists and
+// only falls back to the supplied default when the file is absent or
+// corrupt. So old `runtime_state.json` files that lack the new fields
+// load cleanly via the merge layered in `read()` here. The Kotlin side
+// gets the same coverage automatically via `@Serializable` data class
+// defaults during decode.
 const DEFAULTS = Object.freeze({
     provider: 'claude',
     authType: 'api_key',
     model: 'claude-opus-4-7',
+    reasoningEnabled: false,
+    reasoningDisplayInChat: false,
+    customEchoReasoning: false,
+    customConfigSignature: null,
 });
 
 // Provider / authType matrix — must mirror
@@ -112,7 +127,22 @@ function open(workDir) {
     const store = createStore(filePath, DEFAULTS);
 
     function read() {
-        return store.read();
+        // BAT-549 Commit 3b: layer DEFAULTS-merge over the cross-process-
+        // store's raw JSON.parse so old `runtime_state.json` files (pre-
+        // BAT-549, with only provider/authType/model) load cleanly with
+        // the new fields filled from DEFAULTS. The Kotlin side handles
+        // this automatically via @Serializable data class defaults; the
+        // Node side needs explicit merge because cross-process-store
+        // returns the parsed object as-is when the file exists.
+        const raw = store.read();
+        if (!raw || typeof raw !== 'object') return { ...DEFAULTS };
+        const merged = { ...DEFAULTS };
+        for (const key of Object.keys(DEFAULTS)) {
+            if (Object.prototype.hasOwnProperty.call(raw, key) && raw[key] !== undefined) {
+                merged[key] = raw[key];
+            }
+        }
+        return merged;
     }
 
     function write(value) {
@@ -148,7 +178,71 @@ function open(workDir) {
                 `authType=${value.authType}) — refusing to persist`,
             );
         }
-        return store.write(value);
+        // BAT-549 Commit 3b: type-check the new optional fields IF
+        // present. Absent → MERGE preserves the persisted value (see
+        // below); that's fine. Wrong type → caller bug, surface loudly
+        // so the symptom shows up at the source instead of "saved but
+        // didn't take".
+        if (value.reasoningEnabled !== undefined && typeof value.reasoningEnabled !== 'boolean') {
+            throw new Error(`runtime-state: reasoningEnabled must be boolean, got ${typeof value.reasoningEnabled}`);
+        }
+        if (value.reasoningDisplayInChat !== undefined && typeof value.reasoningDisplayInChat !== 'boolean') {
+            throw new Error(`runtime-state: reasoningDisplayInChat must be boolean, got ${typeof value.reasoningDisplayInChat}`);
+        }
+        if (value.customEchoReasoning !== undefined && typeof value.customEchoReasoning !== 'boolean') {
+            throw new Error(`runtime-state: customEchoReasoning must be boolean, got ${typeof value.customEchoReasoning}`);
+        }
+        if (value.customConfigSignature !== undefined
+            && value.customConfigSignature !== null
+            && typeof value.customConfigSignature !== 'string') {
+            throw new Error(`runtime-state: customConfigSignature must be string or null, got ${typeof value.customConfigSignature}`);
+        }
+        // BAT-549 Commit 3b R2 Copilot: merge incoming with persisted
+        // state so legacy 3-field callers (Telegram /model, /provider —
+        // see message-handler.js:573, :814) don't silently drop the
+        // BAT-549 fields when they update provider/authType/model. The
+        // semantic becomes: write() is a partial-update — fields not in
+        // the incoming value are preserved from disk. Full-replace is
+        // still possible by passing all 7 fields explicitly.
+        //
+        // Allowlist merge to avoid prototype-pollution / unknown-field
+        // leakage: only fields named in DEFAULTS get carried forward.
+        // Anything else in the incoming object is dropped (won't reach
+        // disk), and anything else in the persisted object is dropped
+        // too (post-rollback cleanup of stale fields from a future
+        // build that downgraded to this one).
+        const persisted = read();
+        const merged = {};
+        for (const key of Object.keys(DEFAULTS)) {
+            if (Object.prototype.hasOwnProperty.call(value, key) && value[key] !== undefined) {
+                merged[key] = value[key];
+            } else if (Object.prototype.hasOwnProperty.call(persisted, key)) {
+                merged[key] = persisted[key];
+            } else {
+                merged[key] = DEFAULTS[key];
+            }
+        }
+        // 3e R5 Copilot: re-validate the BAT-549 fields after merge.
+        // The type-checks above only run on `value`. If a corrupted
+        // runtime_state.json (manual edit, future schema rolled back,
+        // etc.) had a wrong-type value for one of the BAT-549 fields,
+        // the merge above would carry it forward and we'd silently
+        // re-persist the bad value. Defensive sanitize-on-merge: if
+        // the persisted value has the wrong type, fall back to the
+        // DEFAULT for that field instead of refusing the write
+        // (refusing would break legacy 3-field callers entirely; the
+        // sanitize-and-write path heals corrupt files on the next
+        // user-driven write). Only the optional BAT-549 fields need
+        // this — the required fields (provider/authType/model) are
+        // already shape-checked above and won't reach here in a bad
+        // state.
+        if (typeof merged.reasoningEnabled !== 'boolean') merged.reasoningEnabled = DEFAULTS.reasoningEnabled;
+        if (typeof merged.reasoningDisplayInChat !== 'boolean') merged.reasoningDisplayInChat = DEFAULTS.reasoningDisplayInChat;
+        if (typeof merged.customEchoReasoning !== 'boolean') merged.customEchoReasoning = DEFAULTS.customEchoReasoning;
+        if (merged.customConfigSignature !== null && typeof merged.customConfigSignature !== 'string') {
+            merged.customConfigSignature = DEFAULTS.customConfigSignature;
+        }
+        return store.write(merged);
     }
 
     function update(transform) {
