@@ -39,7 +39,23 @@ object NodeControlClient {
     private const val TAG = "NodeControlClient"
     private const val BASE_URL = "http://127.0.0.1:8766"
     private const val AUTH_HEADER = "X-Bridge-Token"
-    private const val CONNECT_TIMEOUT_MS = 1500
+    // BAT-525 R4 Copilot: HttpURLConnection is NOT cooperatively
+    // cancellable — a `withTimeoutOrNull` on the calling coroutine
+    // can't interrupt an in-flight blocking connect/read. The
+    // underlying timeouts MUST therefore sum to a wall-time that
+    // fits within every caller's outer budget. The strictest caller
+    // today is [flushShutdown] (BAT-525, called from
+    // SeekerClawService.onDestroy under withTimeoutOrNull(2000)).
+    //
+    // Loopback connect is essentially instant (<5ms in practice on
+    // the device); 250ms is generous defense-in-depth. Read budget
+    // remains 1500ms to cover the slow shutdown-flush path
+    // (Node-side summaryTimeoutMs = 1200ms with ~300ms buffer for
+    // Anthropic's response stream + JSON encode + socket write).
+    //
+    // Total worst-case wall time: 250 + 1500 = 1750ms — fits the
+    // 2000ms outer service-teardown budget with 250ms margin.
+    private const val CONNECT_TIMEOUT_MS = 250
     private const val READ_TIMEOUT_MS = 1500
 
     /**
@@ -62,6 +78,52 @@ object NodeControlClient {
     /** Best-effort liveness probe (`POST /healthz`). Mirrors [reconcile]'s failure shape. */
     suspend fun healthz(): Boolean = withContext(Dispatchers.IO) {
         post("/healthz", "{}")
+    }
+
+    /**
+     * Drive Node's graceful-shutdown flush before
+     * [com.seekerclaw.app.service.SeekerClawService] kills the
+     * `:node` process (BAT-525). Persists pending session summaries
+     * + dirty SQL.js mutations so the last ~60s of `api_request_log`
+     * activity isn't lost on user-initiated Stop.
+     *
+     * Returns `true` on a 2xx response (Node confirmed flush
+     * complete). Returns `false` on connect-refused (service
+     * already down), 401 (bridge token rotated), 500
+     * (`flushForShutdown` rejected), or transport timeout — in
+     * every case the caller proceeds with the unconditional
+     * `killProcess()` fallback. Bridge-token auth is provided by
+     * the shared [post] helper so the endpoint's POST-auth gate
+     * doesn't 401 every Stop event.
+     *
+     * ## Cancellation semantics (R4 Copilot — not the soft "outer
+     * timeout cancels everything" simplification it might first
+     * appear to be)
+     *
+     * `HttpURLConnection` is NOT cooperatively cancellable —
+     * `withTimeoutOrNull` on the calling coroutine fires a
+     * CancellationException at the next suspend point, but it
+     * cannot interrupt an in-flight blocking
+     * `connect()` / `responseCode` / `inputStream.readBytes()`.
+     * The hard upper bound therefore comes from the underlying
+     * connect+read timeouts, NOT the outer coroutine timeout.
+     *
+     * - [CONNECT_TIMEOUT_MS] = 250ms (loopback is near-instant; 250
+     *   is defensive padding).
+     * - [READ_TIMEOUT_MS] = 1500ms (sized 300ms above the Node-side
+     *   `summaryTimeoutMs: 1200` so a real flush response always
+     *   lands).
+     * - Worst-case wall time: 1750ms.
+     *
+     * SeekerClawService still wraps the suspend call in
+     * `withTimeoutOrNull(2000)` — that timeout primarily exists so
+     * the Kotlin-side suspension releases promptly when the underlying
+     * I/O eventually returns/throws within its bounded budget. It
+     * does NOT directly interrupt the I/O; the 1750ms worst case is
+     * the actual ceiling.
+     */
+    suspend fun flushShutdown(): Boolean = withContext(Dispatchers.IO) {
+        post("/shutdown/flush", "{}")
     }
 
     private fun post(path: String, body: String): Boolean {

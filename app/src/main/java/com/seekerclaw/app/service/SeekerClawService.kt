@@ -15,6 +15,7 @@ import com.seekerclaw.app.MainActivity
 import com.seekerclaw.app.R
 import com.seekerclaw.app.SeekerClawApplication
 import com.seekerclaw.app.bridge.AndroidBridge
+import com.seekerclaw.app.bridge.NodeControlClient
 import com.seekerclaw.app.config.ConfigManager
 import com.seekerclaw.app.util.LogCollector
 import com.seekerclaw.app.util.LogLevel
@@ -27,8 +28,10 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.UUID
 
@@ -549,14 +552,21 @@ class SeekerClawService : Service() {
 
     override fun onDestroy() {
         LogCollector.append("[Service] Stopping Claw Engine...")
-        // Cancel the service scope FIRST. This stops any in-flight
-        // forwardNewNodeDebugLines or observer reattach coroutines that
-        // would otherwise race the observer.stopWatching() below — they
-        // hold nodeDebugMutex while reading the file, and could land
-        // a stale lastPos write or trigger the now-stopped observer's
-        // unrelated event handler. cancel() is non-blocking and
-        // synchronous; in-flight launches reach a suspension point and
-        // exit.
+        // BAT-525: flush Node BEFORE everything else. The bridge token
+        // and Node process must both still be alive for the loopback
+        // POST /shutdown/flush to land. This call is bounded
+        // (NodeControlClient timeouts ≤ 1750ms inside an outer 2000ms
+        // withTimeoutOrNull) and intentionally precedes scope cancel,
+        // observer stop, NodeBridge.stop, and clearBridgeToken below.
+        flushNodeBeforeProcessKill()
+        // Cancel the service scope before stopping the FileObserver
+        // below. This stops any in-flight forwardNewNodeDebugLines or
+        // observer reattach coroutines that would otherwise race
+        // observer.stopWatching() — they hold nodeDebugMutex while
+        // reading the file, and could land a stale lastPos write or
+        // trigger the now-stopped observer's unrelated event handler.
+        // cancel() is non-blocking and synchronous; in-flight launches
+        // reach a suspension point and exit.
         scopeJob.cancel()
         // Stop the node-debug FileObserver (BAT-518: was nodeDebugJob coroutine).
         nodeDebugObserver?.stopWatching()
@@ -600,6 +610,42 @@ class SeekerClawService : Service() {
 
         // Service is isolated in :node process. Kill process so Node runtime cannot linger.
         android.os.Process.killProcess(android.os.Process.myPid())
+    }
+
+    /**
+     * BAT-525: ask `:node` to flush pending session summaries + dirty
+     * SQL.js mutations BEFORE [killProcess]. Without this hook, the
+     * last ~60s of `api_request_log` rows in BAT-523's debounce
+     * window are lost on every user-initiated Stop.
+     *
+     * Bounded by [timeoutMs] (default 2s) so a hung Node can't
+     * deadlock the service teardown — the unconditional [killProcess]
+     * call below this still fires either way.
+     *
+     * R3 Copilot: delegates to [NodeControlClient.flushShutdown] so
+     * the shared `X-Bridge-Token` auth + JSON body + response-drain
+     * + connect/read-timeout logic stays in one place. Pre-fix this
+     * rolled its own [HttpURLConnection] client without setting the
+     * auth header, which would have 401'd at the bridge-token gate
+     * `/shutdown/flush` enforces — the flush would never have run
+     * in production.
+     */
+    private fun flushNodeBeforeProcessKill(timeoutMs: Long = 2_000L) {
+        if (!NodeBridge.isAlive()) return
+        val flushed = runBlocking {
+            withTimeoutOrNull(timeoutMs) {
+                NodeControlClient.flushShutdown()
+            }
+        } == true
+
+        if (flushed) {
+            LogCollector.append("[Shutdown] Node flush acknowledged")
+        } else {
+            LogCollector.append(
+                "[Shutdown] Node flush timed out or failed; continuing process kill",
+                LogLevel.WARN,
+            )
+        }
     }
 
     private fun createNotification(text: String): Notification {

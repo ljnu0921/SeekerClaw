@@ -234,9 +234,29 @@ async function initDatabase() {
  *        lie. Init keeps the default so a failed bootstrap write
  *        retries before any mutation arrives.
  */
+// BAT-525 R5 Copilot: saveDatabase returns a Boolean so callers that
+// need to distinguish "actually persisted to disk" from "swallowed
+// I/O error" — specifically [flushForShutdown], driving the
+// `POST /shutdown/flush` endpoint that surfaces 500 vs 200/{ok:true}
+// to Kotlin — can do so. Pre-fix the function returned `undefined` and
+// caught/logged failures internally; the shutdown endpoint therefore
+// returned 200 even when the user-Stop flush hit an I/O error and the
+// last 60s of api_request_log rows were genuinely lost. Existing
+// callers (the debounced save timer + initDatabase bootstrap) can
+// continue to ignore the return value — the contract is additive.
+//
+// Return semantics (Boolean):
+//   - true  : either persisted to disk OR no-op (db not initialized,
+//             or dirty=false && force=false — nothing to save). The
+//             "persisted" and "no-op" cases collapse into the same
+//             return value because callers only care about
+//             "shutdown work completed without an I/O error".
+//   - false : the write attempt threw an I/O error. The error has
+//             already been logged with the same level + message it
+//             always was; the boolean is purely for flow control.
 function saveDatabase({ force = false, scheduleRetry = true } = {}) {
-    if (!db) return;
-    if (!dirty && !force) return; // Idle — nothing changed since last save.
+    if (!db) return true;
+    if (!dirty && !force) return true; // Idle — nothing changed since last save.
     try {
         const data = db.export();
         const buffer = Buffer.from(data);
@@ -252,6 +272,7 @@ function saveDatabase({ force = false, scheduleRetry = true } = {}) {
             clearTimeout(saveTimer);
             saveTimer = null;
         }
+        return true;
     } catch (err) {
         // BAT-523: transient I/O failures must reschedule a retry.
         //
@@ -290,6 +311,7 @@ function saveDatabase({ force = false, scheduleRetry = true } = {}) {
                 saveDatabase({ force });
             }, SAVE_DEBOUNCE_MS);
         }
+        return false;
     }
 }
 
@@ -607,8 +629,34 @@ function backfillSessionsFromFiles() {
 // GRACEFUL SHUTDOWN (BAT-57)
 // ============================================================================
 
-// Registered outside initDatabase so shutdown hooks work even if DB init fails
-async function gracefulShutdown(signal) {
+/**
+ * Run shutdown-time persistence work. Cancels idle-summary timers,
+ * writes session summaries for active conversations, then force-
+ * flushes any debounced SQL.js mutations.
+ *
+ * BAT-525 R5 Copilot: returns a result object so callers can
+ * distinguish "shutdown work cleanly persisted" from "I/O errors
+ * silently swallowed". Pre-fix this function caught + logged both
+ * the summary path AND the saveDatabase path internally and
+ * returned `undefined`, so the new POST /shutdown/flush HTTP
+ * endpoint always returned 200/{ok:true} — Kotlin's "flush
+ * acknowledged" log was a lie in exactly the failure mode the
+ * endpoint exists to surface.
+ *
+ * Result shape:
+ *   {
+ *     ok: boolean,         // true iff every step persisted cleanly
+ *     summaryFailed?: string, // error message, if summary path threw
+ *     dbFailed?: boolean,  // true if saveDatabase returned false
+ *   }
+ *
+ * Both step failures are tolerated — the function ALWAYS reaches
+ * the saveDatabase call (summary timeout/error doesn't short-
+ * circuit the DB flush, since they're independent). The result
+ * just reports both outcomes so the caller (HTTP endpoint OR
+ * gracefulShutdown signal handler) can act accordingly.
+ */
+async function flushForShutdown(signal, { summaryTimeoutMs = 5000 } = {}) {
     log(`[Shutdown] ${signal} received, saving session summary...`, 'INFO');
     // BAT-524: cancel pending idle-summary timers FIRST. Without this,
     // a timer that's about to fire could call saveSessionSummary
@@ -619,10 +667,11 @@ async function gracefulShutdown(signal) {
     if (typeof _shutdownDeps.cancelAllIdleSummaries === 'function') {
         try { _shutdownDeps.cancelAllIdleSummaries(); } catch (_) {}
     }
+    let summaryFailed = null;
     try {
         const { conversations, saveSessionSummary, MIN_MESSAGES_FOR_SUMMARY } = _shutdownDeps;
         if (conversations && saveSessionSummary) {
-            const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000));
+            const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), summaryTimeoutMs));
             const summaries = [];
             for (const [chatId, conv] of conversations) {
                 if (conv.length >= MIN_MESSAGES_FOR_SUMMARY) {
@@ -636,13 +685,34 @@ async function gracefulShutdown(signal) {
         }
     } catch (err) {
         log(`[Shutdown] Summary failed: ${err.message}`, 'ERROR');
+        summaryFailed = err.message || String(err);
     }
     // BAT-523: force-flush any pending debounced mutations before the
     // process exits — otherwise dirty in-memory rows would be lost.
-    // scheduleRetry=false because the very next instruction is
-    // process.exit(0) — a queued retry timer would never run, and the
+    // scheduleRetry=false because shutdown callers are immediately
+    // followed by either normal Node termination or Android
+    // killProcess(); a queued retry timer would never run, and the
     // "retry in 60s" log line would be a lie.
-    saveDatabase({ force: true, scheduleRetry: false });
+    const dbOk = saveDatabase({ force: true, scheduleRetry: false });
+    const result = { ok: !summaryFailed && dbOk };
+    if (summaryFailed) result.summaryFailed = summaryFailed;
+    if (!dbOk) result.dbFailed = true;
+    return result;
+}
+
+// Registered outside initDatabase so shutdown hooks work even if DB init fails
+async function gracefulShutdown(signal) {
+    // R5 Copilot: surface flush result in logs even on the SIGTERM/SIGINT
+    // path. The HTTP endpoint also surfaces it via 500 response, but the
+    // signal path has no caller to receive it — only the user-visible log
+    // tells the operator whether the shutdown was clean.
+    const result = await flushForShutdown(signal);
+    if (!result.ok) {
+        const parts = [];
+        if (result.summaryFailed) parts.push(`summary: ${result.summaryFailed}`);
+        if (result.dbFailed) parts.push('db: I/O error');
+        log(`[Shutdown] flush completed with errors — ${parts.join(', ')}`, 'WARN');
+    }
     process.exit(0);
 }
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
@@ -781,7 +851,10 @@ function startDbSummaryInterval() {
 // `internal-control-server.js` so MCP control endpoints
 // (`POST /mcp/reconcile`, `POST /healthz`) can share the same port.
 // `getDbSummary` below is the only export the new server needs from
-// this module — main.js wires the dependency.
+// this module — main.js wires the dependency. BAT-525 adds
+// `flushForShutdown` to that wired-callback set so the new
+// `POST /shutdown/flush` endpoint can drive it without an import
+// cycle (database -> internal-control-server -> database).
 
 // ============================================================================
 // EXPORTS
@@ -798,6 +871,7 @@ module.exports = {
     writeDbSummaryFile,
     markDbSummaryDirty,
     markDbDirty, // BAT-523 (BAT-518 phase 3A) — call after every db.run() that mutates state
+    flushForShutdown,
     startDbSummaryInterval,
     getDbSummary,
 };
