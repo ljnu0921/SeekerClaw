@@ -19,7 +19,8 @@ const {
     config: _config,
     runtimeState: _runtimeState,
 } = require('./config');
-const { reasoningSupportFor } = require('./model-catalog');
+const { reasoningSupportFor, displayNameForProvider } = require('./model-catalog');
+const { logSuppression: _logSuppression, SUPPRESSION_REASONS: _SUPPRESSION_REASONS } = require('./reasoning-gating');
 
 const { redactSecrets } = require('./security');
 // Channel abstraction — routes to telegram.js or discord.js based on config
@@ -1495,7 +1496,7 @@ async function claudeApiCall(body, chatId, traceCtx = {}) {
                         // these writes relied on database.js's now-removed 60s
                         // setInterval safety net.
                         markDbDirty();
-                    } catch (e) { log(`[Claude] Failed to log network error to DB: ${e.message}`, 'WARN'); }
+                    } catch (e) { log(`[${displayNameForProvider(PROVIDER)}] Failed to log network error to DB: ${e.message}`, 'WARN'); }
                 }
                 if (!background) updateAgentHealth('error', { type: isTimeoutClass ? 'timeout' : 'network', status: -1, message: networkErr.message });
                 throw networkErr;
@@ -1533,7 +1534,17 @@ async function claudeApiCall(body, chatId, traceCtx = {}) {
                     // BAT-253: Add ±25% jitter to prevent thundering herd; respect server retry-after exactly
                     const jitteredBackoff = Math.round(backoffMs * (0.75 + Math.random() * 0.5));
                     const waitMs = retryAfterMs > 0 ? retryAfterMs : jitteredBackoff;
-                    log(`[Retry] Claude API ${res.status} (${errClass.type}), retry ${retries + 1}/${MAX_RETRIES}, base ${backoffMs}ms, waiting ${waitMs}ms`, 'WARN');
+                    // BAT-559: log the active provider's registry display name
+                    // (Anthropic / OpenAI / OpenRouter / Custom — the registry
+                    // maps `claude → Anthropic` since "Anthropic" is the
+                    // company; "Claude" is the model family) instead of the
+                    // pre-multi-provider hardcoded "Claude API". Misleading
+                    // observability noticed during BAT-515 device test — an
+                    // OpenAI 429 from a rate-limited account was logged as
+                    // "Claude API 429", making "why is Claude rate limiting me"
+                    // support tickets ambiguous about which provider actually
+                    // returned the error.
+                    log(`[Retry] ${displayNameForProvider(PROVIDER)} API ${res.status} (${errClass.type}), retry ${retries + 1}/${MAX_RETRIES}, base ${backoffMs}ms, waiting ${waitMs}ms`, 'WARN');
                     if (!background) updateAgentHealth('degraded', { type: errClass.type, status: res.status, message: errClass.userMessage });
                     retries++;
                     await new Promise(r => setTimeout(r, waitMs));
@@ -2347,11 +2358,106 @@ async function chat(chatId, userMessage, options = {}) {
             } else {
                 _authForRegistry = AUTH_TYPE;
             }
+            // BAT-558 v4 R2 — synthetic-turn marker at the chat() boundary.
+            // Heartbeat (and future synthetic turns: summaries, etc.) pass
+            // `reasoningMode: 'off'` so app-controlled optional reasoning is
+            // suppressed across all providers. The defensive `__heartbeat__`
+            // override here is belt-and-suspenders for any code path that
+            // forgets to pass the option explicitly — the canonical contract
+            // is the explicit option at the call site (main.js heartbeat).
+            // R3 transport-required exceptions (OpenAI OAuth/Codex) are
+            // preserved at the adapter layer, not overridden here.
+            //
+            // R1.1 Copilot: `synthetic` is the metadata marker the v4
+            // contract calls out for telemetry / future channel-renderer
+            // hooks. Threading it through `requestOptions` makes the
+            // option actually read — without this it would be a contract
+            // surface promised by main.js's call site but unused below
+            // ai.js. The current consumer is the SYNTHETIC_HEARTBEAT
+            // suppression log (see R1.3 / R4 dedup helper); future
+            // surfaces (e.g., a "background" tag in the api_request_log
+            // database) can read the same marker.
+            const isHeartbeatChat = chatId === '__heartbeat__';
+            const callerReasoningMode = (options && options.reasoningMode === 'off') ? 'off' : 'normal';
+            const effectiveReasoningMode = isHeartbeatChat ? 'off' : callerReasoningMode;
+            const callerSynthetic = (options && typeof options.synthetic === 'string')
+                ? options.synthetic : null;
+            // Defensive: any `__heartbeat__` chat counts as synthetic
+            // 'heartbeat' for log/telemetry purposes, even if the caller
+            // forgot to pass the marker explicitly.
+            const effectiveSynthetic = isHeartbeatChat ? 'heartbeat' : callerSynthetic;
             const requestOptions = {
                 reasoningEnabled: !!(_liveRtState && _liveRtState.reasoningEnabled),
                 reasoningSupport: reasoningSupportFor(_registryProviderId, activeModel, _authForRegistry),
                 customEchoOverride: !!(_liveRtState && _liveRtState.customEchoReasoning),
+                reasoningMode: effectiveReasoningMode,
+                synthetic: effectiveSynthetic,
             };
+
+            // R1.3 + R2.2 Copilot: emit the SYNTHETIC_HEARTBEAT
+            // suppression log once per process — but ONLY when the
+            // suppression actually has effect. The log says
+            // "[Reasoning] suppressed: synthetic-heartbeat", so it
+            // would mislead the reader if it fired in cases where
+            // the adapter still emits reasoning regardless:
+            //
+            //   - User reasoning toggle is off OR registry support is
+            //     'no' / 'unknown' → no app-controlled emission was
+            //     ever queued, so 'off' is a no-op. Logging
+            //     "suppressed" implies an action that didn't happen.
+            //   - OpenAI OAuth/Codex transport-required path — the
+            //     Codex endpoint MUST receive `body.reasoning` or it
+            //     returns `output: []`. v4 R3 explicitly preserves
+            //     this exception. The synthetic 'off' marker is a
+            //     no-op here for the wire shape, so the log would
+            //     mislead.
+            //   - OpenAI api_key + codex model — same model-id-driven
+            //     hardcode, transport-required.
+            //
+            // Logging fires when ALL of these are true:
+            //   1. effectiveReasoningMode === 'off'
+            //   2. effectiveSynthetic === 'heartbeat'
+            //   3. user toggle would have triggered emission
+            //      (reasoningEnabled && reasoningSupport === 'yes')
+            //   4. no transport-required exception applies
+            //
+            // Detail string includes provider/auth/channel so a field
+            // report has the full context to triage from one log line.
+            const _userToggleWouldEmit = requestOptions.reasoningEnabled
+                && requestOptions.reasoningSupport === 'yes';
+            const _modelIsCodex = typeof activeModel === 'string'
+                && activeModel.includes('codex');
+            // R3 Copilot: Custom with CUSTOM_FORMAT='responses' DELEGATES
+            // to openai.formatRequest, which carries OpenAI's transport-
+            // required exceptions (OAuth + codex models). Pre-fix the
+            // gate only checked `PROVIDER === 'openai'`, so a
+            // Custom-Responses gateway pointing at a `*-codex` model
+            // would still trigger the suppression log even though the
+            // delegate emits `body.reasoning` regardless. Treating
+            // Custom-Responses as the OpenAI Responses transport here
+            // mirrors what the delegate actually does, so the log
+            // reflects effective behavior.
+            const _usesOpenAIResponsesTransport = (PROVIDER === 'openai')
+                || (PROVIDER === 'custom' && CUSTOM_FORMAT === 'responses');
+            const _effectiveTransportProvider = _usesOpenAIResponsesTransport
+                ? 'openai'
+                : PROVIDER;
+            const _effectiveTransportAuth = _usesOpenAIResponsesTransport
+                ? OPENAI_AUTH_TYPE
+                : AUTH_TYPE;
+            const _transportRequiresReasoning = _usesOpenAIResponsesTransport
+                && (_effectiveTransportAuth === 'oauth' || _modelIsCodex);
+            if (effectiveReasoningMode === 'off'
+                && effectiveSynthetic === 'heartbeat'
+                && _userToggleWouldEmit
+                && !_transportRequiresReasoning) {
+                _logSuppression(
+                    _SUPPRESSION_REASONS.SYNTHETIC_HEARTBEAT,
+                    `chatId=${String(chatId).slice(0, 32)} provider=${_effectiveTransportProvider} `
+                    + `auth=${_effectiveTransportAuth} `
+                    + `model=${String(activeModel).slice(0, 48)}`,
+                );
+            }
 
             // Convert neutral messages to provider API format for the request.
             // BAT-549 R2 thread 3: pass `activeModel` as 2nd arg so the
@@ -2375,10 +2481,19 @@ async function chat(chatId, userMessage, options = {}) {
             // helper (telegram.js) which has a 500ms debounce (so
             // fast non-thinking turns never flash) and NO min-visible
             // hold (so cleanup never delays the final answer).
+            //
+            // BAT-558 v4 R2/R4: synthetic turns (heartbeat, future
+            // summaries) ALSO suppress the bubble — heartbeats are
+            // invisible liveness probes, a flickering "Thinking..."
+            // every 30 min would be a confusing UX surprise. The
+            // adapter layer already suppresses the wire-side reasoning
+            // request when reasoningMode='off' (R3 matrix); this gate
+            // just stops the local UI artifact too.
             const showThinkingStatus = !!(
                 requestOptions
                 && requestOptions.reasoningEnabled === true
                 && requestOptions.reasoningSupport === 'yes'
+                && requestOptions.reasoningMode !== 'off'
                 && _liveRtState
                 && _liveRtState.reasoningDisplayInChat === true
             );
