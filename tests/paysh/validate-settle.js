@@ -21,8 +21,10 @@
 //     R-pr367-fix-1 regression — pre-fix this was empty).
 //   - accepted.network is the CAIP-2 wire-form the challenge sent, not
 //     normalized to "solana" (R20+ negotiation invariant).
-//   - extra.feePayer + extra.memo present; other server extension fields
-//     preserved by shallow-clone (R-pr367-fix-7).
+//   - extra.feePayer present; other server extension fields preserved by
+//     shallow-clone (R-pr367-fix-7). Memo is NOT in accepted.extra unless
+//     the challenge included it (R-pr368-live-fix-1) — it lives in the
+//     tx as a Memo instruction (on-chain commitment).
 //   - payload.transaction round-trips the built tx base64 (Layer 2.5
 //     passes the unsigned/placeholder tx straight into settle — actual
 //     signing happens in agent_pay between build() and settle() via the
@@ -34,6 +36,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const assert = require('assert');
 
 const X402_PATH = require.resolve('../../app/src/main/assets/nodejs-project/payment/x402.js');
 const { X402Protocol, _setBlockhashFetcher, _extractPayload } = require(X402_PATH);
@@ -248,9 +251,27 @@ async function runSettleForCapture(captureEntry) {
         if (captureEntry.expectFeePayer && decoded.accepted.extra.feePayer !== captureEntry.expectFeePayer) {
             throw new Error(`extra.feePayer expected "${captureEntry.expectFeePayer}", got "${decoded.accepted.extra.feePayer}"`);
         }
-        if (typeof decoded.accepted.extra.memo !== 'string' || decoded.accepted.extra.memo.length === 0) {
-            throw new Error(`PAYMENT-SIGNATURE.accepted.extra.memo missing or empty`);
+        // R-pr368-live-fix-1 / R-pr369-fix-1 / R-pr369-fix-4: assert the
+        // real invariant — `accepted.extra` must equal the challenge's
+        // `accepts[i].extra` EXACTLY (deep strict equality). Pre-fix this
+        // hard-coded `!('memo' in ...)` (false alarms on future captures
+        // with extra.memo); intermediate fix used per-key `!==` (would
+        // false-fail on any nested object/array because JSON.parse creates
+        // a new identity). Now uses assert.deepStrictEqual which handles
+        // nested structures correctly. The key-mismatch error message is
+        // kept for diagnostic clarity since deepStrictEqual's default
+        // message can be hard to read for object diffs.
+        const challengeExtra = built.paymentMeta.requirement.extra || {};
+        const proofExtraKeys = Object.keys(decoded.accepted.extra).sort();
+        const challengeExtraKeys = Object.keys(challengeExtra).sort();
+        if (proofExtraKeys.join(',') !== challengeExtraKeys.join(',')) {
+            throw new Error(`PAYMENT-SIGNATURE.accepted.extra keys mismatch challenge.accepts[i].extra: proof=[${proofExtraKeys.join(',')}] challenge=[${challengeExtraKeys.join(',')}] — strict facilitators (paysponge) reject "No matching payment requirements"`);
         }
+        assert.deepStrictEqual(
+            decoded.accepted.extra,
+            challengeExtra,
+            `PAYMENT-SIGNATURE.accepted.extra does not deep-equal challenge.accepts[i].extra`,
+        );
         if (!decoded.payload || !decoded.payload.transaction) {
             throw new Error(`PAYMENT-SIGNATURE.payload.transaction missing`);
         }
@@ -288,6 +309,11 @@ async function runSettleForCapture(captureEntry) {
 function _isExcludedFromSettleCoverage(fname) {
     if (fname.startsWith('synthetic-')) return true;
     if (fname === 'textbelt-status-free.json') return true;
+    // Layer 3 live-pay captures the success response (status 200 + a
+    // PAYMENT-RESPONSE header) as `<service>-v2-success.json`. These
+    // are NOT 402 challenges — Layer 2.5 only validates the
+    // detect/build/settle path against challenge captures.
+    if (fname.endsWith('-v2-success.json')) return true;
     return false;
 }
 
@@ -347,14 +373,27 @@ async function main() {
         }
     });
 
-    await check('all v2 captures emit a non-empty memo in PAYMENT-SIGNATURE (challenge or random nonce)', () => {
+    await check('all v2 captures: accepted.extra deep-equals challenge accepts[i].extra (R-pr368-live-fix-1 / R-pr369-fix-4)', () => {
+        // Strict facilitators (paysponge) reject "No matching payment
+        // requirements" when accepted.extra differs from the challenge.
+        // Use deepStrictEqual so nested objects/arrays compare correctly
+        // (per-key `!==` would false-fail because JSON.parse creates new
+        // object identities even for equivalent values).
         for (const entry of SETTLE_CAPTURES.filter(e => e.expectV2)) {
             const artifacts = runCache.get(entry.file);
             if (!artifacts) continue;
             const decoded = JSON.parse(Buffer.from(artifacts.capturedHeaders['payment-signature'], 'base64').toString('utf8'));
-            if (!decoded.accepted.extra.memo || decoded.accepted.extra.memo.length === 0) {
-                throw new Error(`${entry.file}: extra.memo empty`);
+            const challengeExtra = artifacts.built.paymentMeta.requirement.extra || {};
+            const proofKeys = Object.keys(decoded.accepted.extra).sort();
+            const chKeys = Object.keys(challengeExtra).sort();
+            if (proofKeys.join(',') !== chKeys.join(',')) {
+                throw new Error(`${entry.file}: accepted.extra keys [${proofKeys.join(',')}] != challenge.extra keys [${chKeys.join(',')}]`);
             }
+            assert.deepStrictEqual(
+                decoded.accepted.extra,
+                challengeExtra,
+                `${entry.file}: accepted.extra does not deep-equal challenge.extra`,
+            );
         }
     });
 
