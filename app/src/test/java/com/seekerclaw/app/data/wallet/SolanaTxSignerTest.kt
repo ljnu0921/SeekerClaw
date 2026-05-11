@@ -247,6 +247,142 @@ class SolanaTxSignerTest {
     }
 
     @Test
+    fun `BAT-582 v1_6 Phase 5d - v0 multi-signer tx with allowPartiallySigned=true is accepted`() {
+        // x402 v2 case: facilitator is fee-payer at slot 0 (server
+        // co-signs after receiving PAYMENT-SIGNATURE), burner is the
+        // SECOND signer at slot 1 (we fill it on-device). Tx is v0
+        // versioned per Coinbase x402 v2 spec.
+        // R-pr367-fix-6: tightened to v0-only (was legacy in R-pr367-fix-3).
+        val facilitator = KeyImporter.derivePubkey(ByteArray(32) { (it + 7).toByte() })
+        val tx = buildV0TxMultiSigner(
+            signerPubkeys = listOf(facilitator, burnerPubkey),  // facilitator FIRST (slot 0)
+            preSignedSignatures = listOf(null, null),           // both empty — partial sign scenario
+            blockhash = ByteArray(32),
+        )
+        val parsed = SolanaTxSigner.parse(tx)
+        assertEquals(2, parsed.numRequiredSignatures)
+        assertTrue("must be v0 versioned", parsed.isV0)
+        // Sanity: facilitator is slot 0, burner is slot 1.
+        assertEquals("facilitator must be slot 0", facilitator.toList(), parsed.accountKeys[0].toList())
+        assertEquals("burner must be slot 1",      burnerPubkey.toList(), parsed.accountKeys[1].toList())
+
+        val burnerSig = ByteArray(64) { ((it + 0x42) and 0xFF).toByte() }
+        val signed = SolanaTxSigner.insertSignature(
+            tx, parsed, burnerPubkey, burnerSig, allowPartiallySigned = true
+        )
+        // Burner's signature lands at slot 1; facilitator's slot 0 stays
+        // ALL-ZERO (server fills it after receiving PAYMENT-SIGNATURE).
+        val signedParsed = SolanaTxSigner.parse(signed)
+        assertTrue("facilitator slot 0 must remain zero", signedParsed.signatures[0].all { it == 0.toByte() })
+        assertEquals("burner slot 1 must hold signature", burnerSig.toList(), signedParsed.signatures[1].toList())
+    }
+
+    @Test
+    fun `BAT-582 R-pr367-fix-6 - allowPartiallySigned rejects legacy (non-v0) tx`() {
+        // x402 v2 is ALWAYS a v0 versioned tx per Coinbase spec. A legacy
+        // tx that happens to match the 2-signer slot layout must still be
+        // rejected — there's no legitimate caller that should opt into
+        // partial signing for a legacy tx. Narrows the signing surface.
+        val facilitator = KeyImporter.derivePubkey(ByteArray(32) { (it + 7).toByte() })
+        val tx = buildLegacyTxMultiSigner(
+            signerPubkeys = listOf(facilitator, burnerPubkey),
+            preSignedSignatures = listOf(null, null),
+            blockhash = ByteArray(32),
+        )
+        val parsed = SolanaTxSigner.parse(tx)
+        assertEquals("must be parsed as legacy (not v0)", false, parsed.isV0)
+        try {
+            SolanaTxSigner.insertSignature(tx, parsed, burnerPubkey, ByteArray(64), allowPartiallySigned = true)
+            fail("Expected unexpected_partial_sign_layout for legacy tx")
+        } catch (e: SigningException) {
+            assertEquals("unexpected_partial_sign_layout", e.code)
+            assertTrue("error must mention v0", e.message?.contains("v0") == true)
+        }
+    }
+
+    @Test
+    fun `BAT-582 R-pr367-fix-4 - allowPartiallySigned rejects 3-signer layout`() {
+        // Defense against the flag becoming a "skip safeguard for any
+        // multisig" toggle. x402 v2 is ALWAYS exactly 2 signers; a
+        // 3-signer tx (e.g., governance) must reject even with the flag.
+        val cosigner1 = KeyImporter.derivePubkey(ByteArray(32) { (it + 7).toByte() })
+        val cosigner2 = KeyImporter.derivePubkey(ByteArray(32) { (it + 13).toByte() })
+        val tx = buildV0TxMultiSigner(
+            signerPubkeys = listOf(cosigner1, burnerPubkey, cosigner2),
+            preSignedSignatures = listOf(null, null, null),
+            blockhash = ByteArray(32),
+        )
+        val parsed = SolanaTxSigner.parse(tx)
+        assertEquals(3, parsed.numRequiredSignatures)
+        try {
+            SolanaTxSigner.insertSignature(tx, parsed, burnerPubkey, ByteArray(64), allowPartiallySigned = true)
+            fail("Expected unexpected_partial_sign_layout for 3-signer tx")
+        } catch (e: SigningException) {
+            assertEquals("unexpected_partial_sign_layout", e.code)
+        }
+    }
+
+    @Test
+    fun `BAT-582 R-pr367-fix-4 - allowPartiallySigned rejects burner at slot 0`() {
+        // x402 v2 puts the facilitator at slot 0 (server co-signs) and
+        // the burner at slot 1. A tx where the burner is at slot 0
+        // doesn't match the v2 layout and must reject even with the flag.
+        val cosigner = KeyImporter.derivePubkey(ByteArray(32) { (it + 7).toByte() })
+        val tx = buildV0TxMultiSigner(
+            signerPubkeys = listOf(burnerPubkey, cosigner),     // burner at slot 0 — wrong!
+            preSignedSignatures = listOf(null, null),
+            blockhash = ByteArray(32),
+        )
+        val parsed = SolanaTxSigner.parse(tx)
+        try {
+            SolanaTxSigner.insertSignature(tx, parsed, burnerPubkey, ByteArray(64), allowPartiallySigned = true)
+            fail("Expected unexpected_partial_sign_layout when burner is at slot 0")
+        } catch (e: SigningException) {
+            assertEquals("unexpected_partial_sign_layout", e.code)
+        }
+    }
+
+    @Test
+    fun `BAT-582 R-pr367-fix-4 - allowPartiallySigned rejects pre-signed facilitator slot`() {
+        // If slot 0 already has a non-zero signature, something is off:
+        // either we're being asked to re-sign over a message the
+        // facilitator already signed (invalidating their sig), or the tx
+        // came from a non-x402 source. Either way, reject.
+        val facilitator = KeyImporter.derivePubkey(ByteArray(32) { (it + 7).toByte() })
+        val tx = buildV0TxMultiSigner(
+            signerPubkeys = listOf(facilitator, burnerPubkey),
+            preSignedSignatures = listOf(ByteArray(64) { 0x42.toByte() }, null),  // slot 0 pre-filled
+            blockhash = ByteArray(32),
+        )
+        val parsed = SolanaTxSigner.parse(tx)
+        try {
+            SolanaTxSigner.insertSignature(tx, parsed, burnerPubkey, ByteArray(64), allowPartiallySigned = true)
+            fail("Expected unexpected_partial_sign_layout when slot 0 is pre-signed")
+        } catch (e: SigningException) {
+            assertEquals("unexpected_partial_sign_layout", e.code)
+        }
+    }
+
+    @Test
+    fun `BAT-582 v1_6 Phase 5d - default allowPartiallySigned=false preserves v1 behavior`() {
+        // Same multi-signer tx, but without opting in — must reject as
+        // before (regression guard against accidentally weakening v1).
+        val cosigner = KeyImporter.derivePubkey(ByteArray(32) { (it + 7).toByte() })
+        val tx = buildLegacyTxMultiSigner(
+            signerPubkeys = listOf(burnerPubkey, cosigner),
+            preSignedSignatures = listOf(null, null),
+            blockhash = ByteArray(32),
+        )
+        val parsed = SolanaTxSigner.parse(tx)
+        try {
+            SolanaTxSigner.insertSignature(tx, parsed, burnerPubkey, ByteArray(64))
+            fail("Expected additional_signers_required when allowPartiallySigned defaults to false")
+        } catch (e: SigningException) {
+            assertEquals("additional_signers_required", e.code)
+        }
+    }
+
+    @Test
     fun `multi-signer tx with cosigner already signed is accepted`() {
         val cosigner = KeyImporter.derivePubkey(ByteArray(32) { (it + 7).toByte() })
         val cosignerSig = ByteArray(64) { ((it + 1) and 0xFF).toByte() }  // non-zero
@@ -443,6 +579,33 @@ class SolanaTxSignerTest {
         for (pk in signerPubkeys) out.write(pk)
         out.write(blockhash)
         out.write(0x00)
+        return out.toByteArray()
+    }
+
+    /**
+     * Build a multi-signer v0 versioned tx. Same shape as
+     * buildLegacyTxMultiSigner but with the 0x80 version byte after
+     * signatures and a trailing 0x00 address-lookup-tables count.
+     */
+    private fun buildV0TxMultiSigner(
+        signerPubkeys: List<ByteArray>,
+        preSignedSignatures: List<ByteArray?>,
+        blockhash: ByteArray,
+    ): ByteArray {
+        require(signerPubkeys.size == preSignedSignatures.size)
+        val n = signerPubkeys.size
+        val out = ByteArrayOutputStream()
+        out.write(n)
+        for (sig in preSignedSignatures) {
+            out.write(sig ?: ByteArray(64))
+        }
+        out.write(0x80)  // v0 version byte
+        out.write(n); out.write(0x00); out.write(0x00)  // header
+        out.write(n)
+        for (pk in signerPubkeys) out.write(pk)
+        out.write(blockhash)
+        out.write(0x00)  // 0 instructions
+        out.write(0x00)  // 0 ALT entries
         return out.toByteArray()
     }
 

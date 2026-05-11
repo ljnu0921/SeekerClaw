@@ -32,6 +32,8 @@ object SolanaTxSigner {
         val signaturesStartOffset: Int = 0,
         /** Where each individual signature byte-slot begins, inside the signature array. */
         val signatureSlotOffsets: List<Int>,
+        /** true if the tx is a v0 versioned tx (message starts with 0x80); false for legacy. */
+        val isV0: Boolean,
     )
 
     /**
@@ -139,6 +141,7 @@ object SolanaTxSigner {
             messageStartOffset = messageStart,
             signaturesStartOffset = 0,
             signatureSlotOffsets = sigSlotOffsets,
+            isV0 = isV0,
         )
     }
 
@@ -147,17 +150,26 @@ object SolanaTxSigner {
      * [original] and return the updated transaction bytes. Preserves any
      * pre-existing signatures from co-signers.
      *
+     * @param allowPartiallySigned When `true`, other signer slots may
+     *   remain all-zero (used for x402 v2 where the facilitator
+     *   co-signs server-side AFTER receiving PAYMENT-SIGNATURE — the
+     *   wire tx that leaves the device is partially signed by design).
+     *   When `false` (default — v1 behavior), all other required
+     *   signer slots must already contain a non-zero signature.
+     *
      * Throws [SigningException]:
      *   - `burner_not_required_signer` if [burnerPubkey] is not in the
      *     first numRequiredSignatures account-key slots.
-     *   - `additional_signers_required` when numRequiredSignatures > 1
-     *     AND any other signer slot is still all-zeros.
+     *   - `additional_signers_required` when numRequiredSignatures > 1,
+     *     `allowPartiallySigned` is false, AND any other signer slot
+     *     is still all-zeros.
      */
     fun insertSignature(
         original: ByteArray,
         parsed: ParsedTx,
         burnerPubkey: ByteArray,
         signature: ByteArray,
+        allowPartiallySigned: Boolean = false,
     ): ByteArray {
         require(burnerPubkey.size == 32) { "burnerPubkey must be 32 bytes" }
         require(signature.size == 64) { "signature must be 64 bytes" }
@@ -178,15 +190,69 @@ object SolanaTxSigner {
         }
 
         // V1 co-sign rule: if there are additional required signers, they
-        // must already have non-zero signatures present. We don't attempt
-        // any kind of multi-party signing.
+        // must already have non-zero signatures present. BAT-582 v1.6
+        // Phase 5d: x402 v2 explicitly opts out via `allowPartiallySigned`
+        // (facilitator co-signs server-side; the tx is partially signed
+        // by design when it leaves the device).
+        //
+        // BAT-582 v1.6 R-pr367-fix-4: when allowPartiallySigned=true,
+        // ENFORCE the x402 v2 layout invariants — pre-fix the flag was a
+        // blanket "skip the safeguard for any multi-signer tx" toggle,
+        // which would let a malicious/buggy caller get the burner to
+        // partially-sign ARBITRARY multisig txs (e.g., a 3-signer
+        // governance tx). The flag is purpose-built for x402 v2, which
+        // is ALWAYS a 2-signer layout with facilitator at slot 0 and
+        // burner at slot 1. Reject anything else as
+        // `unexpected_partial_sign_layout`.
         if (parsed.numRequiredSignatures > 1) {
-            for (i in 0 until parsed.numRequiredSignatures) {
-                if (i == burnerIndex) continue
-                if (isZero(parsed.signatures[i])) {
+            if (!allowPartiallySigned) {
+                for (i in 0 until parsed.numRequiredSignatures) {
+                    if (i == burnerIndex) continue
+                    if (isZero(parsed.signatures[i])) {
+                        throw SigningException(
+                            "additional_signers_required",
+                            "Slot $i has no signature (caller must opt in via allowPartiallySigned for x402 v2)",
+                        )
+                    }
+                }
+            } else {
+                // Partial-sign mode: enforce the x402 v2 invariants.
+                //
+                // BAT-582 v1.6 R-pr367-fix-6: x402 v2 uses ONLY v0 versioned
+                // txs (per Coinbase spec scheme_exact_svm.md). Reject legacy
+                // txs even if the 2-signer slot layout coincidentally
+                // matches — there is no legitimate v1 caller that should
+                // ever set allowPartiallySigned=true. This narrows the
+                // attack surface so an attacker can't smuggle a legacy
+                // multisig tx through the v2-only path.
+                if (!parsed.isV0) {
                     throw SigningException(
-                        "additional_signers_required",
-                        "Slot $i has no signature (V1 supports single or pre-cosigned only)",
+                        "unexpected_partial_sign_layout",
+                        "allowPartiallySigned requires a v0 versioned tx (x402 v2); got legacy tx",
+                    )
+                }
+                if (parsed.numRequiredSignatures != 2) {
+                    throw SigningException(
+                        "unexpected_partial_sign_layout",
+                        "allowPartiallySigned requires exactly 2 required signers (x402 v2); got ${parsed.numRequiredSignatures}",
+                    )
+                }
+                if (burnerIndex != 1) {
+                    throw SigningException(
+                        "unexpected_partial_sign_layout",
+                        "allowPartiallySigned requires burner at slot 1 (facilitator at slot 0); burner found at slot $burnerIndex",
+                    )
+                }
+                // Slot 0 (facilitator) must remain empty — server co-signs
+                // after receiving PAYMENT-SIGNATURE. If already filled,
+                // something is off: either we're being asked to re-sign a
+                // tx the facilitator already touched (which would
+                // invalidate their sig over our message bytes) or the tx
+                // came from a non-x402 source.
+                if (!isZero(parsed.signatures[0])) {
+                    throw SigningException(
+                        "unexpected_partial_sign_layout",
+                        "allowPartiallySigned requires slot 0 (facilitator) to be empty; found pre-existing signature",
                     )
                 }
             }
