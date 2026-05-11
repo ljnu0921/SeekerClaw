@@ -204,9 +204,95 @@ function formatConfirmationMessage(toolName, input, policyMessage) {
         if (v.length > 200) v = v.slice(0, 197) + '...';
         return v;
     };
+    // R-pr370-fix-3 (BAT-664): policy hooks construct their own preview
+    // strings (agent_pay POST: method + URL + max_usdc + 200-char body
+    // preview; wallet_set_caps: old→new cap diffs). These messages are
+    // intentionally multi-line and can exceed the 200-char per-field cap.
+    // Use a more generous limit for explicit policyMessage so URLs +
+    // body previews aren't decapitated. 1024 chars covers a long URL +
+    // a 200-char body preview + framing comfortably; still bounded so
+    // a buggy hook can't blow up the confirmation card.
+    //
+    // R-pr370-fix-13 (security): the policyMessage can include
+    // model-controlled args (e.g. wallet_set_caps decimals, agent_pay
+    // URL/body). markdown-it on the channel side renders backticks as
+    // code, [text](url) as links, ** as bold, etc. Escape Markdown
+    // metacharacters here at the render boundary so EVERY policy hook
+    // is safe by default — individual hooks don't have to remember to
+    // sanitize. Newlines are PRESERVED so multi-line cards still
+    // render as separate visual lines (hooks that want a single-line
+    // preview must literalize their own newlines first).
+    const escPolicy = (s) => {
+        let v = String(s ?? '');
+        // Escape backslash first (so we don't double-escape markers below).
+        v = v.replace(/\\/g, '\\\\');
+        // Markdown structure characters + HTML angle brackets. Use explicit
+        // \[ and \] inside the character class so the regex is unambiguous
+        // to future readers (the parser handles `[\]]` correctly but mixed
+        // escaping inside a class is a recurring source of confusion).
+        v = v.replace(/[`*_~\[\](){}#>|!<>]/g, (c) => '\\' + c);
+        // Strip control chars OTHER than newlines (newlines are the
+        // structural separator for multi-line cards and must survive).
+        // eslint-disable-next-line no-control-regex
+        v = v.replace(/[\x00-\x09\x0B-\x1F\x7F]/g, ' ');
+        // R-pr370-fix-40/42: neutralize Markdown line-start structures.
+        // markdown-it auto-renders:
+        //   `- foo` / `+ foo` / `1. foo` → list items
+        //   `--- ` → horizontal rule (or setext H2 underline)
+        //   `=== ` → setext H1 underline
+        // (`***` and `___` HR patterns are already neutralized by the
+        // per-character escape pass above — every `*` and `_` becomes
+        // `\*` / `\_` which breaks the contiguous-marker requirement
+        // markdown-it uses to detect HRs.)
+        //
+        // Because we intentionally preserve newlines for multi-line cards,
+        // a model-controlled value containing `\n--- ` could inject a
+        // visual divider or restructure the card. Escape the line-leading
+        // marker so each renders as literal text.
+        v = v.replace(/(^|\n)([-+])(\s)/g, '$1\\$2$3');
+        v = v.replace(/(^|\n)(\d+)(\.)(\s)/g, '$1$2\\$3$4');
+        v = v.replace(/(^|\n)(-{3,}|={3,})/g, (m, lead, run) => `${lead}\\${run[0]}${run.slice(1)}`);
+        // R-pr370-fix-18 (security): markdown-it's `linkify: true` auto-
+        // detects raw URLs (http:// / https:// / ftp:// etc.) and renders
+        // them as clickable links — even after Markdown char escaping.
+        // An attacker-controlled body preview containing a URL would
+        // render as a clickable phishing link in the confirmation card.
+        // Insert a zero-width space (U+200B) between the scheme and `//`
+        // to break linkify's detection. URLs remain visually readable
+        // (the ZWSP renders as nothing) but copy/paste users get a tiny
+        // anomaly they can clean up — preferable to a one-click phish.
+        // R-pr370-fix-19/23/26/28: declare ZWSP via String.fromCharCode so
+        // the literal U+200B character never appears in source.
+        const ZWSP = String.fromCharCode(0x200B);
+        // Break schemed URLs (http://, https://, ftp://, ws://, wss://,
+        // file://, data://).
+        v = v.replace(/(https?|ftp|ws|wss|file|data):\/\//gi, `$1:${ZWSP}//`);
+        // R-pr370-fix-32/34/38: break BARE DOMAINS (no scheme). markdown-it
+        // linkify defaults to `fuzzyLink: true`, which auto-detects
+        // patterns like "attacker.evil.com" or "www.example.org" and
+        // renders them as clickable links without any explicit scheme.
+        //
+        // Match an alpha-led label as a capture group + `.` + lookahead
+        // for 2+ alphabetic chars, then re-insert the captured label
+        // before the ZWSP. The capture-group approach avoids a
+        // variable-length lookbehind (which some JS engines don't
+        // support — V8 does, but explicit capture is portable). For
+        // consecutive dots in `api.example.com`, /g advances past each
+        // match (past the consumed label + dot), then the next
+        // iteration starts on `example` and matches its trailing dot
+        // too — both dots get a ZWSP. Numeric values like "0.10" are
+        // not mangled because the capture group requires alpha-led.
+        v = v.replace(/([a-z][a-z0-9-]*)\.(?=[a-z]{2,})/gi, `$1${ZWSP}.`);
+        // R-pr370-fix-15: cap AFTER escaping + de-linkify so the rendered
+        // message is actually bounded. Escaping can roughly double the
+        // byte count (every `*` becomes `\*`); de-linkify adds ~1 char
+        // per URL. Cap the final output, not the input.
+        if (v.length > 1024) v = v.slice(0, 1021) + '...';
+        return v;
+    };
     let details;
     if (typeof policyMessage === 'string' && policyMessage.length > 0) {
-        details = `**${esc(toolName)}** — ${esc(policyMessage)}`;
+        details = `**${esc(toolName)}** — ${escPolicy(policyMessage)}`;
     } else {
         switch (toolName) {
             case 'android_sms':

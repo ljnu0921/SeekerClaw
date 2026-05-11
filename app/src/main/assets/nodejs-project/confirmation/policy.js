@@ -104,6 +104,107 @@ function _decimalToAtomic(decimal, decimals) {
     return full;
 }
 
+// BAT-664 (R-pr370-fix-4): early body validation in the policy hook so
+// invalid POST calls fail fast WITHOUT prompting the user to confirm an
+// action that would deterministically reject downstream. Mirrors the
+// rules in tools/agent_pay.js::validateAndSerializeBody — duplicated
+// here rather than imported to avoid a confirmation→tools require cycle.
+// The two MUST stay in sync (regression test in agent-pay-post.test.js
+// pins the rules cross-check).
+const _POLICY_MAX_POST_BODY_BYTES = 8 * 1024;
+function _validateAgentPayPostBody(body) {
+    if (body === undefined || body === null) {
+        return { error: 'body_required_for_post', reason: 'POST requires a JSON body' };
+    }
+    let parsed = body;
+    if (typeof body === 'string') {
+        // R-pr370-fix-5: bound raw string length BEFORE JSON.parse to
+        // avoid resource exhaustion in the confirmation path. Same 2×
+        // cap as agent_pay's validator — final compact-serialized size
+        // is still checked against the strict 8 KB cap below.
+        if (Buffer.byteLength(body, 'utf8') > _POLICY_MAX_POST_BODY_BYTES * 2) {
+            return {
+                error: 'body_too_large',
+                reason: `raw POST body string exceeds ${_POLICY_MAX_POST_BODY_BYTES * 2} bytes pre-parse`,
+            };
+        }
+        try { parsed = JSON.parse(body); }
+        catch (_) {
+            return { error: 'body_not_json', reason: 'string body must be valid JSON' };
+        }
+    }
+    if (parsed === null || typeof parsed !== 'object') {
+        return { error: 'body_not_json', reason: `body must be a JSON object or array (got ${parsed === null ? 'null' : typeof parsed})` };
+    }
+    let s;
+    try { s = JSON.stringify(parsed); }
+    catch (e) {
+        return { error: 'body_not_json', reason: `body could not be serialized: ${e.message}` };
+    }
+    if (typeof s !== 'string') {
+        return { error: 'body_not_json', reason: 'body did not produce a JSON value' };
+    }
+    if (Buffer.byteLength(s, 'utf8') > _POLICY_MAX_POST_BODY_BYTES) {
+        return { error: 'body_too_large', reason: `POST body exceeds ${_POLICY_MAX_POST_BODY_BYTES} UTF-8 bytes` };
+    }
+    return { ok: true };
+}
+
+// BAT-664: confirmation message for agent_pay POST. Shows method + URL +
+// max_usdc + a 200-char body PREVIEW that the UI can render. Per Codex v2
+// note 2: the preview is for HUMAN display only — it must not be persisted
+// to analytics in any form that contains body content. Callers that emit
+// telemetry should record `method`, `host`, `bodyByteLength`, and a
+// `bodyTruncated: true` flag instead. This helper does NOT log or emit;
+// it just returns a string for the confirmation card.
+// R-pr370-fix-3.2: budget the body preview at 200 chars TOTAL (including
+// the truncation suffix), not 200 chars + suffix. Pre-fix produced strings
+// like "<200 chars>… (truncated)" which were 213 chars long — broke the
+// 200-char contract from BAT-664 v2.
+const _BODY_PREVIEW_MAX = 200;
+const _BODY_PREVIEW_SUFFIX = '… (truncated)';
+
+// R-pr370-fix-13 (BAT-664 security): Markdown escaping happens at the
+// render boundary in tools/index.js::formatConfirmationMessage — EVERY
+// policy-built message gets sanitized there, so individual hooks don't
+// have to remember to escape backticks/links/bold/etc. Newlines are
+// preserved structurally by the format function; only the BODY content
+// here literalizes its own embedded newlines (\n in the JSON value
+// shouldn't break the body line out into a new structural line).
+function _literalizeNewlines(s) {
+    return String(s).replace(/\r\n?/g, '\n').replace(/\n/g, '\\n');
+}
+
+function _agentPayPostConfirmMessage(args) {
+    // R-pr370-fix-16: literalize newlines in EVERY interpolated field so
+    // a model-controlled url or max_usdc with embedded \n can't inject
+    // extra structural lines into the confirmation card. Pre-fix only the
+    // body had newline literalization — url/max_usdc were passed through
+    // verbatim and formatConfirmationMessage's escape preserves real
+    // newlines for structure, which is the exact lever an attacker would
+    // use to misrepresent the action being confirmed.
+    const url = typeof args.url === 'string' ? _literalizeNewlines(args.url) : '<missing url>';
+    const max = _literalizeNewlines(typeof args.max_usdc === 'string' ? args.max_usdc : String(args.max_usdc));
+    let bodyPreview = '';
+    if (args.body !== undefined && args.body !== null) {
+        let s;
+        try { s = typeof args.body === 'string' ? args.body : JSON.stringify(args.body); }
+        catch (_) { s = '<unserializable body>'; }
+        // R-pr370-fix-33: literalize BEFORE truncating. Newline → "\n"
+        // is a 2-char expansion; truncating before literalization could
+        // produce a post-literalize string that exceeds _BODY_PREVIEW_MAX.
+        // Now the truncation bound holds on the final user-visible content.
+        s = _literalizeNewlines(s);
+        if (s.length > _BODY_PREVIEW_MAX) {
+            s = s.slice(0, _BODY_PREVIEW_MAX - _BODY_PREVIEW_SUFFIX.length) + _BODY_PREVIEW_SUFFIX;
+        }
+        bodyPreview = `body: ${s}`;
+    } else {
+        bodyPreview = 'body: <empty>';
+    }
+    return `POST ${url}\nmax_usdc: ${max} USDC\n${bodyPreview}`;
+}
+
 function _capDiffMessage(args, walletState) {
     // wallet_set_caps args are decimal strings; current caps in walletState are atomic strings.
     const current = (walletState && walletState.burnerCaps) || {};
@@ -169,6 +270,14 @@ function getConfirmationPolicy(toolName, args, walletState) {
     // Phase 6 does the real demand-vs-max_usdc check inside the tool itself
     // (Node has no way to know the demand pre-fetch). When max_usdc is
     // missing, block at the gate to fail fast.
+    //
+    // BAT-664: POST always requires user confirmation (side-effect-aware).
+    // POST endpoints can send SMS, post content, or trigger paid actions.
+    // _agentPayPostConfirmMessage() below builds the preview text that the
+    // confirmation UI will render verbatim (method + URL + 200-char body
+    // preview + max_usdc). The UI shows this string in the card; this
+    // hook is the source of truth for the preview content. GET keeps its
+    // existing under-cap silent behavior.
     if (toolName === 'agent_pay') {
         if (typeof a.max_usdc !== 'string' && typeof a.max_usdc !== 'number') {
             return {
@@ -177,6 +286,111 @@ function getConfirmationPolicy(toolName, args, walletState) {
                 message: 'agent_pay requires a max_usdc cap (decimal string).',
             };
         }
+        // R-pr370-fix-9: gate-level method validation. Pre-fix any method
+        // other than POST silently fell through to GET behavior (return
+        // 'none'), so an invalid method only failed at the handler. Now
+        // block unsupported methods at the policy so the agent gets a
+        // clear, immediate reason without going through the confirmation
+        // or dispatch path.
+        let method;
+        if (a.method === undefined || a.method === null) {
+            method = 'GET';
+        } else if (typeof a.method !== 'string') {
+            return {
+                policy: 'block',
+                reason: 'method_not_allowed',
+                message: `agent_pay: method must be a string (got ${typeof a.method})`,
+            };
+        } else {
+            method = a.method.toUpperCase();
+        }
+        if (method !== 'GET' && method !== 'POST') {
+            return {
+                policy: 'block',
+                reason: 'method_not_allowed',
+                message: `agent_pay: method must be GET or POST (got ${method})`,
+            };
+        }
+        if (method === 'POST') {
+            // R-pr370-fix-39/43: validate url here — if missing/non-string,
+            // unparseable, or non-HTTPS, the tool deterministically rejects
+            // downstream. Don't prompt the user to confirm an action that
+            // can't succeed. We don't replicate the FULL preflight here
+            // (private IP / debug-localhost) since those need DNS — just
+            // the cheap pre-DNS checks.
+            if (typeof a.url !== 'string' || a.url.length === 0) {
+                return {
+                    policy: 'block',
+                    reason: 'invalid_input',
+                    message: 'agent_pay POST requires a non-empty url string.',
+                };
+            }
+            let parsedUrl;
+            try { parsedUrl = new URL(a.url); }
+            catch (_) {
+                return {
+                    policy: 'block',
+                    reason: 'invalid_url',
+                    message: 'agent_pay POST: url failed to parse as a URL.',
+                };
+            }
+            // R-pr370-fix-44: mirror tools/agent_pay.js::preflightUrlSync.
+            // https:// always OK. http:// only OK for localhost AND debug
+            // build — otherwise non_https. Any other scheme → non_https.
+            // Pre-fix the gate only blocked non-http(s); plain `http://x`
+            // would reach 'confirm' even though the tool deterministically
+            // rejects it as non_https.
+            if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+                return {
+                    policy: 'block',
+                    reason: 'non_https',
+                    message: `agent_pay POST: url scheme must be https (got ${parsedUrl.protocol}).`,
+                };
+            }
+            if (parsedUrl.protocol === 'http:') {
+                const host = (parsedUrl.hostname || '').toLowerCase();
+                const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
+                const isDebug = process.env.NODE_ENV === 'development' || process.env.NODE_ENV === 'test';
+                if (!isLocal || !isDebug) {
+                    return {
+                        policy: 'block',
+                        reason: 'non_https',
+                        message: 'agent_pay POST: http:// only allowed for localhost in debug builds.',
+                    };
+                }
+            }
+            // R-pr370-fix-20: fail-fast at gate when no burner. POST
+            // deterministically rejects with burner_not_configured at the
+            // handler — prompting the user to confirm an action that
+            // can't succeed is bad UX. Block early so the agent gets the
+            // signal without involving the user.
+            if (!burnerConfigured) {
+                return {
+                    policy: 'block',
+                    reason: 'burner_not_configured',
+                    message: 'agent_pay POST requires a burner wallet. Configure one in Settings → Burner Wallet.',
+                };
+            }
+            // R-pr370-fix-4: validate the body here BEFORE asking the user
+            // to confirm. Pre-fix the user could confirm a POST that the
+            // tool then deterministically rejects with body_required_for_post
+            // / body_not_json / body_too_large — wasted UX. Block at the
+            // policy gate with a clear reason so the agent fixes the call
+            // without involving the user.
+            const v = _validateAgentPayPostBody(a.body);
+            if (v.error) {
+                return {
+                    policy: 'block',
+                    reason: v.error,
+                    message: `agent_pay POST rejected: ${v.reason}`,
+                };
+            }
+            return {
+                policy: 'confirm',
+                message: _agentPayPostConfirmMessage(a),
+            };
+        }
+        // GET: keep the existing under-cap-silent behavior.
         return 'none';
     }
 
