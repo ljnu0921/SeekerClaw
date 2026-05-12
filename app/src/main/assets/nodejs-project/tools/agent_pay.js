@@ -542,7 +542,18 @@ const tools = [
                     // guidance + downstream schema-driven validators see the
                     // full surface. Bare primitives rejected at validate
                     // time (see validateAndSerializeBody).
+                    //
+                    // Anthropic schema validator requires that when `type`
+                    // includes `array`, an `items` schema MUST be defined —
+                    // even when other types are also allowed. Without it
+                    // the entire toolset is rejected with status 400
+                    // `array schema missing items`, taking down ALL agent
+                    // turns (not just agent_pay calls). `items: {}` (the
+                    // empty schema = "any value") is the minimal valid
+                    // shape that preserves the union intent. Regression
+                    // covered by tests/nodejs-project/tool-schemas.test.js.
                     type: ['object', 'array', 'string'],
+                    items: {},
                     description: 'Request body for POST. JSON object or array (or a JSON string that parses to an object/array). Bare primitives (numbers, booleans, plain strings) are rejected. Max 8 KB UTF-8 after compact serialization. String inputs are ALSO capped at 16 KB UTF-8 pre-parse (DoS guard against multi-MB strings that would compact down). Required when method=POST.',
                 },
             },
