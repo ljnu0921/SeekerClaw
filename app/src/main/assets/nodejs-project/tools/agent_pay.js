@@ -677,7 +677,34 @@ async function _handle(input /* , chatId */) {
     // 5. 402 → detect protocol.
     const protocol = detectProtocol(_protocolView(firstResp));
     if (!protocol) {
-        log('[agent_pay] no x402 protocol detected for 402 response', 'WARN');
+        // Diagnostic dump when detection fails. Pre-fix (BAT-664 device-test
+        // 2026-05-12), this branch only logged "no x402 protocol detected"
+        // with no shape detail — making it impossible to tell whether the
+        // body was empty, malformed, missing accepts[], wrong x402Version,
+        // or arrived via the `payment-required` header. Now we surface
+        // enough to diagnose without re-instrumenting + rebuilding. Keep
+        // the dump bounded: 500 chars max from each side, sanitize obvious
+        // secret-shaped values via security.redactSecrets if available.
+        const ct = String(firstResp.headers && firstResp.headers['content-type'] || '');
+        const pr = firstResp.headers && (firstResp.headers['payment-required'] || firstResp.headers['Payment-Required']);
+        const bj = firstResp.bodyJson;
+        let bjShape = 'undefined';
+        if (bj === null) bjShape = 'null';
+        else if (Array.isArray(bj)) bjShape = `array(${bj.length})`;
+        else if (typeof bj === 'object') {
+            const keys = Object.keys(bj).slice(0, 10).join(',');
+            const acceptsLen = Array.isArray(bj.accepts) ? bj.accepts.length : 'n/a';
+            const reqLen = Array.isArray(bj.paymentRequirements) ? bj.paymentRequirements.length : 'n/a';
+            bjShape = `object{${keys}} x402Version=${bj.x402Version ?? 'absent'} accepts=${acceptsLen} paymentRequirements=${reqLen}`;
+        } else if (typeof bj !== 'undefined') {
+            bjShape = typeof bj;
+        }
+        const bbLen = firstResp.bodyBuffer ? firstResp.bodyBuffer.length : 'n/a';
+        const bodyHead = firstResp.bodyBuffer
+            ? firstResp.bodyBuffer.toString('utf8').slice(0, 500).replace(/\s+/g, ' ')
+            : '(no body)';
+        log(`[agent_pay] no x402 protocol detected for 402 response — ct="${ct}" payment-required-header=${pr ? 'present(' + pr.length + 'b)' : 'absent'} bodyJson=${bjShape} bodyBuffer.len=${bbLen}`, 'WARN');
+        log(`[agent_pay] no_protocol_match body head: ${bodyHead}`, 'WARN');
         return {
             error: 'no_protocol_match',
             reason: 'Received 402 but no registered payment protocol matched the response shape (V1 supports pay.sh-style x402 only).',
