@@ -728,8 +728,12 @@ async function _handle(input /* , chatId */) {
             bjShape = typeof bj;
         }
         const bbLen = firstResp.bodyBuffer ? firstResp.bodyBuffer.length : 'n/a';
+        // R-pr373-r5-1: decode only the first 500 bytes from the buffer (not
+        // the entire potentially-1MB body) before whitespace-collapsing and
+        // redacting. Buffer.toString with start/end offsets handles the
+        // boundary natively; cheap on the error path.
         const rawBodyHead = firstResp.bodyBuffer
-            ? firstResp.bodyBuffer.toString('utf8').slice(0, 500).replace(/\s+/g, ' ')
+            ? firstResp.bodyBuffer.toString('utf8', 0, 500).replace(/\s+/g, ' ')
             : '(no body)';
         const bodyHead = redactSecrets(rawBodyHead);
         log(`[agent_pay] no x402 protocol detected for 402 response — ct="${ct}" payment-required-header=${pr ? 'present(' + pr.length + 'b)' : 'absent'} bodyJson=${bjShape} bodyBuffer.len=${bbLen}`, 'WARN');

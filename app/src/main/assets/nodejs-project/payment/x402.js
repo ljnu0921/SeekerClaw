@@ -1392,8 +1392,16 @@ class X402Protocol extends PaymentProtocol {
             // Bounded 500-char head. Body is public protocol data — same
             // shape we commit as fixtures — no secrets to redact here.
             const ct = String(resp.headers && resp.headers['content-type'] || '');
+            // R-pr373-r5-1: decode only the first 500 bytes via Buffer.toString
+            // with start/end offsets, rather than decoding the entire (up to
+            // MAX_BODY_BYTES=1MB) buffer first and then slicing the resulting
+            // string. The error path can run on a freshly-allocated 1MB
+            // buffer; full-buffer decoding plus garbage-collection of the
+            // discarded ~99.95% is wasteful when we only ever log 500 bytes.
+            // Buffer.toString gracefully handles end > buffer.length so we
+            // don't need to clamp explicitly.
             const bodyHead = resp.bodyBuffer
-                ? resp.bodyBuffer.toString('utf8').slice(0, 500)
+                ? resp.bodyBuffer.toString('utf8', 0, 500)
                 : (typeof resp.body === 'string' ? resp.body.slice(0, 500) : '');
             return {
                 error: 'payment_rejected',
