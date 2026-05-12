@@ -4,11 +4,50 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # Run on PRs to ANY branch, not just main. Feature branches and
+    # integration branches need the same protection — schema bugs that
+    # land on a feature branch propagate forward at merge time.
+    branches: ['**']
 
 jobs:
-  build:
+  # Fast Node-only checks — run first, fail fast, no JDK / Gradle / SDK
+  # needed. Catches the class of bug that takes down the agent on the
+  # wire (invalid tool input_schema) without waiting for the ~5-minute
+  # APK build.
+  #
+  # See BAT-664 device-test incident 2026-05-12: agent_pay's body schema
+  # declared type union including 'array' without 'items', the Anthropic
+  # API rejected the entire toolset, and EVERY agent turn failed. The
+  # bug shipped through Copilot review + validate-detect + validate-settle
+  # + 6 live on-chain payments because none of those exercise the actual
+  # model API. The schema test below is the wire-level safety net.
+  node-tests:
+    name: Node tests (input_schema + smoke)
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate tool input_schemas
+        # Required check — a bad schema breaks ALL agent turns, not just
+        # calls to the bad tool. Cheap to run (<1s), high blast radius.
+        run: node tests/nodejs-project/tool-schemas.test.js
+
+      - name: Node bundle smoke test
+        # node --check on every .js + require() of side-effect-free modules.
+        # Catches the BAT-489 RC5 class of bug (regex SyntaxError that
+        # node --check passes but module-load eval throws on).
+        run: node tests/nodejs-project/smoke.js
+
+  build:
+    name: Android build (dappStore + googlePlay)
+    runs-on: ubuntu-latest
+    needs: node-tests  # don't waste 5min of compile if Node checks fail
 
     steps:
       - name: Checkout
