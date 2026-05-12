@@ -100,6 +100,18 @@ grep "\[Trace\]" node_debug.log | tail -10
 3. The system automatically retries with backoff — no manual intervention usually needed
 4. API timeout is configurable in agent_settings.json (`apiTimeoutMs`, default 120000)
 
+### Invalid Tool Schema (400 Error) — Agent Won't Respond
+**Symptoms:** Every agent turn fails with `API error (400): Invalid schema for function 'TOOLNAME'`. NO tool is dispatched; the model rejects the entire toolset before producing any output. Agent appears completely dead.
+**Check:**
+```
+grep -i "Invalid schema for function" node_debug.log | tail -3
+```
+**Diagnosis:** The Anthropic API validates every tool's `input_schema` before allowing the model to call any of them. A single malformed schema rejects the WHOLE toolset, not just calls to the bad tool. Common bug shapes that bite:
+- `type: ['object', 'array', 'string']` without `items: {}` — when a union includes `array`, `items` is required even for the polymorphic case. Caught: BAT-664 (`tools/agent_pay.js` `body` parameter).
+- `required: ['foo']` where `foo` isn't in `properties`.
+- Misspelled JSON Schema type names (`"strng"` instead of `"string"`).
+**Fix:** `node tests/nodejs-project/tool-schemas.test.js` walks every tool's schema and points at the bad one. CI runs this on every PR (`.github/workflows/build.yml` `node-tests` job). If you see this error in production, the safety net was bypassed — investigate. Once the schema is corrected, no APK rebuild is required if the tool definition is in `nodejs-project/` (just restart the service); if it's in `tools/index.js` Kotlin glue, rebuild + reinstall.
+
 ### Context Overflow (400 Error)
 **Symptoms:** API returns 400 error, message mentions "maximum context length" or "too many tokens".
 **Check:**
@@ -637,6 +649,8 @@ All errors below:
 **Symptoms:** Tool result `error: "burner_not_configured"`. NO HTTP request to the URL was made.
 **Diagnosis:** agent_pay refuses to fetch when there's no burner wallet; it would have nothing to pay with. /burner/status returned `configured: false`.
 **Fix:** Open SeekerClaw → Settings → Burner Wallet → import a key. Fund the burner with USDC (mainnet). Re-invoke agent_pay.
+
+**False-positive scenario (BAT-664 device-test 2026-05-12):** `burner_not_configured` was returned **only for POST**, while same-session GET worked fine. Root cause was NOT the burner — it was configured. `wallet/index.js _BURNER_STATUS_GATE_TOOLS` had `agent_pay` excluded under R9's v1.4-era optimization, so the confirmation gate received the empty short-circuit state (`burnerConfigured: false`) and the BAT-664 POST branch in `confirmation/policy.js:367` fast-failed every call. Fixed by re-including `agent_pay` in the gate set (commit `6957604c`). Guard: `tests/nodejs-project/wallet-registry.test.js` now asserts the gate fetches `/burner/status` for agent_pay AND propagates `configured: true` through to the policy hook. If the symptom recurs (POST-only `burner_not_configured` with GET working), check that test first, then `_BURNER_STATUS_GATE_TOOLS` membership.
 
 ### `agent_pay: no x402 protocol detected for this response`
 **Symptoms:** Tool result `error: "no_protocol_match"` after a 402 response.

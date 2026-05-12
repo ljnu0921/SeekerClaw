@@ -522,6 +522,11 @@ const tools = [
             '+ optional `method` ("GET" default, or "POST") + optional `body` (JSON-serializable object, required for POST, ≤ 8 KB). ' +
             'The burner wallet signs autonomously when the 402 demand is ≤ max_usdc; the call is rejected ' +
             'if the demand exceeds max_usdc, the network is not Solana, or the asset is not USDC. ' +
+            'TWO INDEPENDENT CEILINGS apply: `max_usdc` is YOUR willingness ceiling (set per-call); the BURNER CAP ' +
+            '(per-tx + daily, configured by the user in Settings) is the user\'s hard ceiling. BOTH bound the ACTUAL ' +
+            'demand the server returns, NOT max_usdc itself — so setting max_usdc=$1.00 against a $0.01 endpoint ' +
+            'with a $0.10 cap pays $0.01 (within both), not $1.00. When a user sets a cap "to test it," explain this ' +
+            'distinction before invoking; suggest they pick a service costing more than the cap to actually exercise rejection. ' +
             'GET runs silently when under cap. POST always asks for user confirmation (side-effect-aware: ' +
             'POST can send SMS, post content, or trigger other paid actions). ' +
             'Refuses if no burner is configured (Settings → Burner Wallet to set up).',
