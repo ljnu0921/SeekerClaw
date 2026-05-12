@@ -816,6 +816,16 @@ async function _handle(input /* , chatId */) {
     const settled = await protocol.settle(originalRequest, signedTxBase64, paymentMeta, { _fetchWithLimits });
     if (!settled || settled.error) {
         await _release(reservationId, settled && settled.error ? settled.error : 'settle_failed');
+        // BAT-664 device-test diagnostic. When x402.settle() surfaces a
+        // `diag` block (currently emitted only on payment_rejected — the
+        // server-returned-402-again case), dump it so we can see WHY
+        // paysponge rejected our PAYMENT-SIGNATURE proof. Bounded
+        // 500-char body head — public protocol fields only, no secrets.
+        if (settled && settled.diag) {
+            const d = settled.diag;
+            const bodyOneLine = String(d.bodyHead || '').replace(/\s+/g, ' ').slice(0, 500);
+            log(`[agent_pay] settle rejection diag — ct="${d.contentType || ''}" bodyLen=${d.bodyLen} bodyHead: ${bodyOneLine}`, 'WARN');
+        }
         return {
             error: settled && settled.error ? settled.error : 'settle_failed',
             reason: settled && settled.reason ? settled.reason : 'settle returned no result',

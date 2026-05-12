@@ -1381,7 +1381,29 @@ class X402Protocol extends PaymentProtocol {
 
         if (resp.error) return { error: resp.error, reason: resp.reason };
         if (resp.status === 402) {
-            return { error: 'payment_rejected', reason: `server returned 402 again (status=${resp.status})` };
+            // BAT-664 device-test diagnostic (2026-05-12). Propagate the
+            // server's 402 body up so agent_pay.js (which has `log`
+            // imported) can dump it. Surfaces WHY paysponge rejected:
+            //   - invalid signature (bridge BC mismatch)
+            //   - expired challenge.id (timing)
+            //   - amount mismatch (build vs accepted)
+            //   - replay (idempotency-key cache)
+            //   - generic "still need payment" (paysponge bug)
+            // Bounded 500-char head. Body is public protocol data — same
+            // shape we commit as fixtures — no secrets to redact here.
+            const ct = String(resp.headers && resp.headers['content-type'] || '');
+            const bodyHead = resp.bodyBuffer
+                ? resp.bodyBuffer.toString('utf8').slice(0, 500)
+                : (typeof resp.body === 'string' ? resp.body.slice(0, 500) : '');
+            return {
+                error: 'payment_rejected',
+                reason: `server returned 402 again (status=${resp.status})`,
+                diag: {
+                    contentType: ct,
+                    bodyHead,
+                    bodyLen: resp.bodyBuffer ? resp.bodyBuffer.length : (typeof resp.body === 'string' ? resp.body.length : 0),
+                },
+            };
         }
         if (resp.status >= 400) {
             return { error: 'settle_http_error', reason: `server returned ${resp.status} after payment` };
