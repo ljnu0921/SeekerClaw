@@ -49,6 +49,35 @@ jobs:
         # node --check passes but module-load eval throws on).
         run: node tests/nodejs-project/smoke.js
 
+      # R-pr373-r6-2: financial-flow + confirmation-gate tests gated in CI.
+      # Pre-fix, these only ran locally (or in pre-push for those who
+      # remembered to run it). The agent_pay-* + wallet-registry + caps
+      # + confirmation tests cover safety-critical wallet logic:
+      # gating, cap enforcement, pre-flight balance check branches, POST
+      # body validation, burner-status routing. Each is fast (<5s) and
+      # they catch regressions that would otherwise only surface at
+      # device-test time — too late.
+      - name: Financial-flow + confirmation-gate tests
+        run: |
+          set -e
+          for t in \
+            agent-pay-no-burner \
+            agent-pay-post \
+            agent-pay-preflight-balance \
+            burner-cancel-zero-amount \
+            burner-signer \
+            caps-preflight \
+            confirmation-policy \
+            confirmation-policy-burner \
+            wallet-registry \
+            wallet-set-caps-errors \
+            x402 \
+            x402-v2-tx
+          do
+            echo "── $t ──"
+            node "tests/nodejs-project/${t}.test.js"
+          done
+
   build:
     name: Android build (dappStore + googlePlay)
     runs-on: ubuntu-latest

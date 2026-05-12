@@ -16,10 +16,14 @@ const BUNDLE = path.resolve(__dirname, '..', '..', 'app', 'src', 'main', 'assets
 const FIXTURES = path.resolve(__dirname, '..', 'payment');
 
 // ── Mock config.js + bridge.js + solana.js ──────────────────────────────────
+// R-pr373-r2-1 / r6-2: agent_pay.js (transitively required below)
+// pulls `../security`, which destructures `config` from config.js
+// and iterates Object.keys(config) at module load. Mock must expose
+// a real (if empty) `config` object — not undefined.
 const configPath = require.resolve(path.join(BUNDLE, 'config.js'));
 require.cache[configPath] = {
     id: configPath, filename: configPath, loaded: true,
-    exports: { BRIDGE_TOKEN: 't', log: () => {} },
+    exports: { BRIDGE_TOKEN: 't', log: () => {}, config: {}, workDir: '/tmp/seekerclaw-test' },
 };
 
 // Stub solana.js so payment/x402.js's lazy require for blockhash and

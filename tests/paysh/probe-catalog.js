@@ -443,11 +443,34 @@ function fmtAmount(amounts) {
     const a = String(amounts[0]);
     // Numeric atomic USDC → decimal USDC display ($x.yz)
     if (/^\d+$/.test(a)) {
-        const atomic = BigInt(a);
-        const usdc = Number(atomic) / 1e6;
-        return `$${usdc.toFixed(4).replace(/\.?0+$/, '')}`;
+        // R-pr373-r6-1: BigInt-safe formatting. Pre-fix used
+        // `Number(atomic) / 1e6` which loses precision for values above
+        // Number.MAX_SAFE_INTEGER (~9e15 — ~9 trillion USDC, unrealistic
+        // but possible if a service advertises a malformed huge amount;
+        // we'd render Infinity in the catalog summary, which is worse
+        // than the raw string). String-math via padStart is BigInt-safe
+        // for any value the protocol parser can construct.
+        return `$${_bigIntAtomicToDecimal(BigInt(a), 6)}`;
     }
     return a;
+}
+
+// BigInt-safe USDC atomic → trimmed decimal string. Same algorithm as
+// `_atomicBigIntToDecimal` in `app/.../tools/index.js` and
+// `_atomicToDecimalString` in `app/.../tools/agent_pay.js` — kept local
+// here to avoid pulling the Android app's tools/ module into a test
+// script (which doesn't and shouldn't have those transitive requires).
+function _bigIntAtomicToDecimal(atomicBig, decimals) {
+    if (typeof atomicBig !== 'bigint') return '?';
+    let s = atomicBig.toString();
+    const negative = s.startsWith('-');
+    if (negative) s = s.slice(1);
+    if (s === '0') return '0';
+    const pad = s.padStart(decimals + 1, '0');
+    const head = pad.slice(0, pad.length - decimals);
+    const tail = pad.slice(pad.length - decimals).replace(/0+$/, '');
+    const out = tail.length ? `${head}.${tail}` : head;
+    return negative ? `-${out}` : out;
 }
 
 async function main() {
