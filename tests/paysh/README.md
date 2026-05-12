@@ -109,8 +109,22 @@ node tests/paysh/probe-catalog.js --commit-captures    # also write captures/cat
 
 Unlike `probe-all.js` (regression net — 4 hand-curated services with
 committed fixtures + EXPECTATIONS entries), `probe-catalog.js` is a
-BREADTH survey designed to scale to the whole catalog without bloating
-the repo. The summary file is the artefact, not per-service captures.
+BREADTH survey designed to scale to the whole catalog. Two artefact
+modes:
+
+- **Default mode** (no `--commit-captures` flag): only `catalog-summary.md`
+  is regenerated on each run. Most catalog probes go this way — refreshing
+  the markdown summary is cheap and avoids bloat from 72+ per-service
+  fixtures.
+- **Capture mode** (`--commit-captures` flag): also writes one JSON
+  fixture per service that returned 402 to `captures/catalog/<svc>.json`.
+  Committed to the repo IF the operator runs the script that way AND
+  stages the resulting files. Used to seed regression evidence for
+  specific protocol classes — e.g. this PR's 33 MPP-protocol capture
+  fixtures under `captures/catalog/solana-foundation-{alibaba,google}_*.json`
+  are committed as wire-data for [BAT-675](https://linear.app/batcave/issue/BAT-675)
+  (MPP discovery follow-on). When refreshing, review `git diff
+  tests/paysh/captures/catalog/` like any other fixture diff.
 
 Distinct reject codes surface real ecosystem facts:
 - `mpp_protocol` — service speaks a non-x402 paywall (e.g. Alibaba +
