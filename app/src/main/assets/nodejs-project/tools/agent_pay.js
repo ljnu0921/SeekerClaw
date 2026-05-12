@@ -982,23 +982,53 @@ async function _checkBurnerUsdcBalance(burnerPubkey58, demandAtomic) {
     } catch (e) {
         return { error: 'preflight_balance_rpc_failed', reason: e.message };
     }
-    // No ATA exists (burner has never received USDC at all). Treat as
-    // 0 balance — definitely insufficient for any non-zero demand.
-    if (!rpcResult || rpcResult.error) {
-        // Common case: getTokenAccountBalance returns 32004 / "could not
-        // find account" when the ATA doesn't exist on chain.
-        const have = 0n;
-        const short = demandAtomic - have;
-        return {
-            error: 'insufficient_burner_balance',
-            haveAtomic: '0',
-            haveDecimal: '0',
-            needAtomic: demandAtomic.toString(),
-            needDecimal: (Number(demandAtomic) / 1e6).toFixed(6).replace(/\.?0+$/, ''),
-            shortAtomic: short.toString(),
-            shortDecimal: (Number(short) / 1e6).toFixed(6).replace(/\.?0+$/, ''),
-            reason: 'Burner has never received USDC (no ATA on chain).',
-        };
+    // R-pr373-r1-1: distinguish "ATA doesn't exist on chain" (fail-closed,
+    // treat as 0 balance) from "RPC failure" (fail-open, fall through to
+    // facilitator-side check). Pre-fix every error was treated as zero
+    // balance — meaning a transient `getTokenAccountBalance` timeout
+    // would have incorrectly blocked a legitimate payment with
+    // `insufficient_burner_balance`. solanaRpc() only returns
+    // `{error: <message>}` without structured RPC codes, so we match on
+    // the error message text Solana RPC emits for the not-found case.
+    if (!rpcResult) {
+        // Empty result with no error envelope — unusual, treat as RPC
+        // issue (fail-open).
+        return { error: 'preflight_balance_rpc_empty_response' };
+    }
+    if (rpcResult.error) {
+        const errMsg = String(rpcResult.error || '').toLowerCase();
+        const isAccountNotFound =
+            errMsg.includes('could not find account') ||
+            errMsg.includes('account not found') ||
+            errMsg.includes('-32004') ||
+            // Some Solana RPC variants return "invalid param: pubkey" when
+            // the ATA address itself is well-formed but no account lives
+            // at that address. We treat the explicit not-found phrases
+            // above only; other "invalid" surfaces fall through as RPC
+            // issues (fail-open) since they may be transient.
+            errMsg.includes('invalid param: pubkey');
+        if (isAccountNotFound) {
+            // ATA truly doesn't exist on chain — burner has never received
+            // USDC. Treat as 0 balance, fail-closed (this is a definite
+            // "insufficient" state, not a transient one).
+            const have = 0n;
+            const short = demandAtomic - have;
+            return {
+                error: 'insufficient_burner_balance',
+                haveAtomic: '0',
+                haveDecimal: '0',
+                needAtomic: demandAtomic.toString(),
+                needDecimal: (Number(demandAtomic) / 1e6).toFixed(6).replace(/\.?0+$/, ''),
+                shortAtomic: short.toString(),
+                shortDecimal: (Number(short) / 1e6).toFixed(6).replace(/\.?0+$/, ''),
+                reason: 'Burner has never received USDC (no ATA on chain).',
+            };
+        }
+        // Any other RPC error (timeout, rate limit, transient network
+        // failure, gateway 5xx) — fail-open. Caller logs WARN and falls
+        // through to the existing cap reservation + facilitator-side
+        // checks. Don't block legitimate payments on RPC flake.
+        return { error: 'preflight_balance_rpc_failed', reason: rpcResult.error };
     }
     const amountStr = rpcResult.value && rpcResult.value.amount;
     if (typeof amountStr !== 'string' || !/^\d+$/.test(amountStr)) {

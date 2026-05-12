@@ -31,7 +31,12 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # Pin to Node 18 LTS — matches the embedded nodejs-mobile runtime
+          # on device (per CLAUDE.md "Node.js: 18 LTS"). Pre-fix this was
+          # Node 20; Copilot review R1-2 flagged the drift risk (newer
+          # syntax / APIs could pass CI and crash on-device). Keeping CI's
+          # Node major aligned with production catches that class of bug.
+          node-version: '18'
 
       - name: Validate tool input_schemas
         # Required check — a bad schema breaks ALL agent turns, not just
