@@ -727,12 +727,54 @@ async function _handle(input /* , chatId */) {
         return { error: 'protocol_build_invalid', reason: 'protocol.build returned no txBase64 or paymentMeta' };
     }
 
-    // 7. Cap preflight (USDC per-tx + daily). Bridge is canonical writer; we
-    // just fail fast if the cap obviously won't fit.
     const demandAtomic = paymentMeta.amountAtomic;
     if (typeof demandAtomic !== 'bigint') {
         return { error: 'protocol_build_invalid', reason: 'paymentMeta.amountAtomic must be a BigInt' };
     }
+
+    // 6b. Pre-flight burner USDC balance check.
+    //
+    // BAT-664 device-test 2026-05-12: paysponge's facilitator does a
+    // server-side balance check on the payer and returns 402 (sometimes
+    // with stripped accepts → looks like `no_protocol_match`, sometimes
+    // with full challenge → looks like `payment_rejected` after settle)
+    // when the burner can't cover the demand. Before this check existed
+    // the agent would blindly probe + build + sign + settle for a payment
+    // that paysponge would always reject — burning UX latency, confusing
+    // the agent's diagnosis, AND because the bridge cap-reserve already
+    // happened, holding a phantom reservation until TTL expiry.
+    //
+    // Implementation: query Solana RPC for the burner's USDC ATA balance.
+    // Fail-OPEN on RPC errors (timeout, rate limit, parse fail) — we don't
+    // want to block legitimate payments because of a transient RPC
+    // hiccup. The settle path's facilitator check + the on-chain
+    // failure mode catch insufficient funds downstream regardless.
+    //
+    // We check `demandAtomic` only, not demand+fees. Solana SPL transfer
+    // fees come from the FACILITATOR account in v2 (feePayer slot 0), not
+    // from the burner, so the burner only needs USDC enough to cover the
+    // transfer amount itself. SOL on the burner is for SOL transfers
+    // (separate path).
+    try {
+        const balanceCheck = await _checkBurnerUsdcBalance(status.pubkey, demandAtomic);
+        if (balanceCheck && balanceCheck.error === 'insufficient_burner_balance') {
+            log(`[agent_pay] pre-flight balance check refused: have=${balanceCheck.haveAtomic} atomic, need=${demandAtomic} atomic, short by ${balanceCheck.shortAtomic} atomic`, 'WARN');
+            return {
+                error: 'insufficient_burner_balance',
+                reason: `Burner has ${balanceCheck.haveDecimal} USDC; this call needs ${balanceCheck.needDecimal} USDC. Fund the burner with at least ${balanceCheck.shortDecimal} more USDC (send to ${status.pubkey}) and retry.`,
+            };
+        }
+        // RPC failure: fail-open. Log so device operator can investigate
+        // if pattern persists, but allow the call to proceed.
+        if (balanceCheck && balanceCheck.error) {
+            log(`[agent_pay] pre-flight balance check skipped (RPC issue: ${balanceCheck.error}) — falling through to facilitator-side check`, 'WARN');
+        }
+    } catch (e) {
+        log(`[agent_pay] pre-flight balance check threw (${e.message}) — falling through`, 'WARN');
+    }
+
+    // 7. Cap preflight (USDC per-tx + daily). Bridge is canonical writer; we
+    // just fail fast if the cap obviously won't fit.
     const perTx = await wouldReserve('burner.pertx.usdc', demandAtomic);
     if (!perTx.wouldAllow) {
         return {
@@ -888,6 +930,94 @@ function _safeHeaders(headers) {
         out[lk] = headers[k];
     }
     return out;
+}
+
+// BAT-664 device-test fix (2026-05-12): check burner's on-chain USDC
+// balance vs demand BEFORE committing to a settle round-trip. Returns:
+//   - { ok: true, haveAtomic }                      when balance ≥ demand
+//   - { error: 'insufficient_burner_balance', ... } when short
+//   - { error: '<rpc-error>' }                      on transient RPC issue
+//                                                   (caller fails open)
+//
+// Why this exists: paysponge's facilitator does a server-side balance
+// check and rejects with 402 (sometimes with stripped accepts → masked
+// as `no_protocol_match`, sometimes with a full challenge replayed →
+// masked as `payment_rejected`). Either way the device-side agent gets
+// a confusing error rather than "your burner is empty." This pre-flight
+// surfaces the real cause with the actual gap so the agent can tell the
+// user "send X more USDC to <pubkey> and retry."
+//
+// Lazy-requires solana.js + payment/x402.js so the test surface in
+// agent-pay-* tests (which inject mocks pre-load) stays unchanged.
+async function _checkBurnerUsdcBalance(burnerPubkey58, demandAtomic) {
+    let solanaRpc, _findAssociatedTokenAddress, _decodeSolanaPubkey, USDC_MINT, base58Encode;
+    try {
+        ({ solanaRpc, base58Encode } = require('../solana'));
+        ({ _findAssociatedTokenAddress, _decodeSolanaPubkey, USDC_MINT } = require('../payment/x402'));
+    } catch (e) {
+        return { error: 'preflight_balance_load_failed', reason: e.message };
+    }
+
+    // Derive the burner's USDC ATA from pubkey + USDC mint. The same
+    // algorithm x402.js uses to build the SPL transfer destination, so
+    // we read the EXACT account paysponge will check.
+    let ataBase58;
+    try {
+        const ownerBytes = _decodeSolanaPubkey(burnerPubkey58);
+        const mintBytes = _decodeSolanaPubkey(USDC_MINT);
+        if (!ownerBytes || !mintBytes) {
+            return { error: 'preflight_balance_invalid_pubkey' };
+        }
+        const { address } = _findAssociatedTokenAddress(ownerBytes, mintBytes);
+        ataBase58 = base58Encode(address);
+    } catch (e) {
+        return { error: 'preflight_balance_ata_derive_failed', reason: e.message };
+    }
+
+    // RPC call. Tight per-call budget; the overall agent_pay deadline
+    // still applies. Failure here is non-fatal — caller falls through.
+    let rpcResult;
+    try {
+        rpcResult = await solanaRpc('getTokenAccountBalance', [ataBase58]);
+    } catch (e) {
+        return { error: 'preflight_balance_rpc_failed', reason: e.message };
+    }
+    // No ATA exists (burner has never received USDC at all). Treat as
+    // 0 balance — definitely insufficient for any non-zero demand.
+    if (!rpcResult || rpcResult.error) {
+        // Common case: getTokenAccountBalance returns 32004 / "could not
+        // find account" when the ATA doesn't exist on chain.
+        const have = 0n;
+        const short = demandAtomic - have;
+        return {
+            error: 'insufficient_burner_balance',
+            haveAtomic: '0',
+            haveDecimal: '0',
+            needAtomic: demandAtomic.toString(),
+            needDecimal: (Number(demandAtomic) / 1e6).toFixed(6).replace(/\.?0+$/, ''),
+            shortAtomic: short.toString(),
+            shortDecimal: (Number(short) / 1e6).toFixed(6).replace(/\.?0+$/, ''),
+            reason: 'Burner has never received USDC (no ATA on chain).',
+        };
+    }
+    const amountStr = rpcResult.value && rpcResult.value.amount;
+    if (typeof amountStr !== 'string' || !/^\d+$/.test(amountStr)) {
+        return { error: 'preflight_balance_rpc_malformed_response' };
+    }
+    const have = BigInt(amountStr);
+    if (have >= demandAtomic) {
+        return { ok: true, haveAtomic: amountStr };
+    }
+    const short = demandAtomic - have;
+    return {
+        error: 'insufficient_burner_balance',
+        haveAtomic: amountStr,
+        haveDecimal: (Number(have) / 1e6).toFixed(6).replace(/\.?0+$/, ''),
+        needAtomic: demandAtomic.toString(),
+        needDecimal: (Number(demandAtomic) / 1e6).toFixed(6).replace(/\.?0+$/, ''),
+        shortAtomic: short.toString(),
+        shortDecimal: (Number(short) / 1e6).toFixed(6).replace(/\.?0+$/, ''),
+    };
 }
 
 async function _release(reservationId, reason) {

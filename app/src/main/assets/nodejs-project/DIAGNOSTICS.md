@@ -660,6 +660,19 @@ All errors below:
 2. If it's a different x402 dialect (e.g., Coinbase's variant), V1 doesn't support it — track as a follow-up to commit a fixture for that variant.
 3. If it's a non-x402 paywall, agent_pay can't handle it. Tell the user "this endpoint uses a paywall format I don't support."
 
+### `agent_pay: insufficient burner balance`
+**Symptoms:** Tool result `error: "insufficient_burner_balance"` with `reason` like `"Burner has 0.003378 USDC; this call needs 0.02 USDC. Fund the burner with at least 0.016622 more USDC (send to <pubkey>) and retry."` NO probe sent, NO settle attempted, NO money moved.
+**Diagnosis:** The pre-flight balance check (BAT-664 device-test fix) queries the burner's USDC ATA on-chain BEFORE probing. If the ATA balance < demand, refuse immediately. This catches what used to surface as confusing downstream errors (`no_protocol_match` or `payment_rejected` — both caused by paysponge's server-side balance check rejecting with 402).
+**Fix:**
+1. Tell the user the EXACT shortfall (in the error reason).
+2. User funds the burner — send USDC to the burner pubkey (shown in the error and in `wallet_status`).
+3. Retry. The pre-flight will re-check on each invocation.
+
+**Failure mode evolution:** Pre-fix (commit `54845b57` and earlier), an under-funded burner produced:
+- `no_protocol_match` when paysponge stripped accepts from its 402 response (looked like a parser bug)
+- `payment_rejected — server returned 402 again` when paysponge returned a full challenge but rejected the proof (looked like a settle bug)
+Both were red herrings — root cause was always "not enough USDC at the source." The pre-flight surfaces the real reason with the dollar gap.
+
 ### `agent_pay: cap exceeded` (per-tx or daily USDC)
 **Symptoms:** Tool result `error: "burner_cap_exceeded"` mentioning USDC. The 402 demand was within `max_usdc` but exceeded the burner's per-tx or daily USDC cap.
 **Diagnosis:** Two different ceilings: `max_usdc` is the agent-side cap (per-call), `burner.pertx.usdc` and `burner.daily.usdc` are user-controlled caps (per-burner). Both must allow the demand.
