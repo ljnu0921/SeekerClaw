@@ -57,7 +57,9 @@ tests/paysh/
 │   ├── synthetic-no-solana-multichain-402.json  # EVM-only multi-chain → reject
 │   ├── synthetic-v3-402.json                 # x402Version: 3 → reject (forward-compat)
 │   └── synthetic-non-usdc-402.json           # USDT asset on Solana → reject
-├── probe-all.js             # Layer 1 — capture real 402 responses (no payment)
+├── probe-all.js             # Layer 1 — capture real 402 responses (no payment), curated 4 services
+├── probe-catalog.js         # Layer 1b — sweep entire pay.sh catalog (~72 services), no payment
+├── catalog-summary.md       # output of probe-catalog.js — committed, regenerated on demand
 ├── validate-detect.js       # Layer 2   — detect+build for every capture ($0)
 ├── validate-settle.js       # Layer 2.5 — detect+build+settle, mocked network ($0)
 └── README.md
@@ -85,6 +87,48 @@ node tests/paysh/probe-all.js --service tripadvisor
 Re-run when:
 - A service's protocol shape may have changed (capture diff in PR review)
 - Adding a new service to the regression set (edit `PROBE_LIST` in `probe-all.js`)
+
+### Layer 1b — Full catalog sweep (`probe-catalog.js`)
+
+Surveys all ~72 services in the `solana-foundation/pay-skills` catalog
+in one pass. Discovers each service's URL from its committed `PAY.md`,
+finds a cheap probe endpoint via the published `openapi.json`, probes
+once (no payment), and runs the response through `X402Protocol.detect()
++ build()`. Outputs `catalog-summary.md` with per-service results and
+aggregate counts.
+
+**Cost: $0.** Same probe semantics as Layer 1.
+
+```bash
+node tests/paysh/probe-catalog.js                      # full sweep, default concurrency 5
+node tests/paysh/probe-catalog.js --concurrency 8      # faster
+node tests/paysh/probe-catalog.js --limit 5            # smoke-test first N services
+node tests/paysh/probe-catalog.js --filter paysponge   # only services with substring match
+node tests/paysh/probe-catalog.js --commit-captures    # also write captures/catalog/*.json
+```
+
+Unlike `probe-all.js` (regression net — 4 hand-curated services with
+committed fixtures + EXPECTATIONS entries), `probe-catalog.js` is a
+BREADTH survey designed to scale to the whole catalog without bloating
+the repo. The summary file is the artefact, not per-service captures.
+
+Distinct reject codes surface real ecosystem facts:
+- `mpp_protocol` — service speaks a non-x402 paywall (e.g. Alibaba +
+  Google `gateway-402.com` services use MPP)
+- `siwx_auth_required` — needs Sign-In-With-X auth flow before payment
+  (e.g. merit-systems stable* services for paid-only data lookup)
+- `invalid_demand` — service advertises free via `amount=0` 402
+- `no_solana_offer` — EVM-only multi-chain (rare in current catalog)
+- `non_usdc_asset` — asks for non-USDC SPL asset
+
+To refresh the catalog inventory (when pay-skills adds/removes services):
+
+```bash
+curl -s "https://api.github.com/repos/solana-foundation/pay-skills/git/trees/main?recursive=1" \
+  | jq -r '.tree[].path | select(endswith("PAY.md"))'
+```
+
+Paste the result over `PAY_MD_PATHS` in `probe-catalog.js`.
 
 ### Layer 2 — Detect/build dry-run (`validate-detect.js`) — SHIPPED
 

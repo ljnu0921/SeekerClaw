@@ -1,0 +1,638 @@
+// tests/paysh/probe-catalog.js
+//
+// pay.sh CATALOG probe — sweeps the full ~71-service catalog from
+// solana-foundation/pay-skills, probes one cheap GET per service (no
+// payment), and reports which services our v2 parser handles cleanly.
+//
+// Differs from probe-all.js (which captures a curated 4-service
+// regression set with committed fixtures): this script is a BREADTH
+// survey, not a regression set. It writes a single summary markdown
+// file (`tests/paysh/catalog-summary.md`) — not 71 individual capture
+// files — so it scales without bloating the repo.
+//
+// Cost: $0. No X-PAYMENT or PAYMENT-SIGNATURE header sent.
+//
+// Run:
+//   node tests/paysh/probe-catalog.js
+//   node tests/paysh/probe-catalog.js --concurrency 8
+//   node tests/paysh/probe-catalog.js --commit-captures   # write individual files too
+//
+// Per BAT-582 v1.6 spirit: pay.sh ecosystem is moving fast; this script
+// surfaces drift across the WHOLE catalog (e.g. a new provider adopting
+// a v3 field shape) in one pass.
+
+'use strict';
+
+const fs    = require('fs');
+const path  = require('path');
+const https = require('https');
+const http  = require('http');
+const { URL } = require('url');
+
+const X402_PATH = require.resolve('../../app/src/main/assets/nodejs-project/payment/x402.js');
+const { X402Protocol, _setBlockhashFetcher } = require(X402_PATH);
+
+const { probe, sleep }  = require('./lib/probe');
+const { sanitize }      = require('./lib/sanitize');
+
+const CAPTURES_DIR = path.join(__dirname, 'captures', 'catalog');
+const SUMMARY_FILE = path.join(__dirname, 'catalog-summary.md');
+
+// ── Static catalog (from solana-foundation/pay-skills `main` tree) ───────────
+// Each entry = one PAY.md path. service_url is fetched from the file
+// at probe time. We snapshot the path list here so the script can run
+// offline-against-GitHub if needed (raw fetches still required for the
+// service URL itself, but the catalog inventory is stable).
+//
+// To refresh: re-run the GitHub Trees API query against this repo (see
+// README "Refreshing the catalog inventory").
+const PAY_MD_PATHS = [
+    'providers/agentmail/email/PAY.md',
+    'providers/crushrewards/pricing/PAY.md',
+    'providers/dtelecom/voice/PAY.md',
+    'providers/merit-systems/stablecrypto/market-data/PAY.md',
+    'providers/merit-systems/stabledomains/domains/PAY.md',
+    'providers/merit-systems/stableemail/email/PAY.md',
+    'providers/merit-systems/stableenrich/enrichment/PAY.md',
+    'providers/merit-systems/stablemerch/merchandise/PAY.md',
+    'providers/merit-systems/stablephone/calls/PAY.md',
+    'providers/merit-systems/stablesocial/social-data/PAY.md',
+    'providers/merit-systems/stableupload/hosting/PAY.md',
+    'providers/paysponge/2captcha/PAY.md',
+    'providers/paysponge/coingecko/PAY.md',
+    'providers/paysponge/fal/PAY.md',
+    'providers/paysponge/nyne/PAY.md',
+    'providers/paysponge/perplexity/PAY.md',
+    'providers/paysponge/reducto/PAY.md',
+    'providers/paysponge/rentcast/PAY.md',
+    'providers/paysponge/screenshotone/PAY.md',
+    'providers/paysponge/textbelt/PAY.md',
+    'providers/paysponge/tripadvisor/PAY.md',
+    'providers/paysponge/wolframalpha/PAY.md',
+    'providers/purch/marketplace/PAY.md',
+    'providers/quicknode/rpc/PAY.md',
+    'providers/socialintel/influencer-search/PAY.md',
+    'providers/solana-foundation/alibaba/agentexplorer/PAY.md',
+    'providers/solana-foundation/alibaba/aigen/PAY.md',
+    'providers/solana-foundation/alibaba/anytrans/PAY.md',
+    'providers/solana-foundation/alibaba/captcha/PAY.md',
+    'providers/solana-foundation/alibaba/contactcenterai/PAY.md',
+    'providers/solana-foundation/alibaba/documentparseservice/PAY.md',
+    'providers/solana-foundation/alibaba/edututor/PAY.md',
+    'providers/solana-foundation/alibaba/embeddings/PAY.md',
+    'providers/solana-foundation/alibaba/facebody/PAY.md',
+    'providers/solana-foundation/alibaba/farui/PAY.md',
+    'providers/solana-foundation/alibaba/goodstech/PAY.md',
+    'providers/solana-foundation/alibaba/green/PAY.md',
+    'providers/solana-foundation/alibaba/imageaudit/PAY.md',
+    'providers/solana-foundation/alibaba/imagerecog/PAY.md',
+    'providers/solana-foundation/alibaba/imageseg/PAY.md',
+    'providers/solana-foundation/alibaba/intelligentspeechinteraction/PAY.md',
+    'providers/solana-foundation/alibaba/iqs/PAY.md',
+    'providers/solana-foundation/alibaba/ivpd/PAY.md',
+    'providers/solana-foundation/alibaba/machinetranslation/PAY.md',
+    'providers/solana-foundation/alibaba/objectdet/PAY.md',
+    'providers/solana-foundation/alibaba/ocr-api/PAY.md',
+    'providers/solana-foundation/alibaba/ocr/PAY.md',
+    'providers/solana-foundation/alibaba/paimodelgallery/PAY.md',
+    'providers/solana-foundation/alibaba/rai/PAY.md',
+    'providers/solana-foundation/alibaba/saf/PAY.md',
+    'providers/solana-foundation/alibaba/speech/PAY.md',
+    'providers/solana-foundation/alibaba/texttospeech/PAY.md',
+    'providers/solana-foundation/alibaba/translate/PAY.md',
+    'providers/solana-foundation/alibaba/viapi-ocr/PAY.md',
+    'providers/solana-foundation/alibaba/videoenhan/PAY.md',
+    'providers/solana-foundation/alibaba/videorecog/PAY.md',
+    'providers/solana-foundation/alibaba/videoseg/PAY.md',
+    'providers/solana-foundation/google/addressvalidation/PAY.md',
+    'providers/solana-foundation/google/airquality/PAY.md',
+    'providers/solana-foundation/google/bigquery/PAY.md',
+    'providers/solana-foundation/google/civicinfo/PAY.md',
+    'providers/solana-foundation/google/documentai/PAY.md',
+    'providers/solana-foundation/google/factchecktools/PAY.md',
+    'providers/solana-foundation/google/generativelanguage/PAY.md',
+    'providers/solana-foundation/google/kgsearch/PAY.md',
+    'providers/solana-foundation/google/language/PAY.md',
+    'providers/solana-foundation/google/places/PAY.md',
+    'providers/solana-foundation/google/speech/PAY.md',
+    'providers/solana-foundation/google/texttospeech/PAY.md',
+    'providers/solana-foundation/google/translate/PAY.md',
+    'providers/solana-foundation/google/videointelligence/PAY.md',
+    'providers/solana-foundation/google/vision/PAY.md',
+];
+
+const RAW_BASE = 'https://raw.githubusercontent.com/solana-foundation/pay-skills/main/';
+
+// Test wallet pinned to the same fake-but-valid pubkey we use everywhere
+// else (see validate-detect.js). build() needs SOME pubkey to construct
+// the SPL transfer; we never sign so it doesn't have to control funds.
+const TEST_BURNER_PUBKEY = '7xKXTg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU';
+const TEST_MAX_USDC_ATOMIC = 100_000_000n; // 100 USDC
+
+// Stub blockhash so build() doesn't hit RPC.
+_setBlockhashFetcher(async () => '2tLBHqeQdeq4Pzioote4ueMkQjrpdnNLBTuDtyKo4ds9');
+
+function parseArgs(argv) {
+    const out = { concurrency: 5, commitCaptures: false, limit: 0, filter: null };
+    for (let i = 2; i < argv.length; i++) {
+        if (argv[i] === '--concurrency' && argv[i + 1]) { out.concurrency = parseInt(argv[++i], 10); }
+        else if (argv[i] === '--commit-captures') out.commitCaptures = true;
+        else if (argv[i] === '--limit' && argv[i + 1]) out.limit = parseInt(argv[++i], 10);
+        else if (argv[i] === '--filter' && argv[i + 1]) out.filter = argv[++i];
+    }
+    return out;
+}
+
+// Minimal frontmatter parser — pay-skills PAY.md uses 4-space-indented
+// scalar values (no nesting beyond `tags:` list); we only need a handful
+// of top-level fields, so a regex-per-field grab is enough.
+function parseFrontmatter(md) {
+    const m = md.match(/^---\s*\n([\s\S]*?)\n---/);
+    if (!m) return {};
+    const fm = m[1];
+    const out = {};
+    for (const field of ['service_url', 'name', 'service_id', 'category', 'description', 'provider']) {
+        const re = new RegExp(`^${field}:\\s*"?([^"\\n]+)"?\\s*$`, 'm');
+        const mf = fm.match(re);
+        if (mf) out[field] = mf[1].trim();
+    }
+    return out;
+}
+
+function fetchText(url, timeoutMs = 15000) {
+    return new Promise((resolve) => {
+        const parsed = new URL(url);
+        const lib = parsed.protocol === 'https:' ? https : http;
+        const req = lib.request({
+            hostname: parsed.hostname,
+            port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+            path: parsed.pathname + parsed.search,
+            method: 'GET',
+            headers: {
+                'Accept': '*/*',
+                'User-Agent': 'SeekerClaw-paysh-catalog/1.0 (+https://github.com/sepivip/SeekerClaw)',
+            },
+        }, (res) => {
+            // Follow one redirect (raw.githubusercontent doesn't, but
+            // some openapi hosts behind a CDN do).
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                res.resume();
+                return resolve(fetchText(new URL(res.headers.location, url).toString(), timeoutMs));
+            }
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
+            res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+        });
+        req.on('error', e => resolve({ error: e.message }));
+        req.setTimeout(timeoutMs, () => req.destroy(new Error(`fetch timeout after ${timeoutMs}ms`)));
+        req.end();
+    });
+}
+
+function _substituteParams(p) {
+    // OpenAPI uses {param}; Express-style services (merit-systems stable*)
+    // use :param. Stub both with the literal "probe" — any 402 we want
+    // to capture pre-empts the path parser server-side.
+    // Express `:param` must be a whole path segment (preceded by `/`).
+    // Google services use `:verb` suffixes (e.g. `/v1/images:annotate`)
+    // which look similar but are NOT params — guard against those by
+    // requiring the leading slash.
+    return p.replace(/\{[^}]+\}/g, 'probe').replace(/(^|\/):[a-zA-Z_][a-zA-Z0-9_]*/g, '$1probe');
+}
+
+function _hasParam(p) { return /\{[^}]+\}|(^|\/):[a-zA-Z_][a-zA-Z0-9_]*/.test(p); }
+
+function pickProbeEndpoint(openapi) {
+    // Strategy: prefer parameter-free GET, then parametric GET (stub
+    // params with "probe"), then POST as a last resort. Most pay.sh
+    // services 402 before the body parser, so POST with empty body
+    // still surfaces the payment requirement we need.
+    const paths = openapi && openapi.paths;
+    if (!paths || typeof paths !== 'object') return null;
+
+    // Phase 1: parameter-free GET.
+    for (const p of Object.keys(paths)) {
+        const ops = paths[p];
+        if (!ops || typeof ops !== 'object') continue;
+        if (ops.get && !_hasParam(p)) return { method: 'GET', path: p };
+    }
+    // Phase 2: parametric GET.
+    for (const p of Object.keys(paths)) {
+        const ops = paths[p];
+        if (!ops || typeof ops !== 'object') continue;
+        if (ops.get) return { method: 'GET', path: _substituteParams(p) };
+    }
+    // Phase 3: parameter-free POST.
+    for (const p of Object.keys(paths)) {
+        const ops = paths[p];
+        if (!ops || typeof ops !== 'object') continue;
+        if (ops.post && !_hasParam(p)) return { method: 'POST', path: p };
+    }
+    // Phase 4: parametric POST.
+    for (const p of Object.keys(paths)) {
+        const ops = paths[p];
+        if (!ops || typeof ops !== 'object') continue;
+        if (ops.post) return { method: 'POST', path: _substituteParams(p) };
+    }
+    return null;
+}
+
+function detectAltProtocol(capture) {
+    // pay.sh's catalog includes services that 402 but don't speak x402.
+    // We surface them as distinct reject codes so the summary isn't a
+    // wall of `no_payment_requirements` (which conflates "x402 with no
+    // accepts" with "completely different protocol").
+    //
+    //   - MPP: alibaba + google gateways under `*.gateway-402.com`.
+    //     Body has `payment.protocol === 'mpp'`, no x402 fields.
+    //   - SIWX: merit-systems stable* services. Body has
+    //     `extensions.sign-in-with-x` and `accepts: []`.
+    const body = capture.body;
+    if (!body || typeof body !== 'object') return null;
+    if (body.payment && body.payment.protocol === 'mpp') return 'mpp_protocol';
+    if (body.extensions && body.extensions['sign-in-with-x']) return 'siwx_auth_required';
+    return null;
+}
+
+function extractRequirements(capture) {
+    // Mirrors probe-all.js summarize402, but tolerant to non-402 status.
+    const body = capture.body;
+    let payload = null;
+    let delivery = 'none';
+    if (typeof body === 'object' && body !== null && (body.accepts || body.paymentRequirements)) {
+        payload = body;
+        delivery = 'body';
+    } else if (capture.headers && capture.headers['payment-required']) {
+        try {
+            payload = JSON.parse(Buffer.from(capture.headers['payment-required'], 'base64').toString('utf8'));
+            delivery = 'header';
+        } catch (_) { delivery = 'header-malformed'; }
+    }
+    if (!payload) return { delivery, x402Version: null, networks: [], offerCount: 0 };
+    const accepts = payload.accepts || payload.paymentRequirements || [];
+    return {
+        delivery,
+        x402Version: payload.x402Version ?? null,
+        networks: Array.isArray(accepts) ? accepts.map(a => a.network).filter(Boolean) : [],
+        assets:   Array.isArray(accepts) ? accepts.map(a => a.asset).filter(Boolean) : [],
+        amounts:  Array.isArray(accepts) ? accepts.map(a => a.amount ?? a.maxAmountRequired).filter(v => v !== undefined) : [],
+        schemes:  Array.isArray(accepts) ? accepts.map(a => a.scheme).filter(Boolean) : [],
+        offerCount: Array.isArray(accepts) ? accepts.length : 0,
+    };
+}
+
+async function discoverOne(payMdPath) {
+    // Returns { ok, operator, name, serviceUrl, probePath, probeMethod, error }
+    const rawUrl = RAW_BASE + payMdPath;
+    const md = await fetchText(rawUrl);
+    if (md.error || md.status !== 200) {
+        return { ok: false, payMdPath, error: `pay-md fetch failed: ${md.error || md.status}` };
+    }
+    const fm = parseFrontmatter(md.body);
+    const serviceUrl = fm.service_url;
+    const parts = payMdPath.split('/');
+    // providers/<operator>/.../<svc-name>/PAY.md
+    const operator = parts[1];
+    const name = parts.slice(2, -1).join('/');
+    if (!serviceUrl) {
+        return { ok: false, payMdPath, operator, name, error: 'no service_url in frontmatter' };
+    }
+
+    // Discover a probe endpoint via openapi.json. Most pay.sh services
+    // expose this at <service_url>/openapi.json (confirmed across
+    // alibaba.gateway-402, google.gateway-402, paysponge, dtelecom,
+    // agentmail, stablesocial, quicknode).
+    const openapiUrl = serviceUrl.replace(/\/$/, '') + '/openapi.json';
+    const oa = await fetchText(openapiUrl, 15000);
+    let probePath = null, probeMethod = 'GET';
+    if (oa.status === 200) {
+        try {
+            const openapi = JSON.parse(oa.body);
+            const picked = pickProbeEndpoint(openapi);
+            if (picked) { probePath = picked.path; probeMethod = picked.method; }
+        } catch (_) { /* malformed openapi — fall through */ }
+    }
+    return {
+        ok: true,
+        payMdPath, operator, name,
+        serviceUrl,
+        probeUrl: probePath ? (serviceUrl.replace(/\/$/, '') + probePath) : serviceUrl,
+        probeMethod,
+        openapiOk: oa.status === 200,
+    };
+}
+
+async function probeAndParse(disc, proto) {
+    // Run a single probe + parse, return a row for the summary. For POST
+    // probes we send an empty JSON body; pay.sh services check payment
+    // before parsing body, so this still surfaces the 402.
+    const probeOpts = { url: disc.probeUrl, method: disc.probeMethod };
+    if (disc.probeMethod === 'POST') probeOpts.body = {};
+    const captured = await probe(probeOpts);
+    if (captured.error) {
+        return {
+            disc, captured: null,
+            row: { result: 'fetch_failed', detail: captured.reason || captured.error },
+        };
+    }
+    const reqs = extractRequirements(captured);
+    const isV402 = captured.status === 402;
+
+    // Run the parser
+    let detected = null, builtError = null, builtOk = false;
+    if (isV402) {
+        const response = { status: captured.status, bodyJson: captured.body, headers: captured.headers };
+        detected = proto.detect(response);
+        try {
+            const built = await proto.build(response, {
+                burnerPubkey: TEST_BURNER_PUBKEY,
+                maxUsdcAtomic: TEST_MAX_USDC_ATOMIC,
+            });
+            if (built && built.error) builtError = built.error;
+            else if (built && built.txBase64 && built.paymentMeta) builtOk = true;
+            else builtError = 'unexpected_shape';
+        } catch (e) {
+            builtError = `threw:${e.message.slice(0, 40)}`;
+        }
+    }
+
+    let result;
+    const altProto = isV402 ? detectAltProtocol(captured) : null;
+    if (!isV402) result = `http_${captured.status}`;
+    else if (builtOk) result = 'parsed_ok';
+    else if (altProto) result = `reject:${altProto}`;
+    else if (builtError) result = `reject:${builtError}`;
+    else result = 'detect_false';
+
+    return {
+        disc, captured,
+        row: {
+            result,
+            httpStatus: captured.status,
+            delivery: reqs.delivery,
+            x402Version: reqs.x402Version,
+            networks: reqs.networks,
+            assets: reqs.assets,
+            schemes: reqs.schemes,
+            amounts: reqs.amounts,
+            offerCount: reqs.offerCount,
+            detected,
+            builtOk,
+            builtError,
+        },
+    };
+}
+
+async function runWithConcurrency(items, limit, fn) {
+    const out = new Array(items.length);
+    let idx = 0;
+    const workers = Array.from({ length: limit }, async () => {
+        while (true) {
+            const i = idx++;
+            if (i >= items.length) return;
+            out[i] = await fn(items[i], i);
+        }
+    });
+    await Promise.all(workers);
+    return out;
+}
+
+function fmtNetworks(ns) {
+    return ns.map(n => n.startsWith('solana:') ? 'sol' : n.includes('eip155:8453') ? 'base' : n.split(':')[0] || n).join('+') || '—';
+}
+
+function fmtAssetKind(asset) {
+    if (!asset) return '—';
+    if (asset === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v') return 'USDC';
+    if (asset.startsWith('0x')) return 'EVM';
+    if (asset.length === 44 || asset.length === 43) return 'SPL';
+    return asset.slice(0, 6) + '…';
+}
+
+function fmtAmount(amounts) {
+    if (!amounts || !amounts.length) return '—';
+    const a = String(amounts[0]);
+    // Numeric atomic USDC → decimal USDC display ($x.yz)
+    if (/^\d+$/.test(a)) {
+        const atomic = BigInt(a);
+        const usdc = Number(atomic) / 1e6;
+        return `$${usdc.toFixed(4).replace(/\.?0+$/, '')}`;
+    }
+    return a;
+}
+
+async function main() {
+    const args = parseArgs(process.argv);
+    let workItems = PAY_MD_PATHS;
+    if (args.filter) workItems = workItems.filter(p => p.toLowerCase().includes(args.filter.toLowerCase()));
+    if (args.limit > 0) workItems = workItems.slice(0, args.limit);
+
+    console.log(`═══ pay.sh catalog probe (${workItems.length} services, concurrency=${args.concurrency}) ═══\n`);
+    console.log('Phase 1: discovering service URLs and probe endpoints from pay-skills repo…\n');
+
+    const proto = new X402Protocol();
+    const t0 = Date.now();
+
+    const discoveries = await runWithConcurrency(workItems, args.concurrency, discoverOne);
+
+    console.log('Phase 2: probing each service (no payment)…\n');
+
+    if (args.commitCaptures && !fs.existsSync(CAPTURES_DIR)) {
+        fs.mkdirSync(CAPTURES_DIR, { recursive: true });
+    }
+
+    const rows = [];
+    let probed = 0;
+    await runWithConcurrency(discoveries, args.concurrency, async (disc) => {
+        if (!disc.ok) {
+            rows.push({ disc, row: { result: `discovery_failed:${disc.error}` } });
+            return;
+        }
+        const out = await probeAndParse(disc, proto);
+        rows.push(out);
+
+        // Optional per-service capture
+        if (args.commitCaptures && out.captured && out.captured.status === 402) {
+            const safeName = `${disc.operator}-${disc.name.replace(/\//g, '_')}`;
+            const sanitized = sanitize({
+                _meta: {
+                    label: `${safeName}-402`,
+                    capturedAt: new Date().toISOString(),
+                    source: 'probe-catalog',
+                    payMdPath: disc.payMdPath,
+                    note: 'Sanitized per BAT-582 v1.6 contract amendment 6.',
+                },
+                url: out.captured.url,
+                method: out.captured.method,
+                status: out.captured.status,
+                headers: out.captured.headers,
+                body: out.captured.body,
+            });
+            fs.writeFileSync(path.join(CAPTURES_DIR, `${safeName}.json`), JSON.stringify(sanitized, null, 2) + '\n', 'utf8');
+        }
+        probed++;
+        process.stdout.write(`\r  probed ${probed}/${workItems.length}…  `);
+    });
+    process.stdout.write('\n\n');
+
+    // Re-order rows by original input order (concurrency may shuffle)
+    rows.sort((a, b) => {
+        const ia = discoveries.indexOf(a.disc);
+        const ib = discoveries.indexOf(b.disc);
+        return ia - ib;
+    });
+
+    // ── Console summary ───────────────────────────────────────────────────
+    const totalMs = Date.now() - t0;
+    let counts = {
+        total: rows.length,
+        parsedOk: 0,
+        reject: 0,
+        notV402: 0,
+        fetchFailed: 0,
+        discoveryFailed: 0,
+        solanaSupport: 0,
+        v2: 0,
+        v1: 0,
+        bodyDelivery: 0,
+        headerDelivery: 0,
+    };
+    const rejectsByReason = {};
+    for (const r of rows) {
+        if (r.row.result === 'parsed_ok') counts.parsedOk++;
+        else if (r.row.result?.startsWith('reject:')) {
+            counts.reject++;
+            const reason = r.row.result.slice('reject:'.length);
+            rejectsByReason[reason] = (rejectsByReason[reason] || 0) + 1;
+        }
+        else if (r.row.result?.startsWith('http_')) counts.notV402++;
+        else if (r.row.result === 'fetch_failed') counts.fetchFailed++;
+        else if (r.row.result?.startsWith('discovery_failed:')) counts.discoveryFailed++;
+        if (r.row.networks && r.row.networks.some(n => /^solana/.test(n))) counts.solanaSupport++;
+        if (r.row.x402Version === 2) counts.v2++;
+        if (r.row.x402Version === 1) counts.v1++;
+        if (r.row.delivery === 'body') counts.bodyDelivery++;
+        if (r.row.delivery === 'header') counts.headerDelivery++;
+    }
+
+    console.log('═══ Per-service results ═══');
+    console.log('');
+    const header = `  ${'operator/name'.padEnd(38)} ${'http'.padEnd(5)} ${'v'.padEnd(2)} ${'chains'.padEnd(10)} ${'asset'.padEnd(5)} ${'amt'.padEnd(10)} result`;
+    console.log(header);
+    console.log('  ' + '─'.repeat(header.length - 2));
+    for (const r of rows) {
+        const label = r.disc.ok ? `${r.disc.operator}/${r.disc.name}` : r.disc.payMdPath;
+        const httpStr = String(r.row.httpStatus ?? '—');
+        const vStr = r.row.x402Version != null ? `v${r.row.x402Version}` : '—';
+        const chains = fmtNetworks(r.row.networks || []);
+        const asset = fmtAssetKind((r.row.assets || [])[0]);
+        const amt = fmtAmount(r.row.amounts);
+        const mark = r.row.result === 'parsed_ok' ? '✓' : (r.row.result?.startsWith('reject:') ? '✗' : '·');
+        console.log(`  ${mark} ${label.padEnd(36)} ${httpStr.padEnd(5)} ${vStr.padEnd(2)} ${chains.padEnd(10)} ${asset.padEnd(5)} ${amt.padEnd(10)} ${r.row.result}`);
+    }
+
+    console.log('');
+    console.log('═══ Aggregate ═══');
+    console.log(`  total:                ${counts.total}`);
+    console.log(`  parser OK (built):    ${counts.parsedOk}`);
+    console.log(`  parser rejected:      ${counts.reject}`);
+    console.log(`  non-402 response:     ${counts.notV402}`);
+    console.log(`  fetch failed:         ${counts.fetchFailed}`);
+    console.log(`  discovery failed:     ${counts.discoveryFailed}`);
+    console.log(`  Solana offered:       ${counts.solanaSupport}`);
+    console.log(`  x402Version v2 / v1:  ${counts.v2} / ${counts.v1}`);
+    console.log(`  delivery body/header: ${counts.bodyDelivery} / ${counts.headerDelivery}`);
+    if (Object.keys(rejectsByReason).length > 0) {
+        console.log(`  rejects by reason:`);
+        for (const [reason, n] of Object.entries(rejectsByReason).sort((a, b) => b[1] - a[1])) {
+            console.log(`    ${String(n).padStart(3)}× ${reason}`);
+        }
+    }
+    console.log(`  elapsed:              ${(totalMs / 1000).toFixed(1)}s`);
+
+    // ── Markdown summary file ─────────────────────────────────────────────
+    const lines = [];
+    lines.push('# pay.sh catalog probe — summary');
+    lines.push('');
+    lines.push(`Generated: ${new Date().toISOString()}`);
+    lines.push(`Source catalog: solana-foundation/pay-skills (${PAY_MD_PATHS.length} services)`);
+    lines.push(`Probed: ${workItems.length} (concurrency ${args.concurrency})`);
+    lines.push('');
+    lines.push('## Aggregate');
+    lines.push('');
+    lines.push('| Metric | Count |');
+    lines.push('|--------|-------|');
+    lines.push(`| Total probed | ${counts.total} |`);
+    lines.push(`| **Parser OK** (built x402 tx) | ${counts.parsedOk} |`);
+    lines.push(`| Parser rejected (returned 402 we can't pay) | ${counts.reject} |`);
+    lines.push(`| Non-402 HTTP response | ${counts.notV402} |`);
+    lines.push(`| Fetch failed (DNS / TLS / timeout) | ${counts.fetchFailed} |`);
+    lines.push(`| Discovery failed (no service_url) | ${counts.discoveryFailed} |`);
+    lines.push(`| Solana offered | ${counts.solanaSupport} |`);
+    lines.push(`| x402 v2 | ${counts.v2} |`);
+    lines.push(`| x402 v1 | ${counts.v1} |`);
+    lines.push(`| Requirements via body | ${counts.bodyDelivery} |`);
+    lines.push(`| Requirements via \`payment-required\` header | ${counts.headerDelivery} |`);
+    lines.push('');
+    if (Object.keys(rejectsByReason).length > 0) {
+        lines.push('### Rejects by reason');
+        lines.push('');
+        lines.push('| Reason | Count |');
+        lines.push('|--------|-------|');
+        for (const [reason, n] of Object.entries(rejectsByReason).sort((a, b) => b[1] - a[1])) {
+            lines.push(`| \`${reason}\` | ${n} |`);
+        }
+        lines.push('');
+    }
+    lines.push('## Per-service');
+    lines.push('');
+    lines.push('| Service | HTTP | x402 | Chains | Asset | Amount | Result |');
+    lines.push('|---------|------|------|--------|-------|--------|--------|');
+    for (const r of rows) {
+        const label = r.disc.ok ? `${r.disc.operator}/${r.disc.name}` : r.disc.payMdPath;
+        const httpStr = String(r.row.httpStatus ?? '—');
+        const vStr = r.row.x402Version != null ? `v${r.row.x402Version}` : '—';
+        const chains = fmtNetworks(r.row.networks || []);
+        const asset = fmtAssetKind((r.row.assets || [])[0]);
+        const amt = fmtAmount(r.row.amounts);
+        lines.push(`| ${label} | ${httpStr} | ${vStr} | ${chains} | ${asset} | ${amt} | \`${r.row.result}\` |`);
+    }
+    lines.push('');
+    lines.push('## What "parser OK" means');
+    lines.push('');
+    lines.push('The service returned a 402 with x402 payment requirements that our `X402Protocol.detect() + build()` accepted: Solana mainnet offer, scheme=exact, USDC asset, valid payTo, amount within max. The script does NOT sign or settle — `parsed_ok` proves only that we *could* construct a payment, not that the upstream facilitator would accept it.');
+    lines.push('');
+    lines.push('## What rejections mean');
+    lines.push('');
+    lines.push('| Reject code | Meaning |');
+    lines.push('|-------------|---------|');
+    lines.push('| `no_solana_offer` | Service offers only EVM chains (Base) — our wallet is Solana-only |');
+    lines.push('| `non_usdc_asset` | Service asks for an asset that isn\'t the canonical USDC mint |');
+    lines.push('| `unsupported_version` | x402Version is 3+ (forward-compat block) |');
+    lines.push('| `invalid_demand` | amount = 0 (pay.sh sometimes uses 402 + amount=0 to advertise free) |');
+    lines.push('| `demand_exceeds_max_usdc` | amount > our 100 USDC probe ceiling |');
+    lines.push('| `invalid_402_body` | 402 body shape we don\'t recognize (likely new pay.sh dialect) |');
+    lines.push('| `mpp_protocol` | non-x402 paywall (Alibaba/Google `gateway-402.com` services use MPP) |');
+    lines.push('| `siwx_auth_required` | requires Sign-In-With-X auth flow first (merit-systems stable* services) |');
+    lines.push('| `no_payment_requirements` | 402 with no `accepts` / no `paymentRequirements` and no recognised alt-protocol |');
+    lines.push('');
+    lines.push('## Refreshing the catalog inventory');
+    lines.push('');
+    lines.push('The list of PAY.md paths is snapshotted in `PAY_MD_PATHS` inside `probe-catalog.js`. To refresh:');
+    lines.push('');
+    lines.push('```');
+    lines.push('curl -s "https://api.github.com/repos/solana-foundation/pay-skills/git/trees/main?recursive=1" | jq -r \'.tree[].path | select(endswith("PAY.md"))\'');
+    lines.push('```');
+    lines.push('');
+    lines.push('Paste the result over `PAY_MD_PATHS` and re-run.');
+    lines.push('');
+    fs.writeFileSync(SUMMARY_FILE, lines.join('\n'), 'utf8');
+    console.log(`\nSummary written to ${path.relative(process.cwd(), SUMMARY_FILE)}`);
+    console.log('');
+    console.log('Notes:');
+    console.log('  • Pure read survey ($0 spent). Re-run any time to detect catalog drift.');
+    console.log('  • Pass --commit-captures to also write captures/catalog/<svc>.json files (heavier, opt-in).');
+    if (counts.parsedOk === 0) process.exit(2);  // no services parsed cleanly → red flag
+}
+
+main().catch(e => { console.error('FATAL:', e); process.exit(2); });
