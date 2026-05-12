@@ -1,0 +1,132 @@
+{
+  "_meta": {
+    "label": "paysponge-nyne-402",
+    "capturedAt": "2026-05-12T11:15:05.758Z",
+    "source": "probe-catalog",
+    "payMdPath": "providers/paysponge/nyne/PAY.md",
+    "note": "Sanitized per BAT-582 v1.6 contract amendment 6."
+  },
+  "url": "https://api.paysponge.com/x402/purchase/svc_d5ymfernpzeh58gb8/person/enrichment",
+  "method": "GET",
+  "status": 402,
+  "headers": {
+    "date": "Tue, 12 May 2026 11:15:05 GMT",
+    "content-type": "application/json",
+    "transfer-encoding": "chunked",
+    "connection": "keep-alive",
+    "access-control-allow-credentials": "true",
+    "cf-cache-status": "DYNAMIC",
+    "payment-required": "eyJ4NDAyVmVyc2lvbiI6MiwiZXJyb3IiOiJQYXltZW50IHJlcXVpcmVkIiwicmVzb3VyY2UiOnsidXJsIjoiaHR0cHM6Ly9hcGkucGF5c3BvbmdlLmNvbS9wZXJzb24vZW5yaWNobWVudCIsImRlc2NyaXB0aW9uIjoiU2VydmljZTogTnluZSBBSSAoaHR0cHM6Ly9hcGkucGF5c3BvbmdlLmNvbS9wZXJzb24vZW5yaWNobWVudCkiLCJtaW1lVHlwZSI6ImFwcGxpY2F0aW9uL2pzb24ifSwiYWNjZXB0cyI6W3sic2NoZW1lIjoiZXhhY3QiLCJuZXR3b3JrIjoiZWlwMTU1Ojg0NTMiLCJhbW91bnQiOiIwIiwiYXNzZXQiOiIweDgzMzU4OWZDRDZlRGI2RTA4ZjRjN0MzMkQ0ZjcxYjU0YmRBMDI5MTMiLCJwYXlUbyI6IjB4NjMwMkQ5ZTZEQkIyMmZFQzNjMzUwNTUxNTY4QmIzOUI0YjM1QWQ1NyIsIm1heFRpbWVvdXRTZWNvbmRzIjozMDAsImV4dHJhIjp7Im5hbWUiOiJVU0QgQ29pbiIsInZlcnNpb24iOiIyIn19LHsic2NoZW1lIjoiZXhhY3QiLCJuZXR3b3JrIjoic29sYW5hOjVleWt0NFVzRnY4UDhOSmRUUkVwWTF2enFLcVpLdmRwIiwiYW1vdW50IjoiMCIsImFzc2V0IjoiRVBqRldkZDVBdWZxU1NxZU0ycU4xeHp5YmFwQzhHNHdFR0drWnd5VER0MXYiLCJwYXlUbyI6IjkyNDZYcnNBRUtINmhBeUVRZTVQdmRwVUwxcDVLdGo5Yzd5U253UW42b2lzIiwibWF4VGltZW91dFNlY29uZHMiOjMwMCwiZXh0cmEiOnsiZmVlUGF5ZXIiOiIyd0t1cExSOXE2d1hZcHB3OEdyMk52V3hLQlVxbTRQUEpLa1Fmb3hIREJnNCJ9fV0sImV4dGVuc2lvbnMiOnsiYmF6YWFyIjp7ImluZm8iOnsiaW5wdXQiOnsidHlwZSI6Imh0dHAiLCJtZXRob2QiOiJHRVQiLCJxdWVyeVBhcmFtcyI6e319LCJvdXRwdXQiOnsidHlwZSI6Impzb24iLCJleGFtcGxlIjp7fX19LCJzY2hlbWEiOnsiJHNjaGVtYSI6Imh0dHBzOi8vanNvbi1zY2hlbWEub3JnL2RyYWZ0LzIwMjAtMTIvc2NoZW1hIiwidHlwZSI6Im9iamVjdCIsInByb3BlcnRpZXMiOnsiaW5wdXQiOnsidHlwZSI6Im9iamVjdCIsInByb3BlcnRpZXMiOnsidHlwZSI6eyJ0eXBlIjoic3RyaW5nIiwiY29uc3QiOiJodHRwIn0sIm1ldGhvZCI6eyJ0eXBlIjoic3RyaW5nIiwiZW51bSI6WyJHRVQiLCJIRUFEIiwiREVMRVRFIl19LCJxdWVyeVBhcmFtcyI6eyJ0eXBlIjoib2JqZWN0IiwicHJvcGVydGllcyI6e30sImFkZGl0aW9uYWxQcm9wZXJ0aWVzIjpmYWxzZX19LCJyZXF1aXJlZCI6WyJ0eXBlIiwibWV0aG9kIl0sImFkZGl0aW9uYWxQcm9wZXJ0aWVzIjpmYWxzZX0sIm91dHB1dCI6eyJ0eXBlIjoib2JqZWN0IiwicHJvcGVydGllcyI6eyJ0eXBlIjp7InR5cGUiOiJzdHJpbmciLCJjb25zdCI6Impzb24ifSwiZXhhbXBsZSI6eyJ0eXBlIjoib2JqZWN0IiwiYWRkaXRpb25hbFByb3BlcnRpZXMiOnRydWV9fSwicmVxdWlyZWQiOlsidHlwZSJdLCJhZGRpdGlvbmFsUHJvcGVydGllcyI6ZmFsc2V9fSwicmVxdWlyZWQiOlsiaW5wdXQiXSwiYWRkaXRpb25hbFByb3BlcnRpZXMiOmZhbHNlfX19fQ==",
+    "rndr-id": "cee837c8-3e1f-4af9",
+    "server": "cloudflare",
+    "vary": "Origin, Accept-Encoding",
+    "x-render-origin-server": "Render",
+    "report-to": "{\"group\":\"cf-nel\",\"max_age\":604800,\"endpoints\":[{\"url\":\"https://a.nel.cloudflare.com/report/v4?s=mZ%2B1VE6%2F65TtKvbFTXguIMiRZbnzUAGPOW7%2BHkUu35I%2F%2Fxc7CoSWiDKfLFaD9TG%2BH6JGafT4Ia72DUhiGXe%2BUpgMP%2F6r%[REDACTED]%3D%3D\"}]}",
+    "nel": "{\"report_to\":\"cf-nel\",\"success_fraction\":0.0,\"max_age\":604800}",
+    "cf-ray": "9fa900e7ee6152f4-SOF",
+    "alt-svc": "h3=\":443\"; ma=86400"
+  },
+  "body": {
+    "x402Version": 2,
+    "error": "Payment required",
+    "resource": {
+      "url": "https://api.paysponge.com/person/enrichment",
+      "description": "Service: Nyne AI (https://api.paysponge.com/person/enrichment)",
+      "mimeType": "application/json"
+    },
+    "accepts": [
+      {
+        "scheme": "exact",
+        "network": "eip155:8453",
+        "amount": "0",
+        "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "payTo": "0x6302D9e6DBB22fEC3c350551568Bb39B4b35Ad57",
+        "maxTimeoutSeconds": 300,
+        "extra": {
+          "name": "USD Coin",
+          "version": "2"
+        }
+      },
+      {
+        "scheme": "exact",
+        "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+        "amount": "0",
+        "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "payTo": "9246XrsAEKH6hAyEQe5PvdpUL1p5Ktj9c7ySnwQn6ois",
+        "maxTimeoutSeconds": 300,
+        "extra": {
+          "feePayer": "2wKupLR9q6wXYppw8Gr2NvWxKBUqm4PPJKkQfoxHDBg4"
+        }
+      }
+    ],
+    "extensions": {
+      "bazaar": {
+        "info": {
+          "input": {
+            "type": "http",
+            "method": "GET",
+            "queryParams": {}
+          },
+          "output": {
+            "type": "json",
+            "example": {}
+          }
+        },
+        "schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "http"
+                },
+                "method": {
+                  "type": "string",
+                  "enum": [
+                    "GET",
+                    "HEAD",
+                    "DELETE"
+                  ]
+                },
+                "queryParams": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": false
+                }
+              },
+              "required": [
+                "type",
+                "method"
+              ],
+              "additionalProperties": false
+            },
+            "output": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "json"
+                },
+                "example": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "input"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "_meta": {
+    "label": "paysponge-wolframalpha-v2-success",
+    "description": "v2 PAYMENT-RESPONSE captured during Layer 3 live-pay (paysponge-wolframalpha)",
+    "capturedAt": "2026-05-12T11:17:05.735Z",
+    "onChainSignature": "5i9j1zWn5PvdUBa1oLDWpvAjR7o98UFvQvfFAXPBvJJiMF7z9FZ8L6xGNfFbp2YEaJhPnXMC35ncq91kbmAB373o",
+    "demandAtomic": "10000",
+    "note": "Spent real USDC. Body redacted via paidSummary=true (we paid for that content). Captured for regression pinning of v2 settle path."
+  },
+  "url": "https://wolframalpha.x402.paysponge.com/v1/result?i=2%2B2",
+  "method": "GET",
+  "status": 200,
+  "headers": {
+    "date": "Tue, 12 May 2026 11:17:05 GMT",
+    "content-type": "application/json",
+    "transfer-encoding": "chunked",
+    "connection": "keep-alive",
+    "access-control-allow-credentials": "true",
+    "payment-response": "[REDACTED]",
+    "rndr-id": "de40e7ed-ec3c-4b7b",
+    "server": "cloudflare",
+    "vary": "Origin, Accept-Encoding",
+    "x-render-origin-server": "Render",
+    "cf-cache-status": "DYNAMIC",
+    "report-to": "{\"group\":\"cf-nel\",\"max_age\":604800,\"endpoints\":[{\"url\":\"https://a.nel.cloudflare.com/report/v4?s=VY63BZ03MDV2hGuTDzqVB1l2wEAj4nvNCtDsSE2lxofvLD8i45UQma5skmFaEKkvytcpw2Aq2yQt5ta0GH1atpybyS6fa76h913UUmIwxYHbQxMDVhvAYheztMYI0eStLoE9UOeBqnwPd6bCr0%2FujlPF\"}]}",
+    "nel": "{\"report_to\":\"cf-nel\",\"success_fraction\":0.0,\"max_age\":604800}",
+    "cf-ray": "9fa903c8b9088919-SOF",
+    "alt-svc": "h3=\":443\"; ma=86400"
+  },
+  "body": "[REDACTED — paid response body summarized; ? bytes original]"
+}

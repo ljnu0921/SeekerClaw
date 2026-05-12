@@ -1,0 +1,33 @@
+{
+  "_meta": {
+    "label": "crushrewards-pricing-v2-success",
+    "description": "v2 PAYMENT-RESPONSE captured during Layer 3 live-pay (crushrewards-pricing)",
+    "capturedAt": "2026-05-12T11:16:50.299Z",
+    "onChainSignature": "3eT61b5jFToFcTgChMEtVFHnhtfU65mnu44BVrb8Yqf4mgxEbVuLk5VbP7tN448BmesiKUbPMsKkjL12W6RMdJgn",
+    "demandAtomic": "10000",
+    "note": "Spent real USDC. Body redacted via paidSummary=true (we paid for that content). Captured for regression pinning of v2 settle path."
+  },
+  "url": "https://api.crushrewards.dev/v1/shopper/best-price?q=airpods&country=us&retailer=amazon&limit=10",
+  "method": "GET",
+  "status": 200,
+  "headers": {
+    "date": "Tue, 12 May 2026 11:16:50 GMT",
+    "content-type": "application/json",
+    "transfer-encoding": "chunked",
+    "connection": "keep-alive",
+    "cf-cache-status": "DYNAMIC",
+    "payment-response": "[REDACTED]",
+    "rndr-id": "197982db-eeb4-4d34",
+    "server": "cloudflare",
+    "vary": "Accept-Encoding",
+    "x-cache": "MISS",
+    "x-data-freshness-hours": "462",
+    "x-data-stale": "true",
+    "x-pipeline-version": "v2",
+    "x-render-origin-server": "Render",
+    "x-request-id": "019e1be7-5f09-71e8-9b7d-c1910787b80e",
+    "cf-ray": "9fa9036ac931d0ca-SOF",
+    "alt-svc": "h3=\":443\"; ma=86400"
+  },
+  "body": "[REDACTED — paid response body summarized; ? bytes original]"
+}

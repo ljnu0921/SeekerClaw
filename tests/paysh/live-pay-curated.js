@@ -86,6 +86,41 @@ const SERVICES = [
         // scope). BAT-664 lifts that gate; this entry becomes the
         // live regression net for the POST path once BAT-664 lands.
     },
+    // ── Catalog-derived parsed_ok services (added 2026-05-12) ─────────────
+    // These extend Layer 3 coverage beyond the original 3 hand-curated
+    // services to validate the burner-signing + settle path against
+    // different operators discovered by probe-catalog.js. URLs + amounts
+    // taken from the committed catalog captures under captures/catalog/.
+    // Each is a read-only GET to a real paid endpoint — no upstream
+    // side effects (vs textbelt-text which sends SMS).
+    {
+        label: 'crushrewards-pricing',
+        description: 'v2 paid GET (~$0.01) — Render-hosted, payment-required header delivery',
+        url: 'https://api.crushrewards.dev/v1/shopper/best-price?q=airpods&country=us&retailer=amazon&limit=10',
+        method: 'GET',
+        sideEffecting: false,
+    },
+    {
+        label: 'purch-marketplace',
+        description: 'v2 paid GET (~$0.01) — Solana-only USDC (no Base offer), header delivery',
+        url: 'https://api.purch.xyz/x402/search?q=wireless+headphones',
+        method: 'GET',
+        sideEffecting: false,
+    },
+    {
+        label: 'paysponge-rentcast',
+        description: 'v2 paid GET (~$0.01) — paysponge rentcast subdomain (vs tripadvisor)',
+        url: 'https://rentcast.x402.paysponge.com/markets?zipCode=10001',
+        method: 'GET',
+        sideEffecting: false,
+    },
+    {
+        label: 'paysponge-wolframalpha',
+        description: 'v2 paid GET (~$0.01) — paysponge wolframalpha (computation, read-only)',
+        url: 'https://wolframalpha.x402.paysponge.com/v1/result?i=2%2B2',
+        method: 'GET',
+        sideEffecting: false,
+    },
 ];
 
 function parseArgs(argv) {
