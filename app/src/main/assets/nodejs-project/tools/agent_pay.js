@@ -1115,4 +1115,6 @@ module.exports = {
     _setDnsLookup,
     _setFetchOverride,          // BAT-664 (R-pr370-fix-7)
     _fetchWithLimits,
+    _checkBurnerUsdcBalance,    // R-pr373-r3-1 — exposed for branch coverage in tests
+    _atomicToDecimalString,     // R-pr373-r3-1 — exposed for tests
 };
