@@ -36,19 +36,35 @@ const { V1_STATIC_CONFIRM, SOLANA_WRITE_TOOLS, JUPITER_CANCEL_TOOLS } = require(
 // every cancel even though policy.js never reads burner-status for cancels.
 // We branch on JUPITER_CANCEL_TOOLS below to handle them via ownership-only.
 //
-// BAT-582 R9: wallet_status and agent_pay deliberately NOT included.
+// BAT-582 R9: wallet_status NOT included.
 //   - wallet_status: policy hook returns the literal 'none' regardless of
 //     state. The handler does its own /burner/status fetch internally to
 //     populate the response — gating here was a wasted bridge round-trip.
-//   - agent_pay: policy hook only inspects args.max_usdc (block-or-none)
-//     and never reads burner state. The handler ALSO does its own
-//     /burner/status fetch (refuses fast when unconfigured, before any
-//     outbound HTTP). Gating here was a duplicate fetch every dispatch
-//     and the cached state was never read by the policy hook anyway.
+//
+// BAT-664 (device-test fix 2026-05-12): agent_pay IS included.
+// Pre-fix, agent_pay was excluded under the R9 rationale "policy hook only
+// inspects args.max_usdc (block-or-none) and never reads burner state."
+// That was true for v1.4 (GET-only). BAT-664 added a POST-specific branch
+// to policy.js that DOES read `walletState.burnerConfigured` (see
+// confirmation/policy.js:367 — fail-fast block before the user is shown a
+// confirm prompt for an action that can't succeed). With agent_pay
+// excluded from the gate, ai.js would pass the empty short-circuit state
+// (burnerConfigured=false) — so EVERY agent_pay POST got blocked as
+// burner_not_configured even when the burner was configured. Same-session
+// GET worked fine (no POST branch), making this look like a config bug
+// to the agent.
+//
+// Trade-off: agent_pay now incurs one /burner/status bridge call per
+// dispatch (~5-30ms). The R9 optimization is reversed. Correctness > tail
+// latency for a tool that moves user funds. The handler still does its
+// OWN /burner/status fetch for the cap-preflight + reserve steps — that
+// could be deduped via a request-scope cache as a future BAT-XXX
+// (low priority, not user-facing).
 const _BURNER_STATUS_GATE_TOOLS = new Set([
     ...V1_STATIC_CONFIRM,
     ...SOLANA_WRITE_TOOLS,
     'wallet_set_caps',
+    'agent_pay',
 ]);
 
 // Combined gate: tools that need ANY state hydration (burner-status OR

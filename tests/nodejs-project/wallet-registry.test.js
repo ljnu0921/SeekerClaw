@@ -27,8 +27,13 @@ require.cache[configPath] = {
 };
 
 // Inject a fake bridge.js so the wallet modules don't actually hit localhost.
+//
+// wallet/index.js destructures `androidBridgeCall` at module load, so swapping
+// `exports.androidBridgeCall` later has no effect. Instead, expose a delegate
+// (`_responder`) the tests can mutate to control per-test responses.
 const bridgePath = require.resolve(path.join(BUNDLE, 'bridge.js'));
 const bridgeCalls = [];
+let bridgeResponder = async (_endpoint, _body) => ({}); // default: empty
 require.cache[bridgePath] = {
     id: bridgePath,
     filename: bridgePath,
@@ -36,7 +41,7 @@ require.cache[bridgePath] = {
     exports: {
         androidBridgeCall: async (endpoint, body) => {
             bridgeCalls.push({ endpoint, body });
-            return {}; // safe default — unconfigured/empty
+            return bridgeResponder(endpoint, body);
         },
     },
 };
@@ -176,24 +181,54 @@ async function check(label, fn) {
         assert.strictEqual(s.creatorRole, 'unknown');
     });
 
-    // BAT-582 R9: agent_pay's confirmation policy reads only args.max_usdc
-    // (block-or-none gate) and never reads burner state. The agent_pay
-    // handler ALSO does its own /burner/status fetch internally to refuse
-    // fast when unconfigured (before any outbound HTTP). Pre-fix, the gate
-    // ALSO fetched /burner/status — a wasted bridge round-trip on every
-    // agent_pay dispatch. The fix removes agent_pay from the gate set.
-    await check('R9: getWalletState skips /burner/status for agent_pay', async () => {
+    // BAT-664 (device-test fix 2026-05-12): agent_pay MUST fetch
+    // /burner/status from the gate. Pre-fix, agent_pay was excluded from
+    // _GATE_TOOLS under the R9 rationale that its policy hook only reads
+    // args.max_usdc. That was true under v1.4 (GET-only), but BAT-664's
+    // POST branch reads walletState.burnerConfigured to fail-fast before
+    // showing the user a confirm prompt for an unconfigured burner. With
+    // agent_pay excluded, the gate returned the empty short-circuit state
+    // (burnerConfigured=false) and EVERY POST got blocked as
+    // burner_not_configured — even when the burner WAS configured.
+    // GET worked because GET doesn't hit the POST branch. The fix
+    // re-adds agent_pay to the gate set.
+    await check('BAT-664: getWalletState fetches /burner/status for agent_pay (gate must call bridge)', async () => {
         bridgeCalls.length = 0;
-        const s = await getWalletState('agent_pay', { max_usdc: '0.10', url: 'https://example.com' });
+        await getWalletState('agent_pay', { max_usdc: '0.10', url: 'https://example.com' });
         const statusCalls = bridgeCalls.filter(c => c.endpoint === '/burner/status');
-        assert.strictEqual(statusCalls.length, 0,
-            `agent_pay must NOT fetch /burner/status from the gate (got ${statusCalls.length} calls)`);
-        // Sanity: state shape is the empty short-circuit shape — handler
-        // populates everything it needs on its own.
-        assert.strictEqual(s.burnerConfigured, false,
-            'short-circuit path leaves burnerConfigured=false (handler does its own fetch)');
-        assert.strictEqual(bridgeCalls.length, 0,
-            `agent_pay gate should make 0 bridge calls (got ${bridgeCalls.length})`);
+        assert.strictEqual(statusCalls.length, 1,
+            `agent_pay must fetch /burner/status from the gate (got ${statusCalls.length} calls) — POST path depends on real burnerConfigured`);
+    });
+
+    // BAT-664 device-test fix: regression for the exact wire that broke.
+    // When the bridge reports configured=true, the gate MUST propagate
+    // burnerConfigured=true to the policy hook — otherwise BAT-664's
+    // POST branch blocks every call as burner_not_configured.
+    await check('BAT-664: agent_pay gate propagates burnerConfigured=true when bridge reports configured', async () => {
+        const prev = bridgeResponder;
+        bridgeResponder = async (endpoint /* , body */) => {
+            if (endpoint === '/burner/status') {
+                return {
+                    configured: true,
+                    pubkey: 'TestBurnerPubkey11111111111111111111111111',
+                    capPerTxSol: '500000000',
+                    capDailySol: '500000000',
+                    capPerTxUsdc: '100000',
+                    capDailyUsdc: '500000000',
+                    spentTodaySol: '0',
+                    spentTodayUsdc: '0',
+                };
+            }
+            return {};
+        };
+        try {
+            bridgeCalls.length = 0;
+            const s = await getWalletState('agent_pay', { max_usdc: '0.10', url: 'https://example.com' });
+            assert.strictEqual(s.burnerConfigured, true,
+                'gate must propagate burnerConfigured=true to policy hook — pre-fix this was false and broke ALL POST calls');
+        } finally {
+            bridgeResponder = prev;
+        }
     });
 
     // BAT-582 R9: wallet_status's confirmation policy returns the literal
