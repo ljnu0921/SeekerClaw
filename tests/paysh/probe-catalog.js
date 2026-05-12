@@ -132,10 +132,29 @@ const TEST_MAX_USDC_ATOMIC = 100_000_000n; // 100 USDC
 // Stub blockhash so build() doesn't hit RPC.
 _setBlockhashFetcher(async () => '2tLBHqeQdeq4Pzioote4ueMkQjrpdnNLBTuDtyKo4ds9');
 
+// R-pr373-r4-2: validate --concurrency. parseInt returns NaN on garbage,
+// and `runWithConcurrency(items, NaN, ...)` produces 0 workers (Array.from
+// length NaN → 0) → script silently does no work. Reject invalid + clamp
+// to [1, 50] (50 is a polite upper bound for raw.githubusercontent + pay.sh).
+const MIN_CONCURRENCY = 1;
+const MAX_CONCURRENCY = 50;
+function _parseConcurrency(raw) {
+    const n = parseInt(raw, 10);
+    if (!Number.isFinite(n) || n < MIN_CONCURRENCY) {
+        console.error(`Invalid --concurrency "${raw}" (must be integer ≥ ${MIN_CONCURRENCY}). Aborting.`);
+        process.exit(1);
+    }
+    if (n > MAX_CONCURRENCY) {
+        console.error(`--concurrency ${n} exceeds cap ${MAX_CONCURRENCY}; clamping to ${MAX_CONCURRENCY}.`);
+        return MAX_CONCURRENCY;
+    }
+    return n;
+}
+
 function parseArgs(argv) {
     const out = { concurrency: 5, commitCaptures: false, limit: 0, filter: null };
     for (let i = 2; i < argv.length; i++) {
-        if (argv[i] === '--concurrency' && argv[i + 1]) { out.concurrency = parseInt(argv[++i], 10); }
+        if (argv[i] === '--concurrency' && argv[i + 1]) { out.concurrency = _parseConcurrency(argv[++i]); }
         else if (argv[i] === '--commit-captures') out.commitCaptures = true;
         else if (argv[i] === '--limit' && argv[i + 1]) out.limit = parseInt(argv[++i], 10);
         else if (argv[i] === '--filter' && argv[i + 1]) out.filter = argv[++i];
@@ -159,7 +178,13 @@ function parseFrontmatter(md) {
     return out;
 }
 
-function fetchText(url, timeoutMs = 15000) {
+// R-pr373-r4-1: bound redirect chain depth to prevent unbounded recursion
+// on a misbehaving server (redirect loop, or long chain). Default budget
+// is 5 hops — plenty for legitimate CDN redirects (raw.githubusercontent
+// usually doesn't redirect; some openapi-hosting CDNs do once or twice).
+// On exhaustion we return an error rather than throwing or stack-overflowing.
+const MAX_REDIRECTS = 5;
+function fetchText(url, timeoutMs = 15000, redirectsLeft = MAX_REDIRECTS) {
     return new Promise((resolve) => {
         const parsed = new URL(url);
         const lib = parsed.protocol === 'https:' ? https : http;
@@ -173,11 +198,15 @@ function fetchText(url, timeoutMs = 15000) {
                 'User-Agent': 'SeekerClaw-paysh-catalog/1.0 (+https://github.com/sepivip/SeekerClaw)',
             },
         }, (res) => {
-            // Follow one redirect (raw.githubusercontent doesn't, but
-            // some openapi hosts behind a CDN do).
+            // Follow redirects up to MAX_REDIRECTS deep. Pre-fix the
+            // comment claimed "one redirect" but the recursion had no
+            // depth bound — a redirect loop would have hung the script.
             if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
                 res.resume();
-                return resolve(fetchText(new URL(res.headers.location, url).toString(), timeoutMs));
+                if (redirectsLeft <= 0) {
+                    return resolve({ error: `too many redirects (>${MAX_REDIRECTS}) starting at ${url}` });
+                }
+                return resolve(fetchText(new URL(res.headers.location, url).toString(), timeoutMs, redirectsLeft - 1));
             }
             const chunks = [];
             res.on('data', c => chunks.push(c));
