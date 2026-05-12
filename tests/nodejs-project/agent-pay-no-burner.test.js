@@ -14,12 +14,16 @@ const path = require('path');
 const BUNDLE = path.resolve(__dirname, '..', '..', 'app', 'src', 'main', 'assets', 'nodejs-project');
 
 // ── Mock config.js for transitive requires ──────────────────────────────────
+// R-pr373-r2-1: agent_pay.js now requires `../security` (for redactSecrets
+// in diagnostic dumps). security.js destructures `config` from config.js
+// and iterates Object.keys(config) at module load, so the mock must
+// expose a real (if empty) `config` object — not undefined.
 const configPath = require.resolve(path.join(BUNDLE, 'config.js'));
 require.cache[configPath] = {
     id: configPath,
     filename: configPath,
     loaded: true,
-    exports: { BRIDGE_TOKEN: 't', log: () => {} },
+    exports: { BRIDGE_TOKEN: 't', log: () => {}, config: {}, workDir: '/tmp/seekerclaw-test' },
 };
 
 // ── Mock bridge.js — /burner/status returns configured: false ───────────────

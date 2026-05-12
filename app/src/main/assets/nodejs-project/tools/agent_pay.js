@@ -56,6 +56,32 @@ const { androidBridgeCall } = require('../bridge');
 const { getWallet } = require('../wallet');
 const { detectProtocol } = require('../payment');
 const { wouldReserve } = require('../caps/preflight');
+// R-pr373-r2-1: redact secret-shaped values before logging upstream
+// response bodies. The 402 challenge body SHOULD only contain public
+// protocol fields (payTo, asset, amount, facilitator pubkey), but a
+// buggy or malicious upstream could include tokens in headers / extra
+// fields — defensive redaction keeps those out of operator logs.
+const { redactSecrets } = require('../security');
+
+// R-pr373-r2-3: BigInt-safe USDC atomic→decimal formatter. Mirrors
+// `_atomicBigIntToDecimal` in `tools/index.js` (can't import directly
+// without a circular require). Trims trailing zeros so "$0.020000"
+// renders as "$0.02" in user-facing reason text. Keeping precision via
+// BigInt avoids `Number(atomic)/1e6` drift for values above
+// Number.MAX_SAFE_INTEGER (rare for USDC microunits but the helper is
+// cheap and correct).
+function _atomicToDecimalString(atomicBig, decimals = USDC_DECIMALS) {
+    if (typeof atomicBig !== 'bigint') return null;
+    let s = atomicBig.toString();
+    const negative = s.startsWith('-');
+    if (negative) s = s.slice(1);
+    if (s === '0') return '0';
+    const pad = s.padStart(decimals + 1, '0');
+    const head = pad.slice(0, pad.length - decimals);
+    const tail = pad.slice(pad.length - decimals).replace(/0+$/, '');
+    const out = tail.length ? `${head}.${tail}` : head;
+    return negative ? `-${out}` : out;
+}
 
 const USDC_DECIMALS = 6;
 const MAX_BODY_BYTES = 1024 * 1024;        // 1 MB response cap
@@ -683,8 +709,10 @@ async function _handle(input /* , chatId */) {
         // body was empty, malformed, missing accepts[], wrong x402Version,
         // or arrived via the `payment-required` header. Now we surface
         // enough to diagnose without re-instrumenting + rebuilding. Keep
-        // the dump bounded: 500 chars max from each side, sanitize obvious
-        // secret-shaped values via security.redactSecrets if available.
+        // the dump bounded: 500 chars max from each side. Pipe through
+        // security.redactSecrets so any secret-shaped values an upstream
+        // might include (bearer tokens, api keys, long hex/base64 blobs)
+        // are masked before they reach the log buffer (R-pr373-r2-1).
         const ct = String(firstResp.headers && firstResp.headers['content-type'] || '');
         const pr = firstResp.headers && (firstResp.headers['payment-required'] || firstResp.headers['Payment-Required']);
         const bj = firstResp.bodyJson;
@@ -700,9 +728,10 @@ async function _handle(input /* , chatId */) {
             bjShape = typeof bj;
         }
         const bbLen = firstResp.bodyBuffer ? firstResp.bodyBuffer.length : 'n/a';
-        const bodyHead = firstResp.bodyBuffer
+        const rawBodyHead = firstResp.bodyBuffer
             ? firstResp.bodyBuffer.toString('utf8').slice(0, 500).replace(/\s+/g, ' ')
             : '(no body)';
+        const bodyHead = redactSecrets(rawBodyHead);
         log(`[agent_pay] no x402 protocol detected for 402 response — ct="${ct}" payment-required-header=${pr ? 'present(' + pr.length + 'b)' : 'absent'} bodyJson=${bjShape} bodyBuffer.len=${bbLen}`, 'WARN');
         log(`[agent_pay] no_protocol_match body head: ${bodyHead}`, 'WARN');
         return {
@@ -865,7 +894,8 @@ async function _handle(input /* , chatId */) {
         // 500-char body head — public protocol fields only, no secrets.
         if (settled && settled.diag) {
             const d = settled.diag;
-            const bodyOneLine = String(d.bodyHead || '').replace(/\s+/g, ' ').slice(0, 500);
+            // R-pr373-r2-1: redact secret-shaped values before logging.
+            const bodyOneLine = redactSecrets(String(d.bodyHead || '').replace(/\s+/g, ' ').slice(0, 500));
             log(`[agent_pay] settle rejection diag — ct="${d.contentType || ''}" bodyLen=${d.bodyLen} bodyHead: ${bodyOneLine}`, 'WARN');
         }
         return {
@@ -997,16 +1027,18 @@ async function _checkBurnerUsdcBalance(burnerPubkey58, demandAtomic) {
     }
     if (rpcResult.error) {
         const errMsg = String(rpcResult.error || '').toLowerCase();
+        // R-pr373-r2-2: tighten the not-found classifier to the explicit
+        // not-found phrases only. Pre-fix included `invalid param: pubkey`
+        // which can also surface for malformed input or other RPC issues
+        // — treating it as not-found would incorrectly fail-CLOSED with
+        // insufficient_burner_balance when the right behavior is to
+        // fail-OPEN as a transient RPC issue. The remaining patterns
+        // are the canonical Solana RPC not-found responses across
+        // mainnet-beta, publicnode, helius, alchemy.
         const isAccountNotFound =
             errMsg.includes('could not find account') ||
             errMsg.includes('account not found') ||
-            errMsg.includes('-32004') ||
-            // Some Solana RPC variants return "invalid param: pubkey" when
-            // the ATA address itself is well-formed but no account lives
-            // at that address. We treat the explicit not-found phrases
-            // above only; other "invalid" surfaces fall through as RPC
-            // issues (fail-open) since they may be transient.
-            errMsg.includes('invalid param: pubkey');
+            errMsg.includes('-32004');
         if (isAccountNotFound) {
             // ATA truly doesn't exist on chain — burner has never received
             // USDC. Treat as 0 balance, fail-closed (this is a definite
@@ -1018,16 +1050,17 @@ async function _checkBurnerUsdcBalance(burnerPubkey58, demandAtomic) {
                 haveAtomic: '0',
                 haveDecimal: '0',
                 needAtomic: demandAtomic.toString(),
-                needDecimal: (Number(demandAtomic) / 1e6).toFixed(6).replace(/\.?0+$/, ''),
+                needDecimal: _atomicToDecimalString(demandAtomic),
                 shortAtomic: short.toString(),
-                shortDecimal: (Number(short) / 1e6).toFixed(6).replace(/\.?0+$/, ''),
+                shortDecimal: _atomicToDecimalString(short),
                 reason: 'Burner has never received USDC (no ATA on chain).',
             };
         }
         // Any other RPC error (timeout, rate limit, transient network
-        // failure, gateway 5xx) — fail-open. Caller logs WARN and falls
-        // through to the existing cap reservation + facilitator-side
-        // checks. Don't block legitimate payments on RPC flake.
+        // failure, gateway 5xx, "invalid param: pubkey", etc.) — fail-open.
+        // Caller logs WARN and falls through to the existing cap
+        // reservation + facilitator-side checks. Don't block legitimate
+        // payments on RPC flake.
         return { error: 'preflight_balance_rpc_failed', reason: rpcResult.error };
     }
     const amountStr = rpcResult.value && rpcResult.value.amount;
@@ -1039,14 +1072,19 @@ async function _checkBurnerUsdcBalance(burnerPubkey58, demandAtomic) {
         return { ok: true, haveAtomic: amountStr };
     }
     const short = demandAtomic - have;
+    // R-pr373-r2-3: BigInt-safe formatting via `_atomicToDecimalString`.
+    // Pre-fix used `Number(atomic)/1e6` which loses precision for atomic
+    // values above Number.MAX_SAFE_INTEGER (~9.0e15). Current USDC caps
+    // are far below that, but the helper is cheap and correct, so use
+    // it unconditionally.
     return {
         error: 'insufficient_burner_balance',
         haveAtomic: amountStr,
-        haveDecimal: (Number(have) / 1e6).toFixed(6).replace(/\.?0+$/, ''),
+        haveDecimal: _atomicToDecimalString(have),
         needAtomic: demandAtomic.toString(),
-        needDecimal: (Number(demandAtomic) / 1e6).toFixed(6).replace(/\.?0+$/, ''),
+        needDecimal: _atomicToDecimalString(demandAtomic),
         shortAtomic: short.toString(),
-        shortDecimal: (Number(short) / 1e6).toFixed(6).replace(/\.?0+$/, ''),
+        shortDecimal: _atomicToDecimalString(short),
     };
 }
 

@@ -99,7 +99,7 @@ Note: "combined" here scores only the BAT-664 + fix deltas. The full SAB surface
 
 ### Section B (Diagnostic Coverage)
 
-- **DIAGNOSTICS.md `Invalid Tool Schema (400 Error)` (new entry under LLM API section)** — documents the symptom (every turn fails with `Invalid schema for function 'X'`), the cause class (JSON Schema validation rules, e.g., `array` in type union without `items`), and the path to fix (`tools/tool-schemas.test.js` + CI gate). Future Claude session encountering this can self-diagnose in one read.
+- **DIAGNOSTICS.md `Invalid Tool Schema (400 Error)` (new entry under LLM API section)** — documents the symptom (every turn fails with `Invalid schema for function 'X'`), the cause class (JSON Schema validation rules, e.g., `array` in type union without `items`), and the path to fix (`tests/nodejs-project/tool-schemas.test.js` + CI gate). Future Claude session encountering this can self-diagnose in one read.
 - **DIAGNOSTICS.md `agent_pay: burner not configured` extension** — added the BAT-664 device-test false-positive scenario: *"`burner_not_configured` was returned only for POST, while same-session GET worked fine ... root cause was NOT the burner — `_BURNER_STATUS_GATE_TOOLS` had `agent_pay` excluded..."* with a pointer to the regression test in `wallet-registry.test.js`. Future operators see both the real diagnosis ("import a key") AND the false-positive scenario ("check gate inclusion") side by side.
 
 ### Section D (Behavioral Probes)

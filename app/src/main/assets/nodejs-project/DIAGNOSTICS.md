@@ -110,7 +110,9 @@ grep -i "Invalid schema for function" node_debug.log | tail -3
 - `type: ['object', 'array', 'string']` without `items: {}` — when a union includes `array`, `items` is required even for the polymorphic case. Caught: BAT-664 (`tools/agent_pay.js` `body` parameter).
 - `required: ['foo']` where `foo` isn't in `properties`.
 - Misspelled JSON Schema type names (`"strng"` instead of `"string"`).
-**Fix:** `node tests/nodejs-project/tool-schemas.test.js` walks every tool's schema and points at the bad one. CI runs this on every PR (`.github/workflows/build.yml` `node-tests` job). If you see this error in production, the safety net was bypassed — investigate. Once the schema is corrected, no APK rebuild is required if the tool definition is in `nodejs-project/` (just restart the service); if it's in `tools/index.js` Kotlin glue, rebuild + reinstall.
+**Fix:** `node tests/nodejs-project/tool-schemas.test.js` walks every tool's schema and points at the bad one. CI runs this on every PR (`.github/workflows/build.yml` `node-tests` job). If you see this error in production, the safety net was bypassed — investigate. Once the schema is corrected:
+- **Node-bundle change** (any `app/src/main/assets/nodejs-project/**` file, including `tools/index.js` and all `tools/*.js`): the assets are extracted from the APK to `filesDir/nodejs-project/` on first launch, so a fresh APK install ships the fix; on an already-installed device, the bundle re-extracts on the next service restart. No Kotlin recompile needed.
+- **Android/Kotlin change** (any `app/src/main/java/com/seekerclaw/**` file — Settings UI, bridge endpoints, KeyVault, etc.): requires `./gradlew assembleDappStoreDebug` + `adb install -r`, then service restart.
 
 ### Context Overflow (400 Error)
 **Symptoms:** API returns 400 error, message mentions "maximum context length" or "too many tokens".
