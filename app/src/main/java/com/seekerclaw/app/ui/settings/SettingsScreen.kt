@@ -98,6 +98,8 @@ import com.seekerclaw.app.util.Analytics
 import com.seekerclaw.app.util.LogCollector
 import com.seekerclaw.app.util.LogLevel
 import com.seekerclaw.app.BuildConfig
+import com.seekerclaw.app.bridge.burner.BurnerBridgeEndpoints
+import com.seekerclaw.app.data.wallet.EncryptedPrefsKeyVault
 import com.seekerclaw.app.ui.components.CardSurface
 import com.seekerclaw.app.ui.components.DangerButton
 import com.seekerclaw.app.ui.components.DangerOutlineButton
@@ -110,6 +112,7 @@ import com.seekerclaw.app.ui.components.InfoRow
 import com.seekerclaw.app.ui.components.cornerGlowBorder
 import com.seekerclaw.app.ui.theme.Sizing
 import com.seekerclaw.app.ui.theme.Spacing
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -131,6 +134,54 @@ fun SettingsScreen(
     // Observe configVersion so UI refreshes when bridge saves owner ID (auto-detect)
     val configVer by ConfigManager.configVersion
     var config by remember(configVer) { mutableStateOf(ConfigManager.loadConfig(context)) }
+    // BAT-681: track whether the burner wallet is configured so the
+    // Settings → Solana Wallet section can show "Set Up Burner Wallet"
+    // (unconfigured) vs "Manage Burner Wallet" (configured), parallel
+    // to the state-aware iOS Settings pattern.
+    //
+    // R-pr374-r1-1 (Copilot review): drive the state from a successful
+    // `getPubkey()` probe, NOT `isConfigured()`. The latter only checks
+    // file existence — a key file could exist but be undecryptable
+    // (Keystore wipe, restore-from-backup, etc.) which would make
+    // Settings show "Manage" while BurnerWalletScreen renders empty.
+    // The pubkey probe matches what BurnerWalletScreen itself gates on,
+    // so the two surfaces stay in agreement.
+    //
+    // R-pr374-r1-2: remember a single keyVault instance; reused for the
+    // initial probe AND the ON_RESUME refresh below, no reallocation
+    // on each lifecycle event.
+    // R-pr374-r5-1: use short names via imports (added at the top of
+    // the file) for EncryptedPrefsKeyVault, BurnerBridgeEndpoints, and
+    // CancellationException. Matches the rest of SettingsScreen.kt
+    // which relies on imports rather than fully-qualified inline refs.
+    val burnerKeyVault = remember { EncryptedPrefsKeyVault(context.applicationContext) }
+    var burnerConfigured by remember { mutableStateOf(false) }
+    // Bumped from ON_RESUME below to re-probe after the user returns
+    // from BurnerWalletScreen (import / wipe flow). R-pr374-r2-2:
+    // primitive IntState matches `mcpServerCount` and other counters
+    // in this file — avoids the boxed-Int allocation `mutableStateOf(0)`
+    // would create.
+    var burnerProbeKey by remember { mutableIntStateOf(0) }
+    LaunchedEffect(burnerProbeKey) {
+        val pk = withContext(Dispatchers.IO) {
+            try {
+                burnerKeyVault.getPubkey(BurnerBridgeEndpoints.BURNER_ID)
+            } catch (ce: CancellationException) {
+                // R-pr374-r2-1: CancellationException is how Kotlin
+                // coroutines signal cooperative cancellation. Catching
+                // it under the generic `Exception` branch below would
+                // swallow the cancel and let this LaunchedEffect's
+                // coroutine survive past the composable's disposal
+                // (and delay any structured-concurrency parent that's
+                // waiting on this to finish). Re-throw so cancellation
+                // propagates normally.
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
+        }
+        burnerConfigured = pk != null
+    }
 
     var autoStartOnBoot by remember {
         mutableStateOf(ConfigManager.getAutoStartOnBoot(context))
@@ -183,6 +234,12 @@ fun SettingsScreen(
                 hasContactsPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
                 hasSmsPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED
                 hasCallPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
+                // BAT-681: re-probe the burner pubkey on resume so the
+                // Set Up / Manage label flips immediately after the user
+                // imports a key or wipes it in the BurnerWalletScreen
+                // sub-flow. Bumping the key drives the LaunchedEffect
+                // above; the IO-thread probe runs off the main thread.
+                burnerProbeKey++
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -742,7 +799,74 @@ fun SettingsScreen(
                 )
             }
 
-            // Jupiter API Key (Solana swaps)
+            // ── Burner Wallet (BAT-582 / BAT-681) ─────────────────────────
+            // Promoted above the API-key fields per BAT-681: this is a
+            // primary capability surface (agent-controlled signer), so it
+            // gets a full-width button parallel to "Connect/Disconnect
+            // Wallet" rather than a small Edit row. State-aware label
+            // matches the iOS Settings two-state pattern:
+            //   - unconfigured → "Set Up Burner Wallet" (filled, primary CTA)
+            //   - configured   → "Manage Burner Wallet" (outlined, neutral)
+            Spacer(modifier = Modifier.height(20.dp))
+            if (burnerConfigured) {
+                OutlinedButton(
+                    onClick = onNavigateToBurnerWallet,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = shape,
+                    border = BorderStroke(1.dp, SeekerClawColors.BorderSubtle),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = SeekerClawColors.TextPrimary,
+                    ),
+                ) {
+                    Text(
+                        "Manage Burner Wallet",
+                        fontFamily = RethinkSans,
+                        fontSize = 14.sp,
+                    )
+                }
+            } else {
+                Button(
+                    onClick = onNavigateToBurnerWallet,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        // R-pr374-r4-2: match the "Connect Wallet" CTA's
+                        // visual treatment — same glow modifier on the
+                        // primary onboarding button — since the PR
+                        // description claims visual analogy and the user's
+                        // design-system requirement is "consistency."
+                        .cornerGlowBorder(),
+                    shape = shape,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = SeekerClawColors.ActionPrimary,
+                        contentColor = androidx.compose.ui.graphics.Color.White,
+                    ),
+                ) {
+                    Text(
+                        "Set Up Burner Wallet",
+                        fontFamily = RethinkSans,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
+            // R-pr374-r6-1: spacer + caption hoisted out of the
+            // if/else (post-R4 both branches had identical copy +
+            // layout). Single source of truth — no copy/layout drift
+            // if future changes only update one branch by mistake.
+            // R-pr374-r4-1 framing ("Agent-controlled signer
+            // (experimental)") preserved verbatim from the pre-PR
+            // ConfigField value text.
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "Agent-controlled signer (experimental)",
+                fontFamily = RethinkSans,
+                fontSize = 11.sp,
+                color = SeekerClawColors.TextDim,
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            // ── Jupiter API Key (Solana swaps) ────────────────────────────
             Spacer(modifier = Modifier.height(20.dp))
             ConfigField(
                 label = "Jupiter API Key",
@@ -760,7 +884,7 @@ fun SettingsScreen(
                 info = SettingsHelpTexts.JUPITER_API_KEY,
             )
 
-            // Helius API Key (NFT holdings)
+            // ── Helius API Key (NFT holdings) ─────────────────────────────
             Spacer(modifier = Modifier.height(20.dp))
             ConfigField(
                 label = "Helius API Key",
@@ -774,19 +898,8 @@ fun SettingsScreen(
                     editLabel = "Helius API Key"
                     editValue = config?.heliusApiKey ?: ""
                 },
-                showDivider = true,
-                info = SettingsHelpTexts.HELIUS_API_KEY,
-            )
-
-            // Burner wallet (BAT-582) — agent-controlled signer for
-            // autonomous Solana actions. Shows as a navigation row
-            // because the configuration surface is a full screen
-            // (key import, caps, danger zone).
-            ConfigField(
-                label = "Burner Wallet",
-                value = "Agent-controlled signer (experimental)",
-                onClick = onNavigateToBurnerWallet,
                 showDivider = false,
+                info = SettingsHelpTexts.HELIUS_API_KEY,
             )
             }
         }
