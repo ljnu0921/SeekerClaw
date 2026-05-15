@@ -2471,6 +2471,7 @@ object ConfigManager {
     // Note: `version` param must match the version in the YAML frontmatter of `content`.
     // The param drives manifest comparison; the frontmatter version is parsed at runtime by main.js.
     private fun seedSkill(
+        context: Context,
         skillsDir: File,
         manifest: MutableMap<String, SkillManifestEntry>,
         name: String,
@@ -2484,7 +2485,19 @@ object ConfigManager {
         val manifestEntry = manifest[name]
 
         if (!skillFile.exists()) {
-            // Case 1: File doesn't exist — seed it
+            // Case 1: File doesn't exist — seed it.
+            //
+            // BAT-699 R3: copy support files BEFORE SKILL.md so the seed is
+            // atomic. If support-file copy fails for any reason (e.g.
+            // transient I/O, disk pressure), abort before writing SKILL.md
+            // or advancing the manifest — case-1 will fire again on next
+            // launch from a clean state. Pre-fix the helper just logged and
+            // returned; we'd advance the manifest with missing support
+            // files, and the version check would skip re-seeding forever.
+            if (!copySkillSupportFiles(context, "default-skills/$name", skillDir)) {
+                Log.w(TAG, "Skill $name: support-file copy failed; skipping seed, will retry on next launch")
+                return
+            }
             skillFile.writeText(content)
             manifest[name] = SkillManifestEntry(version = version, hash = contentHash)
             Log.d(TAG, "Skill $name seeded at version $version")
@@ -2512,7 +2525,23 @@ object ConfigManager {
         // Case 2: Bundled version > manifest version — check for user modifications
         val installedHash = computeHash(skillFile.readText())
         if (installedHash == currentEntry.hash) {
-            // User hasn't modified — safe to overwrite
+            // User hasn't modified — safe to overwrite.
+            //
+            // BAT-699 R3: same atomic pattern as case 1 — copy support files
+            // FIRST, only advance SKILL.md + manifest if that succeeded.
+            // On failure we leave the old SKILL.md + manifest entry intact
+            // so case-2 fires again on the next launch and retries. Pre-fix
+            // we'd advance the manifest with a partial upgrade.
+            //
+            // NOTE: this overwrites user-modified support files (we don't
+            // yet track per-file hashes). Acceptable trade-off for V1 —
+            // folder-shaped skills are curated catalogs, not user-customized
+            // content. Track per-file hashes if/when this becomes a real
+            // concern.
+            if (!copySkillSupportFiles(context, "default-skills/$name", skillDir)) {
+                Log.w(TAG, "Skill $name: support-file copy failed during upgrade ${currentEntry.version}→$version; postponing, will retry on next launch")
+                return
+            }
             skillFile.writeText(content)
             manifest[name] = SkillManifestEntry(version = version, hash = contentHash)
             Log.d(TAG, "Skill $name updated from ${currentEntry.version} to $version")
@@ -2521,6 +2550,189 @@ object ConfigManager {
             // so we don't keep trying to update on every launch
             manifest[name] = SkillManifestEntry(version = version, hash = installedHash)
             Log.d(TAG, "Skill $name has user modifications, preserving (bundled $version available)")
+        }
+    }
+
+    /**
+     * Recursively copy non-`SKILL.md` files from a bundled skill's asset
+     * folder into the workspace skill directory. Used by [seedSkill] for
+     * folder-shaped skills like `paysh-catalog` that ship `catalog.json`,
+     * `unsupported.json`, and a `services/` subdir alongside SKILL.md.
+     *
+     * AssetManager doesn't expose a is-file probe; we treat a successful
+     * `open()` as "file" and a non-empty `list()` as "directory."
+     *
+     * **Stage-then-swap atomicity** (BAT-699 R6): support files are first
+     * copied into a sibling `.<name>.staging/` directory. ONLY after every
+     * file in the walk has been successfully written to staging do we
+     * promote the staging contents into the live skill directory. If ANY
+     * step in the walk fails, staging is discarded and the live directory
+     * is NEVER touched. This eliminates the mid-walk-failure mixed-state
+     * bug where partial overwrites in the live dir would have left the
+     * skill running with mixed old/new contents alongside an un-advanced
+     * manifest.
+     *
+     * The promote step itself is per-file rename, not a single atomic
+     * directory swap (Android FS doesn't support that). There is a brief
+     * window during promotion where the live dir contains a mix of new
+     * support files; this is bounded to milliseconds and only matters
+     * if the device is read concurrently mid-promotion, which doesn't
+     * happen in practice (skills are loaded once at runtime startup).
+     *
+     * Returns `true` if every walked entry was successfully listed,
+     * copied to staging, AND promoted to the live dir. Returns `false`
+     * on ANY failure — caller must NOT advance the manifest in that
+     * case, so the seed retries on the next launch from a clean state.
+     */
+    private fun copySkillSupportFiles(
+        context: Context,
+        assetSkillDir: String,
+        workspaceSkillDir: File,
+    ): Boolean {
+        val assetManager = context.assets
+        // Staging sibling — same parent as live skill dir, dot-prefixed
+        // name to keep it out of normal skill-directory enumeration.
+        val parent = workspaceSkillDir.parentFile
+            ?: run {
+                Log.e(TAG, "Cannot determine parent dir for ${workspaceSkillDir.path}")
+                return false
+            }
+        val stagingDir = File(parent, ".${workspaceSkillDir.name}.staging")
+        // Clean any orphan staging from a prior failed run before we start.
+        stagingDir.deleteRecursively()
+        if (!stagingDir.mkdirs()) {
+            Log.e(TAG, "Failed to create staging dir ${stagingDir.path}")
+            return false
+        }
+
+        var allOk = true
+        fun walk(assetPath: String, targetDir: File) {
+            val entries = try {
+                assetManager.list(assetPath) ?: emptyArray()
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to list assets at $assetPath", e)
+                allOk = false
+                return
+            }
+            for (entry in entries) {
+                val childAssetPath = "$assetPath/$entry"
+                // Skip SKILL.md at the top level — seeded separately by
+                // seedSkill() with version-aware logic.
+                if (assetPath == assetSkillDir && entry == "SKILL.md") continue
+                // File-vs-directory probe (BAT-699 R7): AssetManager doesn't
+                // expose an `isDirectory` API. Differentiate using BOTH
+                // list() and open() results:
+                //   - list() non-empty           → directory (recurse)
+                //   - list() empty + open() OK   → file (copy)
+                //   - list() empty + open() fail → real I/O error (mark
+                //                                  allOk=false, do not
+                //                                  silently treat as empty
+                //                                  directory).
+                // Pre-fix the probe treated any open() exception as
+                // "directory", which would silently skip a file with a
+                // real I/O error and advance the manifest.
+                val childListing = try {
+                    assetManager.list(childAssetPath) ?: emptyArray()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to list assets at $childAssetPath", e)
+                    allOk = false
+                    continue
+                }
+                if (childListing.isNotEmpty()) {
+                    // Directory — recurse.
+                    val childTarget = File(targetDir, entry).apply { mkdirs() }
+                    walk(childAssetPath, childTarget)
+                    continue
+                }
+                // list() empty: could be a file OR a broken/missing asset.
+                // Probe by opening.
+                val openOk = try {
+                    assetManager.open(childAssetPath).close()
+                    true
+                } catch (e: Exception) {
+                    Log.e(TAG, "Asset $childAssetPath is neither a directory (empty list) nor an openable file", e)
+                    allOk = false
+                    false
+                }
+                if (!openOk) continue
+                // Confirmed file — copy it.
+                val targetFile = File(targetDir, entry)
+                try {
+                    targetFile.parentFile?.mkdirs()
+                    assetManager.open(childAssetPath).use { input ->
+                        targetFile.outputStream().use { output -> input.copyTo(output) }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to copy support file $childAssetPath", e)
+                    allOk = false
+                }
+            }
+        }
+        walk(assetSkillDir, stagingDir)
+
+        if (!allOk) {
+            // Walk failed — discard staging, live dir untouched.
+            stagingDir.deleteRecursively()
+            return false
+        }
+
+        // Walk succeeded — promote staging into the live skill dir.
+        // SKILL.md is never in staging (skipped above) so the live
+        // SKILL.md is preserved untouched here. We delete the old
+        // non-SKILL.md support files first, then move staging contents
+        // into place. Per-file renames are atomic on POSIX-style FSes
+        // including the app-private storage Android uses here.
+        try {
+            workspaceSkillDir.mkdirs()
+            // BAT-699 R8: merge staging into live INSTEAD of blanket-deleting
+            // every non-SKILL.md file. The previous approach would have
+            // wiped user-added files (e.g. a user's own notes.md in a
+            // bundled skill's folder) on every version upgrade. Only
+            // remove live files that have a staging counterpart — i.e.
+            // files we're actively refreshing.
+            //
+            // Side effect: bundled files REMOVED in an upgrade leave
+            // orphans on the user's device (e.g. v1.0.0 had foo.md, v1.1.0
+            // doesn't — user keeps foo.md). Acceptable trade-off for V1;
+            // bundled-file removals are rare and orphans are inert.
+            promoteStaging(stagingDir, workspaceSkillDir)
+            stagingDir.deleteRecursively()
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to promote staging into live skill dir; skill may be in mixed state", e)
+            // Best-effort cleanup; live dir is in unknown state, but the
+            // manifest won't advance so the next launch retries.
+            stagingDir.deleteRecursively()
+            return false
+        }
+    }
+
+    /**
+     * Recursively merge a staging directory's contents into a live
+     * directory. For each entry in staging:
+     *   - Directory: ensure live mirror exists, recurse into it.
+     *   - File: delete the matching live file if it exists, then move
+     *     the staging file into place.
+     *
+     * Files in the live dir that DON'T have a staging counterpart are
+     * preserved untouched — these are user additions and must survive
+     * skill upgrades. BAT-699 R8.
+     */
+    private fun promoteStaging(staging: File, live: File) {
+        live.mkdirs()
+        staging.listFiles()?.forEach { src ->
+            val dest = File(live, src.name)
+            if (src.isDirectory) {
+                promoteStaging(src, dest)
+                src.delete()  // remove now-empty staging subdir
+            } else {
+                if (dest.exists()) dest.deleteRecursively()
+                if (!src.renameTo(dest)) {
+                    // Cross-device rename can fail; fall back to copy + delete.
+                    src.copyTo(dest, overwrite = true)
+                    src.delete()
+                }
+            }
         }
     }
 
@@ -2569,7 +2781,7 @@ object ConfigManager {
 
                 val version = extractVersionFromFrontmatter(content) ?: "1.0.0"
 
-                seedSkill(skillsDir, manifest, skillName, version, content)
+                seedSkill(context, skillsDir, manifest, skillName, version, content)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to seed skill $skillName from assets", e)
             }

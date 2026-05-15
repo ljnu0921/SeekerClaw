@@ -121,6 +121,12 @@ SeekerClaw is an Android app built for the Solana Seeker phone (also works on an
 - **Settings → Burner Wallet** — paste private key (base58 or JSON byte array, 32-byte seed or 64-byte expanded), Test, Save, Wipe, Rotate, edit caps. FLAG_SECURE while screen visible. Address shown post-save with tap-to-copy on both truncated (status card header) and full (funding card) forms. **Live SOL + USDC balance** fetched directly from Solana RPC in the UI process via `SolanaBalanceFetcher` (auto-fetch on screen open + manual refresh button). Returns null/`unavailable` on transient RPC outage rather than misleading "0". QR deferred to follow-up.
 - **Dynamic confirmation hook** in `ai.js` replaces the v1.0 static `CONFIRM_REQUIRED` set in `config.js`. Regression-safe: when burner is unconfigured the hook returns identical v1.0 behavior for every existing tool — pinned by `tests/nodejs-project/confirmation-policy.test.js`.
 
+### pay.sh Service Catalog (BAT-699, bundled skill)
+- **`paysh-catalog` skill** — folder-shaped catalog mapping user intent → known pay.sh service URL + cost + example. Agent reads `catalog.json` to pick a service, then reads only the matching `services/<name>.md` for query construction. 9 verified-payable services to start: Wolfram Alpha, Tripadvisor, 2Captcha, Rentcast, Reducto, Crushrewards, StableCrypto Market Data, StableEnrich, Purch.
+- **`unsupported.json`** — 63 known-but-not-usable services with reasons (mpp_protocol, siwx_auth_required, invalid_demand, requires_binary_response, endpoint_not_402_at_probe). Full pay.sh catalog coverage (9 supported + 63 unsupported = 72 services). Agent can answer "I know about Google Vision but can't pay it — our probe got HTTP 400" honestly instead of generic "I don't have that."
+- **Folder seeding** — Bundled skills' support files (catalog.json, unsupported.json, services/*.md) are now copied from `assets/default-skills/<name>/` to `workspace/skills/<name>/` recursively on first install and version upgrade (BAT-699 extended `ConfigManager.seedSkill()`).
+- **Static bundle** — Ships with APK. Auto-refresh from upstream pay.sh is a follow-up (BAT-700). Drift caught by `tests/paysh/probe-catalog.js` + the planned `external-api-watch` skill (BAT-698).
+
 ### Execution
 - **Shell exec** — 33 sandboxed commands including Android tools (cat, ls, curl, grep, find, sed, diff, screencap, getprop, etc.), workspace-restricted
 - **JS eval** — Run JavaScript inside Node.js process, async/await, require() for builtins
@@ -253,7 +259,7 @@ User (Telegram/Discord) <--HTTPS/WSS--> Channel API <--polling/WS--> Node.js Gat
 | Total commits | 558+ |
 | PRs merged | 363+ |
 | Tools | 63 (17 Solana/Jupiter, 13 Android bridge, 6 memory, 6 file, 5 cron, 4 telegram, 3 system, 2 web, 2 skill, 2 wallet [wallet_status, wallet_set_caps], 1 session, 1 env, 1 agent_pay [x402]) + MCP dynamic |
-| Skills | 35 (20 bundled + 13 workspace + 2 user-created) |
+| Skills | 37 (22 bundled + 13 workspace + 2 user-created) |
 | Android Bridge endpoints | 18+ |
 | Telegram commands | 12 |
 | Channels | 2 (Telegram + Discord) |

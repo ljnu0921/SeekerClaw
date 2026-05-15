@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "generatedAt": "2026-05-15",
+  "source": "tests/paysh/catalog-summary.md (probe-catalog run 2026-05-14)",
+  "notes": "Services in this file are end-to-end usable today: probe-catalog parsed_ok with a Solana-USDC leg AND the response shape is deliverable to Telegram/Discord (text/JSON, not binary). Of the 72 upstream pay.sh services: 9 are listed here (supported), 1 (paysponge/screenshotone) parsed_ok but returns binary and is in unsupported.json under requires_binary_response, 41 reject at the parser (mpp_protocol / siwx_auth_required / invalid_demand) and are in unsupported.json, 21 don't return 402 (broken/moved). See SKILL.md for the read flow and tests/paysh/catalog-summary.md for the full probe matrix.",
+  "services": [
+    {
+      "id": "wolfram-alpha",
+      "name": "Wolfram Alpha",
+      "file": "services/wolfram-alpha.md",
+      "cost_usdc": 0.01,
+      "method": "GET",
+      "intents": ["math", "science", "computation", "physics", "chemistry", "facts", "calculate", "compute", "integral", "derivative", "solve", "convert units"],
+      "summary": "Computational intelligence — math, science, factual lookups via the Wolfram knowledge engine."
+    },
+    {
+      "id": "tripadvisor",
+      "name": "Tripadvisor Nearby Search",
+      "file": "services/tripadvisor.md",
+      "cost_usdc": 0.01,
+      "method": "GET",
+      "intents": ["travel", "hotels", "restaurants", "attractions", "nearby", "tourism", "places to visit"],
+      "summary": "Search nearby travel locations — hotels, restaurants, attractions — by latitude/longitude."
+    },
+    {
+      "id": "2captcha",
+      "name": "2Captcha",
+      "file": "services/2captcha.md",
+      "cost_usdc": 0.01,
+      "method": "POST",
+      "intents": ["solve captcha on my own site", "accessibility captcha helper for users with disabilities", "captcha during testing of a site I own or have operator permission to automate"],
+      "summary": "Submit a CAPTCHA for solving — supports recaptcha, hcaptcha, image. Authorized use only: (1) accessibility assistance for users with disabilities completing a CAPTCHA on a site they're legitimately using, or (2) automated testing of a site the user OWNS or has direct site-operator permission to automate. The user's own consent does NOT make solving a CAPTCHA on a third-party site authorized — the SITE OPERATOR's consent is what matters. NOT for defeating anti-abuse controls."
+    },
+    {
+      "id": "reducto",
+      "name": "Reducto Document Parser",
+      "file": "services/reducto.md",
+      "cost_usdc": 0.05,
+      "method": "POST",
+      "intents": ["parse document", "extract pdf", "ocr", "extract from pdf", "extract data from document", "parse invoice"],
+      "summary": "Parse documents (PDF, images) into structured data via Reducto's AI extraction."
+    },
+    {
+      "id": "rentcast",
+      "name": "Rentcast Markets",
+      "file": "services/rentcast.md",
+      "cost_usdc": 0.01,
+      "method": "GET",
+      "intents": ["real estate", "rental market", "rent prices", "property value", "housing data", "zillow alternative"],
+      "summary": "US rental market data — average rent, market trends, property statistics by zip/city."
+    },
+    {
+      "id": "crushrewards",
+      "name": "Crushrewards Shopper",
+      "file": "services/crushrewards.md",
+      "cost_usdc": 0.01,
+      "method": "GET",
+      "intents": ["shopping", "compare prices", "find best price", "amazon", "walmart", "product search", "deal finder"],
+      "summary": "Find best price across major US retailers (Amazon, Walmart, Costco, Home Depot, etc.)."
+    },
+    {
+      "id": "stablecrypto-market-data",
+      "name": "StableCrypto New Pools",
+      "file": "services/stablecrypto-market-data.md",
+      "cost_usdc": 0.01,
+      "method": "POST",
+      "intents": ["new on-chain pools", "new dex pools", "newly created pools", "fresh liquidity pairs", "trending new pools", "coingecko onchain new pools"],
+      "summary": "Get new on-chain pools across DEXes via the CoinGecko-onchain proxy. Returns recently-deployed token pairs — NOT generic price lookups."
+    },
+    {
+      "id": "stableenrich",
+      "name": "StableEnrich Data Enrichment",
+      "file": "services/stableenrich.md",
+      "cost_usdc": 0.02,
+      "method": "POST",
+      "intents": ["enrich data", "lookup person", "lookup company", "find email", "find linkedin", "people search"],
+      "summary": "Enrich emails, domains, or names into person/company profiles (LinkedIn-style data)."
+    },
+    {
+      "id": "purch",
+      "name": "Purch Marketplace Search",
+      "file": "services/purch.md",
+      "cost_usdc": 0.01,
+      "method": "GET",
+      "intents": ["marketplace search", "product listing search", "ecommerce search"],
+      "summary": "Search the Purch marketplace catalog (general product/listing search)."
+    }
+  ]
+}
