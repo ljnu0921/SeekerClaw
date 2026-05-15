@@ -7,7 +7,7 @@ Search nearby travel locations (hotels, restaurants, attractions) by latitude/lo
 - **URL pattern:** `https://tripadvisor.x402.paysponge.com/api/v1/location/nearby_search?latLong=<lat>,<long>&category=<hotels|restaurants|attractions>`
 - **Method:** GET
 - **Cost:** $0.01 USDC per call (Solana mainnet)
-- **Suggested max_usdc:** 0.05
+- **Suggested max_usdc:** `"0.05"` (decimal STRING)
 
 ## Query construction
 
@@ -26,7 +26,7 @@ If the user gives a place name ("Rome"), look up its lat/long from your training
 User: *"Find hotels near the Eiffel Tower"*
 
 1. Eiffel Tower ≈ `48.8584,2.2945`
-2. Call `agent_pay("https://tripadvisor.x402.paysponge.com/api/v1/location/nearby_search?latLong=48.8584,2.2945&category=hotels", max_usdc=0.05)`
+2. Call `agent_pay({ url: "https://tripadvisor.x402.paysponge.com/api/v1/location/nearby_search?latLong=48.8584,2.2945&category=hotels", max_usdc: "0.05" })` — object args, `max_usdc` as decimal STRING
 3. Return top results from the response.
 
 ## Response shape
