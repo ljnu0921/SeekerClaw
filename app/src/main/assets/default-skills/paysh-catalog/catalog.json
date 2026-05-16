@@ -2,7 +2,7 @@
   "version": 1,
   "generatedAt": "2026-05-15",
   "source": "tests/paysh/catalog-summary.md (probe-catalog run 2026-05-14)",
-  "notes": "Services in this file are end-to-end usable today: probe-catalog parsed_ok with a Solana-USDC leg AND the response shape is deliverable to Telegram/Discord (text/JSON, not binary). Of the 72 upstream pay.sh services: 9 are listed here (supported), 1 (paysponge/screenshotone) parsed_ok but returns binary and is in unsupported.json under requires_binary_response, 41 reject at the parser (mpp_protocol / siwx_auth_required / invalid_demand) and are in unsupported.json, 21 don't return 402 (broken/moved). See SKILL.md for the read flow and tests/paysh/catalog-summary.md for the full probe matrix.",
+  "notes": "Services in this file are end-to-end usable today: probe-catalog parsed_ok with a Solana-USDC leg (or, in textbelt-sms's case, a verified separately-captured POST send endpoint that the catalog probe didn't reach) AND the response shape is deliverable to Telegram/Discord (text/JSON, not binary). Of the 72 upstream pay.sh services: 10 are listed here (supported); 62 are in unsupported.json across four buckets — (a) 1 requires_binary_response (paysponge/fal — `evidence_basis: product-family-inference`, the endpoint names map to fal-ai's published image/video-gen models like Flux, SDXL, Stable Video, Minimax-video; we have not settled to observe a paid response); (b) 1 unverified_paid_response_shape (paysponge/screenshotone — its openapi DECLARES application/json which contradicts the screenshot-as-a-service product-family inference, so we conservatively hold it out until BAT-708 captures a paid response; previously classified as requires_binary_response, retracted in PR #378 R10); (c) 40 parser-reject (33 mpp_protocol + 5 siwx_auth_required + 2 invalid_demand — textbelt was previously in this bucket but its paid POST endpoint is now in catalog.json as textbelt-sms); (d) 20 endpoint_not_402_at_probe (broken/moved at probe time; was 21 before fal was reclassified). Several unsupported entries also carry BAT-706 audit notes for SIBLING endpoints on the same host that ARE payable but aren't catalogued yet — notably paysponge/perplexity (3 paid endpoints: /search, /v1/agent, /v1/async/sonar) and paysponge/nyne (2 paid endpoints: /person/enrichment, /person/search, both PII-sensitive). Deferred to BAT-708 for per-endpoint catalogging + safety scoping. See SKILL.md for the read flow, tests/paysh/catalog-summary.md for the standard probe matrix, and tests/paysh/catalog-audit.md for the BAT-706 multi-endpoint audit.",
   "services": [
     {
       "id": "wolfram-alpha",
@@ -84,6 +84,15 @@
       "method": "GET",
       "intents": ["marketplace search", "product listing search", "ecommerce search"],
       "summary": "Search the Purch marketplace catalog (general product/listing search)."
+    },
+    {
+      "id": "textbelt-sms",
+      "name": "Textbelt SMS",
+      "file": "services/textbelt-sms.md",
+      "cost_usdc": 0.02,
+      "method": "POST",
+      "intents": ["send sms", "send text message", "send text to my phone", "sms reminder to myself", "text my phone"],
+      "summary": "Send a real SMS to a phone number (E.164 format). Authorized-use only: the user's own phone, or a recipient who has clearly consented. NOT for bulk, marketing-without-opt-in, phishing, or impersonation. POST always confirms before paying."
     }
   ]
 }

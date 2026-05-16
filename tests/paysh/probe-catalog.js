@@ -17,6 +17,27 @@
 //   node tests/paysh/probe-catalog.js --concurrency 8
 //   node tests/paysh/probe-catalog.js --commit-captures   # write individual files too
 //
+// BAT-706 audit mode (--audit):
+//   node tests/paysh/probe-catalog.js --audit             # probe every GET endpoint per service
+//   node tests/paysh/probe-catalog.js --audit --filter paysponge
+//   node tests/paysh/probe-catalog.js --audit --audit-side-effects  # also probe POST/PUT/PATCH/DELETE
+//
+// Standard mode probes ONE endpoint per service (typically the
+// catalog-listed entry point) and writes to catalog-summary.md. Audit
+// mode enumerates EVERY endpoint exposed in each service's
+// openapi.json. By default audit only PROBES GET endpoints — non-GET
+// (POST/PUT/PATCH/DELETE) endpoints are listed as
+// `skipped:non_get_side_effect_risk` so the surface is still surveyed
+// but no side effects can fire. Pass --audit-side-effects to actually
+// probe them (most pay.sh services check x402 before any side effect,
+// but it's not universally guaranteed).
+//
+// Audit writes to catalog-audit.md. Audit surfaces hidden paid
+// endpoints the standard probe misses — e.g. paysponge/perplexity has
+// /search + /v1/agent + /v1/sonar + /v1/async/sonar, but standard mode
+// only captures one. Audit mode also takes longer (≈ services × avg
+// endpoints × politeness delay).
+//
 // Per BAT-582 v1.6 spirit: pay.sh ecosystem is moving fast; this script
 // surfaces drift across the WHOLE catalog (e.g. a new provider adopting
 // a v3 field shape) in one pass.
@@ -37,6 +58,10 @@ const { sanitize }      = require('./lib/sanitize');
 
 const CAPTURES_DIR = path.join(__dirname, 'captures', 'catalog');
 const SUMMARY_FILE = path.join(__dirname, 'catalog-summary.md');
+// BAT-706: audit mode probes every endpoint per service (vs the
+// standard mode which probes one). Writes to a separate file so we
+// don't churn the standard summary on every audit run.
+const AUDIT_FILE = path.join(__dirname, 'catalog-audit.md');
 
 // ── Static catalog (from solana-foundation/pay-skills `main` tree) ───────────
 // Each entry = one PAY.md path. service_url is fetched from the file
@@ -152,12 +177,29 @@ function _parseConcurrency(raw) {
 }
 
 function parseArgs(argv) {
-    const out = { concurrency: 5, commitCaptures: false, limit: 0, filter: null };
+    const out = {
+        concurrency: 5,
+        commitCaptures: false,
+        limit: 0,
+        filter: null,
+        audit: false,
+        // BAT-706 R2: by default, audit mode probes ONLY GET endpoints
+        // to avoid triggering server-side side effects on POST/PUT/PATCH/
+        // DELETE endpoints in the rare case the 402 check happens AFTER
+        // body processing. Pass --audit-side-effects to opt in to probing
+        // non-GET endpoints. POST in this codebase's other paid services
+        // (Reducto, 2captcha, etc.) checks payment before any side effect,
+        // but we can't assume that for every service in the upstream
+        // catalog — be polite by default.
+        auditSideEffects: false,
+    };
     for (let i = 2; i < argv.length; i++) {
         if (argv[i] === '--concurrency' && argv[i + 1]) { out.concurrency = _parseConcurrency(argv[++i]); }
         else if (argv[i] === '--commit-captures') out.commitCaptures = true;
         else if (argv[i] === '--limit' && argv[i + 1]) out.limit = parseInt(argv[++i], 10);
         else if (argv[i] === '--filter' && argv[i + 1]) out.filter = argv[++i];
+        else if (argv[i] === '--audit') out.audit = true;
+        else if (argv[i] === '--audit-side-effects') out.auditSideEffects = true;
     }
     return out;
 }
@@ -230,6 +272,37 @@ function _substituteParams(p) {
 }
 
 function _hasParam(p) { return /\{[^}]+\}|(^|\/):[a-zA-Z_][a-zA-Z0-9_]*/.test(p); }
+
+// BAT-706: extract ALL endpoints from an OpenAPI spec (not just one).
+// Used by audit mode (--audit) to surface hidden paid endpoints that
+// the single-endpoint probe (pickProbeEndpoint) would miss for
+// multi-endpoint providers like paysponge/perplexity (which exposes
+// /search, /v1/agent, /v1/sonar, /v1/async/sonar) or paysponge/coingecko
+// (/x402/simple/price, /x402/onchain/networks/{n}/trending_pools, etc.).
+//
+// Returns array of {method, path, hasParam} entries. Params are
+// stubbed with "probe" using the same _substituteParams helper that
+// pickProbeEndpoint uses for parametric paths.
+function extractAllEndpoints(openapi) {
+    const paths = openapi && openapi.paths;
+    if (!paths || typeof paths !== 'object') return [];
+    const out = [];
+    const seen = new Set();
+    for (const p of Object.keys(paths)) {
+        const ops = paths[p];
+        if (!ops || typeof ops !== 'object') continue;
+        for (const method of ['get', 'post', 'put', 'patch', 'delete']) {
+            if (!ops[method]) continue;
+            const hasParam = _hasParam(p);
+            const finalPath = hasParam ? _substituteParams(p) : p;
+            const key = `${method.toUpperCase()} ${finalPath}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push({ method: method.toUpperCase(), path: finalPath, hasParam, rawPath: p });
+        }
+    }
+    return out;
+}
 
 function pickProbeEndpoint(openapi) {
     // Strategy: prefer parameter-free GET, then parametric GET (stub
@@ -334,12 +407,24 @@ async function discoverOne(payMdPath) {
     const openapiUrl = serviceUrl.replace(/\/$/, '') + '/openapi.json';
     const oa = await fetchText(openapiUrl, 15000);
     let probePath = null, probeMethod = 'GET';
+    // R11-B1: cache the parsed openapi (or the error) so auditService can
+    // reuse it instead of re-fetching the same URL during Phase 2. This
+    // halves the openapi traffic and tightens the rate-limit posture.
+    let openapiCache = null;
+    let openapiError = null;
     if (oa.status === 200) {
         try {
             const openapi = JSON.parse(oa.body);
+            openapiCache = openapi;
             const picked = pickProbeEndpoint(openapi);
             if (picked) { probePath = picked.path; probeMethod = picked.method; }
-        } catch (_) { /* malformed openapi — fall through */ }
+        } catch (e) {
+            openapiError = `openapi parse failed: ${e.message}`;
+        }
+    } else {
+        openapiError = oa.error
+            ? `openapi fetch failed: ${oa.error}`
+            : `openapi fetch failed: status ${oa.status}`;
     }
     return {
         ok: true,
@@ -347,7 +432,9 @@ async function discoverOne(payMdPath) {
         serviceUrl,
         probeUrl: probePath ? (serviceUrl.replace(/\/$/, '') + probePath) : serviceUrl,
         probeMethod,
-        openapiOk: oa.status === 200,
+        openapiOk: oa.status === 200 && !openapiError,
+        openapi: openapiCache,
+        openapiError,
     };
 }
 
@@ -412,6 +499,154 @@ async function probeAndParse(disc, proto) {
     };
 }
 
+// BAT-706: audit one service by probing EVERY endpoint declared in its
+// openapi.json (not just the one pickProbeEndpoint would pick). Used by
+// --audit mode to surface hidden paid endpoints that the standard probe
+// would miss.
+//
+// SAFETY (R2): by default, skips non-GET endpoints to avoid triggering
+// server-side side effects. POST/PUT/PATCH/DELETE endpoints in the
+// upstream pay.sh catalog generally check the x402 payment BEFORE any
+// side effect runs, but we can't assume that universally — e.g. a
+// temporarily ungated POST that accepts an empty body would actually
+// execute when we probe. Pass --audit-side-effects to include them.
+//
+// RATE LIMIT (R3 #6 + R6): each service's endpoints are probed serially
+// with a 1000ms inter-request delay (POLITE_DELAY_MS). Pre-R3-fix this
+// was 150ms (~6-7 req/sec per service); R3 bumped to 1000ms to match
+// probe-all.js's contract.
+//
+// CAVEAT (R6): the rate limit is enforced PER SERVICE, not per HOST.
+// Different pay.sh services can share the same hostname — e.g. all 11
+// paysponge services use *.x402.paysponge.com or api.paysponge.com.
+// With the outer runWithConcurrency parallelizing across services, a
+// shared-host group under --concurrency=N can issue up to N req/sec to
+// that one host even though each individual service stays at 1 req/sec.
+//
+// Practical effect: for audits against multi-service hosts (paysponge,
+// merit-systems, alibaba.gateway-402, google.gateway-402), use
+// --concurrency 1 to enforce a true per-host 1 req/sec ceiling. With
+// --concurrency 4 (the documented default in some examples), the
+// per-host burst against api.paysponge.com can reach ~4 req/sec — still
+// within most rate-limit policies but stricter than the per-host contract.
+//
+// A proper per-host rate limiter (semaphore keyed by hostname) is
+// follow-up work; deferred to keep this script focused.
+//
+// Returns { disc, endpoints: [{ method, path, probeUrl, row, captured }] }
+// where each `row` mirrors what probeAndParse produces for one probe.
+async function auditService(disc, proto, opts = {}) {
+    const includeSideEffects = !!opts.auditSideEffects;
+    const POLITE_DELAY_MS = 1000;
+    const result = { disc, endpoints: [] };
+    if (!disc.ok) {
+        result.error = disc.error;
+        return result;
+    }
+    // R11-B1: reuse the openapi parsed during discoverOne (Phase 1).
+    // Pre-fix this re-fetched the same URL, doubling openapi traffic
+    // before any endpoint probes and bypassing per-service politeness.
+    // Now we just consume the cached parsed object or propagate the
+    // recorded error.
+    let openapi;
+    if (disc.openapi) {
+        openapi = disc.openapi;
+    } else if (disc.openapiError) {
+        result.error = disc.openapiError;
+        return result;
+    } else {
+        // Defensive: discoverOne should always set one of the two, but
+        // if it doesn't (e.g. a future refactor), fall back to a fresh
+        // fetch so audit doesn't silently drop the service.
+        const openapiUrl = disc.serviceUrl.replace(/\/$/, '') + '/openapi.json';
+        const oa = await fetchText(openapiUrl, 15000);
+        if (oa.status !== 200) {
+            result.error = oa.error
+                ? `openapi fetch failed: ${oa.error}`
+                : `openapi fetch failed: status ${oa.status}`;
+            return result;
+        }
+        try {
+            openapi = JSON.parse(oa.body);
+        } catch (e) {
+            result.error = `openapi parse failed: ${e.message}`;
+            return result;
+        }
+    }
+    const endpoints = extractAllEndpoints(openapi);
+    if (!endpoints.length) {
+        result.error = 'openapi has no endpoints';
+        return result;
+    }
+    // Probe each endpoint serially within this service (avoid hammering
+    // the same host). Outer runWithConcurrency parallelizes across
+    // services, not within one.
+    let isFirst = true;
+    for (const ep of endpoints) {
+        // R2 safety: skip non-GET unless explicitly opted in.
+        if (ep.method !== 'GET' && !includeSideEffects) {
+            result.endpoints.push({
+                ...ep,
+                probeUrl: disc.serviceUrl.replace(/\/$/, '') + ep.path,
+                row: { result: 'skipped:non_get_side_effect_risk' },
+            });
+            continue;
+        }
+        // R2 politeness: brief inter-request delay per service.
+        if (!isFirst) await sleep(POLITE_DELAY_MS);
+        isFirst = false;
+        const probeUrl = disc.serviceUrl.replace(/\/$/, '') + ep.path;
+        const probeOpts = { url: probeUrl, method: ep.method };
+        if (ep.method !== 'GET') probeOpts.body = {};
+        const captured = await probe(probeOpts);
+        if (captured.error) {
+            result.endpoints.push({ ...ep, probeUrl, row: { result: 'fetch_failed', detail: captured.reason || captured.error } });
+            continue;
+        }
+        const reqs = extractRequirements(captured);
+        const isV402 = captured.status === 402;
+        let detected = null, builtError = null, builtOk = false;
+        if (isV402) {
+            const response = { status: captured.status, bodyJson: captured.body, headers: captured.headers };
+            detected = proto.detect(response);
+            try {
+                const built = await proto.build(response, {
+                    burnerPubkey: TEST_BURNER_PUBKEY,
+                    maxUsdcAtomic: TEST_MAX_USDC_ATOMIC,
+                });
+                if (built && built.error) builtError = built.error;
+                else if (built && built.txBase64 && built.paymentMeta) builtOk = true;
+                else builtError = 'unexpected_shape';
+            } catch (e) {
+                builtError = `threw:${e.message.slice(0, 40)}`;
+            }
+        }
+        const altProto = isV402 ? detectAltProtocol(captured) : null;
+        let outcome;
+        if (!isV402) outcome = `http_${captured.status}`;
+        else if (builtOk) outcome = 'parsed_ok';
+        else if (altProto) outcome = `reject:${altProto}`;
+        else if (builtError) outcome = `reject:${builtError}`;
+        else outcome = 'detect_false';
+        result.endpoints.push({
+            ...ep,
+            probeUrl,
+            captured,
+            row: {
+                result: outcome,
+                httpStatus: captured.status,
+                delivery: reqs.delivery,
+                x402Version: reqs.x402Version,
+                networks: reqs.networks,
+                assets: reqs.assets,
+                amounts: reqs.amounts,
+                offerCount: reqs.offerCount,
+            },
+        });
+    }
+    return result;
+}
+
 async function runWithConcurrency(items, limit, fn) {
     const out = new Array(items.length);
     let idx = 0;
@@ -428,6 +663,160 @@ async function runWithConcurrency(items, limit, fn) {
 
 function fmtNetworks(ns) {
     return ns.map(n => n.startsWith('solana:') ? 'sol' : n.includes('eip155:8453') ? 'base' : n.split(':')[0] || n).join('+') || '—';
+}
+
+// BAT-706: write per-endpoint audit report.
+function writeAuditReport(auditResults, elapsedMs, opts = {}) {
+    const lines = [];
+    lines.push('# pay.sh catalog audit — multi-endpoint probe per service');
+    lines.push('');
+    lines.push(`Generated: ${new Date().toISOString()}`);
+    // R2 transparency: record the actual invocation so readers don't
+    // assume "audit" means full-catalog when it was filtered.
+    // R7: also record --concurrency since it affects per-host burst rate
+    // (per R6's per-service-not-per-host caveat); without it the audit
+    // run isn't reproducible or rate-reviewable from this Source line.
+    const filterNote = opts.filter ? ` --filter ${opts.filter}` : '';
+    const sideEffectsNote = opts.auditSideEffects ? ' --audit-side-effects' : '';
+    const limitNote = opts.limit ? ` --limit ${opts.limit}` : '';
+    const concurrencyNote = (typeof opts.concurrency === 'number') ? ` --concurrency ${opts.concurrency}` : '';
+    lines.push(`Source: probe-catalog.js --audit${concurrencyNote}${filterNote}${sideEffectsNote}${limitNote}`);
+    if (opts.filter) {
+        lines.push(`**Scope note**: this run was FILTERED to "${opts.filter}" — aggregate counts below are for the filtered subset, NOT the full ~72-service upstream catalog. Re-run without --filter for a full-catalog audit.`);
+    }
+    if (!opts.auditSideEffects) {
+        lines.push(`**Safety note**: non-GET endpoints were SKIPPED to avoid triggering server-side side effects. Use \`--audit-side-effects\` to include POST/PUT/PATCH/DELETE probes (most pay.sh services check x402 payment before any side effect runs, but it's not universally guaranteed).`);
+    }
+    lines.push('');
+
+    // R3 #1: separate buckets so skipped/fetch-failed don't get counted
+    // as live non-402 HTTP responses. Pre-fix any non-parsed_ok/non-reject
+    // result fell into notV402, including `skipped:non_get_side_effect_risk`
+    // (never probed) and `fetch_failed` (no HTTP response observed).
+    let totalEndpoints = 0;
+    let parsedOk = 0;
+    let rejected = 0;
+    let notV402 = 0;
+    let skipped = 0;
+    let fetchFailed = 0;
+    for (const r of auditResults) {
+        if (!r.endpoints) continue;
+        for (const e of r.endpoints) {
+            totalEndpoints++;
+            if (e.row.result === 'parsed_ok') parsedOk++;
+            else if (e.row.result.startsWith('reject:')) rejected++;
+            else if (e.row.result.startsWith('skipped:')) skipped++;
+            else if (e.row.result === 'fetch_failed') fetchFailed++;
+            else if (e.row.result.startsWith('http_')) notV402++;
+            else notV402++; // unknown classification — bucket conservatively
+        }
+    }
+
+    lines.push('## Aggregate');
+    lines.push('');
+    lines.push('| Metric | Count |');
+    lines.push('|--------|-------|');
+    lines.push(`| Services audited | ${auditResults.length} |`);
+    lines.push(`| Endpoints discovered (across all services) | ${totalEndpoints} |`);
+    lines.push(`| **Parsed OK** (Solana-USDC parseable 402) | ${parsedOk} |`);
+    lines.push(`| Rejected (402 but parser refused) | ${rejected} |`);
+    lines.push(`| Non-402 HTTP response (http_4xx/5xx/3xx/2xx) | ${notV402} |`);
+    lines.push(`| Skipped (non-GET, side-effect risk; opt in via --audit-side-effects) | ${skipped} |`);
+    lines.push(`| Fetch failed (DNS / TLS / timeout — no HTTP response) | ${fetchFailed} |`);
+    lines.push(`| Audit elapsed | ${(elapsedMs / 1000).toFixed(1)}s |`);
+    lines.push('');
+
+    // R2: section now honestly named — it's ALL parsed_ok endpoints, not
+    // pre-filtered against catalog-summary.md. Reader must cross-reference
+    // to find true "new candidates"; we don't auto-diff because catalog-
+    // summary entries are per-service (one URL each) while audit entries
+    // are per-endpoint, so the join isn't 1:1 trivial.
+    lines.push('## All parsed_ok endpoints from this audit run');
+    lines.push('');
+    lines.push('Every endpoint that parsed_ok with a Solana-USDC leg. This includes endpoints already in our standard catalog (`tests/paysh/catalog-summary.md`) AND endpoints we don\'t currently catalog. Cross-reference manually with catalog-summary.md to identify the audit\'s new discoveries (multi-endpoint providers like paysponge/perplexity and paysponge/rentcast typically show many endpoints here that catalog-summary records as only one per service).');
+    lines.push('');
+    lines.push('| Service | Method | Path | Networks | Asset | Amount | Result |');
+    lines.push('|---------|--------|------|----------|-------|--------|--------|');
+    for (const r of auditResults) {
+        if (!r.endpoints) continue;
+        for (const e of r.endpoints) {
+            if (e.row.result !== 'parsed_ok') continue;
+            const svc = r.disc.payMdPath ? r.disc.payMdPath.split('/').slice(1, -1).join('/') : '?';
+            const nets = fmtNetworks(e.row.networks || []);
+            // R4 #1: parsed_ok means proto.build() picked the Solana
+            // entry. Pre-fix the report rendered accepts[0] which is
+            // typically the Base/EVM offer (multi-chain pay.sh challenges
+            // list Base first), so rows tagged `parsed_ok` Solana-USDC
+            // showed Asset=EVM and could show the wrong amount when
+            // chains advertise different prices. Find the Solana index
+            // explicitly and use that for asset/amount display.
+            const networks = e.row.networks || [];
+            const solanaIdx = networks.findIndex(n => typeof n === 'string' && n.startsWith('solana:'));
+            const pickIdx = solanaIdx >= 0 ? solanaIdx : 0;
+            const asset = fmtAssetKind((e.row.assets || [])[pickIdx]);
+            const amount = fmtAmount(((e.row.amounts || [])[pickIdx]) !== undefined ? [(e.row.amounts || [])[pickIdx]] : []);
+            lines.push(`| ${svc} | ${e.method} | \`${e.path}\` | ${nets} | ${asset} | ${amount} | \`${e.row.result}\` |`);
+        }
+    }
+    lines.push('');
+
+    // Per-service errors (services where audit couldn't probe anything)
+    lines.push('## Audit errors (services where openapi.json was unreachable or empty)');
+    lines.push('');
+    let anyErrors = false;
+    for (const r of auditResults) {
+        if (r.error) {
+            const svc = r.disc.payMdPath ? r.disc.payMdPath.split('/').slice(1, -1).join('/') : '?';
+            lines.push(`- **${svc}**: ${r.error}`);
+            anyErrors = true;
+        }
+    }
+    if (!anyErrors) lines.push('_(none)_');
+    lines.push('');
+
+    // Per-service full results (every endpoint, every result code)
+    lines.push('## Full per-service breakdown');
+    lines.push('');
+    for (const r of auditResults) {
+        if (!r.endpoints || r.endpoints.length === 0) continue;
+        const svc = r.disc.payMdPath ? r.disc.payMdPath.split('/').slice(1, -1).join('/') : '?';
+        lines.push(`### ${svc}`);
+        lines.push('');
+        lines.push(`Service URL: \`${r.disc.serviceUrl}\``);
+        lines.push('');
+        lines.push('| Method | Path | Result | Networks | Amount |');
+        lines.push('|--------|------|--------|----------|--------|');
+        for (const e of r.endpoints) {
+            const nets = fmtNetworks(e.row.networks || []);
+            // R11-B2: match the parsed_ok summary table's Solana-index
+            // pickup. Pre-fix this rendered `amounts[0]` which is typically
+            // the Base/EVM offer (multi-chain pay.sh challenges list Base
+            // first); a row whose `parsed_ok` status came from the Solana
+            // leg could show a Base/EVM price. For non-parsed_ok rows
+            // (rejected / non-402 / skipped) Solana-index isn't meaningful
+            // — `findIndex` returns -1 and we fall back to amounts[0] as
+            // before, so reject diagnostics still render.
+            const networks = e.row.networks || [];
+            const solanaIdx = networks.findIndex(n => typeof n === 'string' && n.startsWith('solana:'));
+            const pickIdx = solanaIdx >= 0 ? solanaIdx : 0;
+            const amounts = e.row.amounts || [];
+            const amount = fmtAmount(amounts[pickIdx] !== undefined ? [amounts[pickIdx]] : amounts);
+            lines.push(`| ${e.method} | \`${e.path}\` | \`${e.row.result}\` | ${nets} | ${amount} |`);
+        }
+        lines.push('');
+    }
+
+    fs.writeFileSync(AUDIT_FILE, lines.join('\n') + '\n', 'utf8');
+    console.log(`\n═══ Audit summary ═══`);
+    console.log(`  services audited:      ${auditResults.length}`);
+    console.log(`  endpoints discovered:  ${totalEndpoints}`);
+    console.log(`  parsed_ok:             ${parsedOk}`);
+    console.log(`  rejected:              ${rejected}`);
+    console.log(`  non-402 HTTP:          ${notV402}`);
+    console.log(`  skipped (non-GET):     ${skipped}`);
+    console.log(`  fetch_failed:          ${fetchFailed}`);
+    console.log(`  elapsed:               ${(elapsedMs / 1000).toFixed(1)}s`);
+    console.log(`\n  Summary written to ${path.relative(process.cwd(), AUDIT_FILE)}`);
 }
 
 function fmtAssetKind(asset) {
@@ -479,13 +868,56 @@ async function main() {
     if (args.filter) workItems = workItems.filter(p => p.toLowerCase().includes(args.filter.toLowerCase()));
     if (args.limit > 0) workItems = workItems.slice(0, args.limit);
 
-    console.log(`═══ pay.sh catalog probe (${workItems.length} services, concurrency=${args.concurrency}) ═══\n`);
+    // R4 #2: status banner now reflects the actual scope. Default
+    // audit probes GET endpoints only; non-GET are listed-but-not-probed.
+    // Surface the side-effect flag state so operators don't assume a
+    // default `--audit` run exercised every endpoint.
+    let mode;
+    if (args.audit) {
+        mode = args.auditSideEffects
+            ? 'AUDIT (probe every endpoint per service incl POST/PUT/PATCH/DELETE — side-effects opt-in)'
+            : 'AUDIT (probe every GET endpoint per service; non-GET listed-but-skipped — pass --audit-side-effects to probe them)';
+    } else {
+        mode = 'STANDARD (probe one endpoint per service)';
+    }
+    console.log(`═══ pay.sh catalog probe — mode: ${mode} — ${workItems.length} services, concurrency=${args.concurrency} ═══\n`);
     console.log('Phase 1: discovering service URLs and probe endpoints from pay-skills repo…\n');
 
     const proto = new X402Protocol();
     const t0 = Date.now();
 
     const discoveries = await runWithConcurrency(workItems, args.concurrency, discoverOne);
+
+    if (args.audit) {
+        // BAT-706: audit mode. Probe every endpoint per service and
+        // write the full breakdown to catalog-audit.md. Does NOT
+        // touch catalog-summary.md (use STANDARD mode for that).
+        // R6: clarify scope when --audit-side-effects is OFF (default).
+        const phase2Msg = args.auditSideEffects
+            ? 'Phase 2 (audit): probing EVERY endpoint per service (no payment, --audit-side-effects ON)…\n'
+            : 'Phase 2 (audit): probing every GET endpoint per service; non-GET will be LISTED-BUT-SKIPPED (pass --audit-side-effects to probe them too)…\n';
+        console.log(phase2Msg);
+        const auditResults = [];
+        let svcDone = 0;
+        await runWithConcurrency(discoveries, args.concurrency, async (disc) => {
+            const r = await auditService(disc, proto, { auditSideEffects: args.auditSideEffects });
+            auditResults.push(r);
+            svcDone++;
+            const epCount = r.endpoints ? r.endpoints.length : 0;
+            const ok = r.endpoints ? r.endpoints.filter(e => e.row.result === 'parsed_ok').length : 0;
+            process.stdout.write(`\r  audited ${svcDone}/${discoveries.length} — last: ${disc.payMdPath ? disc.payMdPath.split('/').slice(1, -1).join('/') : '?'} (${ok}/${epCount} parsed_ok)            `);
+        });
+        process.stdout.write('\n\n');
+        // Re-order by input order
+        auditResults.sort((a, b) => discoveries.indexOf(a.disc) - discoveries.indexOf(b.disc));
+        writeAuditReport(auditResults, Date.now() - t0, {
+            filter: args.filter,
+            auditSideEffects: args.auditSideEffects,
+            limit: args.limit,
+            concurrency: args.concurrency,
+        });
+        return;
+    }
 
     console.log('Phase 2: probing each service (no payment)…\n');
 
