@@ -66,7 +66,7 @@ const tools = [
     },
     {
         name: 'daily_note',
-        description: 'Add a note to today\'s daily memory file. Use this for logging events, conversations, or daily observations.',
+        description: 'Add a note to today\'s daily memory file. Use this for logging events, conversations, or daily observations. Same secrets policy as `memory_save` — NEVER pass API keys, OAuth tokens, seed phrases, private keys, passwords, or auth headers through this tool; daily notes are plain-text on disk AND indexed into the SQL search DB. For API keys the user provides in chat, save to agent_settings.json under apiKeys.<service>; for higher-risk secrets (seed phrases, private keys, etc.), direct the user to Settings UI.',
         input_schema: {
             type: 'object',
             properties: {

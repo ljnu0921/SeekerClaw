@@ -161,8 +161,8 @@ SeekerClaw is an Android app built for the Solana Seeker phone (also works on an
 | `/approve` | Approve pending confirmation |
 | `/deny` | Deny pending confirmation |
 
-### Skills (20 bundled + 13 workspace, version-aware seeding)
-**Bundled skills (OpenClaw format, seeded by ConfigManager.kt with SHA-256 integrity + version tracking):** bookmark, briefing, calclaw (AI calorie tracker), calculator, crypto-prices, define, github, joke, movie-tv, netwatch (network monitoring & security audit), news, notes, quote, reminders, research, summarize, timer, todo, translate, weather
+### Skills (22 bundled + 13 workspace, version-aware seeding)
+**Bundled skills (OpenClaw format, seeded by ConfigManager.kt with SHA-256 integrity + version tracking):** bookmark, briefing, burner-wallet, calclaw (AI calorie tracker), calculator, crypto-prices, define, github, joke, movie-tv, netwatch (network monitoring & security audit), news, notes, paysh-catalog, quote, reminders, research, summarize, timer, todo, translate, weather
 **Workspace skills (agent-usable examples):** crypto-prices, device-status, dictionary, exchange-rates, github, location, movie-tv, phone-call, recipe, sms, solana-dapp, solana-wallet, speak
 **Skill format:** YAML frontmatter (name, description, version, emoji, requires) — see `SKILL-FORMAT.md`
 **Skill install** — `skill_install` tool to install skills from URL or Telegram file attachment, with diagnostics via `/skills` command
