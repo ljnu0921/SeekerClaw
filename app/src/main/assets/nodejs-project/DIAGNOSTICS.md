@@ -686,14 +686,17 @@ Both were red herrings — root cause was always "not enough USDC at the source.
 
 > All `<base>` placeholders below mean the actual service URL of the failing entry — derive it by reading `skills/paysh-catalog/catalog.json` and looking up `entries[].upstream_ref.service_url` for the matching `entries[].id`. Hosts vary across services (e.g. `https://stablecrypto.dev`, `https://api.crushrewards.dev`, `https://tripadvisor.x402.paysponge.com`); do not hardcode the paysponge subdomain pattern.
 
-### `agent_pay returned wrong/empty/error data after settle — gateway rejected the body or params (doc-vs-gateway divergence)`
-**Symptoms (POST and GET):** `agent_pay` succeeded the on-chain payment but the response is unusable. USDC was spent. Agent may retry once or twice (more burn) before falling back. Common forms:
-- HTTP 400/422 on a POST endpoint with body `{"error": "ids must be array"}` — sent strings where openapi declared `array<string>`.
-- HTTP 400 with `{"error": "Unknown field: pool_address"}` — used the upstream API's field name; the gateway renamed it (`pool_address` → `address`, `protocol` → `name`).
-- HTTP 400 with `{"error": "expected days to be string"}` — sent a number where openapi declared `string` (CoinGecko `days` is `"7"` not `7` through the gateway).
-- HTTP 400 on a GET endpoint (e.g., rentcast `/markets?city=Austin`) for a query param the gateway doesn't accept (only `zipCode`, `dataType`, `historyRange` are real).
-- HTTP 200 with garbage / silent wrong-shape data — gateway silently ignored unknown query params (common on GET endpoints that proxy upstream loosely).
-**Diagnosis:** The catalog markdown doc (`services/<id>.md`) was hand-written from the upstream API's public REST docs instead of the gateway's `openapi.json`. Gateways diverge from upstream in three structural ways: (1) arrays where upstream takes comma-separated strings, (2) string types where upstream takes numbers, (3) renamed field names. Fixed in PR #382 (stablecrypto POST bodies) and PR #383 (rentcast GET query params) by deriving every body/param table from the live `openapi.json`.
+### `agent_pay returned wrong/empty/error data after settle — investigate before retrying (could be gateway / doc-vs-gateway / app-level validation)`
+**Symptoms (POST and GET):** `agent_pay` succeeded the on-chain payment but the response is unusable. USDC was spent. The visible tool result will be one of:
+- `{ error: "settle_http_error", reason: "server returned <status> after payment" }` — the gateway returned 4xx after settle. **The response body is NOT surfaced to the agent today** (x402.js:1416 discards it). The agent has only the status code; it cannot read the gateway's specific complaint inline. Follow-up to extend the existing `payment_rejected.diag.bodyHead` pattern (x402.js:1403–1413) to the general 4xx case is tracked separately.
+- HTTP 200 with garbage / silent wrong-shape data — gateway silently ignored unknown query params (common on GET endpoints that proxy upstream loosely). The body IS returned in this case; the agent can inspect what it got back.
+
+Because the agent can't see WHY the server complained on a 4xx, the right next step is always **stop, do not auto-retry, surface the failure to the user** — not "guess at the cause." Causes you cannot distinguish without the body include:
+- **Doc-vs-gateway divergence** (the bug class that motivated PR #382 / #383). Catalog body/param shape diverges from the gateway openapi (arrays vs strings, string-typed numbers, renamed fields).
+- **Application-level validation.** Body/params match the openapi schema fine, but the request itself is invalid: 2captcha rejects an unsupported CAPTCHA task type, reducto rejects an unreachable document URL, textbelt-sms rejects an invalid phone number, perplexity-agent rejects a missing `model`/`models`/`preset`.
+- **Gateway transient error.** 5xx surfacing as 4xx, brief throttling, etc.
+
+**Diagnosis:** The catalog markdown doc (`services/<id>.md`) is hand-written, but the v2 cleanup (PR #382 stablecrypto, PR #383 rentcast) derived every body/param table from the live `openapi.json`. If the failing entry was touched in v2, the catalog shape is likely right and you're seeing app-level validation. If it predates v2 or hasn't been verified, openapi check below.
 **Fix (runnable via agent tools — `shell_exec` rejects `|` and `jq` is not in the allowlist; `web_fetch` THROWS on non-2xx so it can't read 402 bodies either. The right tool here is `js_eval` driving `require('https')` directly, which gives full status/header/body access in one call):**
 1. Look up the entry's service URL: `read skills/paysh-catalog/catalog.json`, find your `entries[].id`, copy its `upstream_ref.service_url`. Call this `<base>`.
 2. Fetch + inspect the openapi schema in one `js_eval` call:
@@ -717,12 +720,11 @@ Both were red herrings — root cause was always "not enough USDC at the source.
      }).on('error', reject);
    });
    ```
-   If the host doesn't expose `/openapi.json` (returns 404), the catalog entry's `verification.last_capture_path` may have the schema baked into the committed 402 capture as `extensions.bazaar.schema` — `read tests/paysh/captures/...` as a fallback.
+   If the host doesn't expose `/openapi.json` (returns 404), the schema may live inside the committed 402 capture as `extensions.bazaar.schema`. That capture file (`tests/paysh/captures/...`) is in the source tree, NOT in the on-device workspace — the `read` tool can't reach it from the device. Maintainer-only fallback: developers checking diagnosis off-device can read it via the source tree. From the device, fall back to step 4 below.
 4. Compare `required[]` and `properties{}` (POST) or `parameters[]` (GET) against the body/params the agent_pay call sent. The truth is on the gateway, not on CoinGecko/DefiLlama/Rentcast/etc. public REST docs.
-5. Re-issue the call with the openapi-correct shape (arrays as arrays, string-typed numbers as quoted strings, gateway-named fields).
+5. Re-issue the call with the openapi-correct shape (arrays as arrays, string-typed numbers as quoted strings, gateway-named fields) — but **only after confirming with the user that you want to spend more USDC on a retry**. Don't silently re-burn.
 6. If the catalog doc itself is wrong, that's a maintainer fix (rewrite `services/<id>.md` like PR #382/#383 did, bump `paysh-catalog/SKILL.md` version so `ConfigManager.seedSkill()` re-seeds existing devices). The agent can flag this to the user but should not edit catalog docs from chat.
-7. Passthrough exception (GET only): some gateways (tripadvisor, wolframalpha) declare ZERO query params in their openapi yet accept them as upstream passthrough — for THOSE GET endpoints the doc is the source of truth. This exception does NOT apply to POST endpoints (2captcha, reducto, perplexity, textbelt-sms, stablecrypto, etc.): their POST body **shapes** are openapi-verified, so a body shape outside the schema would be a real shape bug.
-8. POST 4xx that ISN'T a shape bug: a POST request whose body matches the openapi schema can still return 400/422 for application-level validation reasons — 2captcha rejects an unsupported CAPTCHA task type, reducto rejects an unreachable document URL, textbelt-sms rejects an invalid phone number, perplexity-agent rejects a missing `model`/`models`/`preset`. Diagnose those by reading the error body — they have a specific message rather than a generic "field type" complaint. Don't treat them as catalog bugs.
+7. Passthrough exception (GET only): some gateways (tripadvisor, wolframalpha) declare ZERO query params in their openapi yet accept them as upstream passthrough — for THOSE GET endpoints the doc is the source of truth. This exception does NOT apply to POST endpoints (2captcha, reducto, perplexity, textbelt-sms, stablecrypto, etc.): their POST body **shapes** are openapi-verified, so a body outside the schema would be a real shape bug.
 
 ### `agent autonomously paid for trivia / activated paysh-catalog without an explicit pay-intent keyword`
 **Symptoms:** User asks a factual/trivia question (e.g., "what is the price of SOL", "what's the mass of the sun") and the agent calls `agent_pay` burning USDC, instead of using free tools (`solana_price`, training data, `web_search`).
@@ -755,17 +757,23 @@ Both were red herrings — root cause was always "not enough USDC at the source.
          // stablecrypto) deliver the challenge SOLELY in the header
          // with an empty body; pure body-only parsing misses those.
          let accepts = [];
-         try { const j = JSON.parse(body); accepts = j.accepts || j.paymentRequirements || []; } catch(_) {}
+         let source = null;
+         try {
+           const j = JSON.parse(body);
+           accepts = j.accepts || j.paymentRequirements || [];
+           if (accepts.length) source = 'body';
+         } catch(_) {}
          const hdr = res.headers['payment-required'];
          if (!accepts.length && hdr) {
            try {
              const decoded = JSON.parse(Buffer.from(hdr, 'base64').toString('utf8'));
              accepts = decoded.accepts || decoded.paymentRequirements || [];
+             if (accepts.length) source = 'header';
            } catch(_) {}
          }
          const solana = accepts.find(a => (a.network||'').startsWith('solana:') || a.network === 'solana');
          const amount = solana ? (solana.amount || solana.maxAmountRequired) : null;
-         console.log(JSON.stringify({ status: res.statusCode, solanaAmount: amount, source: accepts === (res.headers['payment-required'] ? [] : accepts) ? 'body' : (hdr ? 'header' : 'body') }, null, 2));
+         console.log(JSON.stringify({ status: res.statusCode, solanaAmount: amount, source }, null, 2));
          resolve();
        });
      });

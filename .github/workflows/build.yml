@@ -69,6 +69,7 @@ jobs:
             caps-preflight \
             confirmation-policy \
             confirmation-policy-burner \
+            system-prompt-wallets \
             wallet-registry \
             wallet-set-caps-errors \
             x402 \

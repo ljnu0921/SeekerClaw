@@ -204,8 +204,14 @@ check('burner configured: prompt lists both Burner and Main with caps + network'
         'must include "Multi-call composition" transparency hint (SAB-AUDIT-v27 A1)');
     assert.ok(stable.includes('do NOT auto-retry') || stable.includes('DO NOT auto-retry'),
         'must instruct agent NOT to auto-retry on HTTP 4xx after settle (SAB-AUDIT-v27 A1)');
-    assert.ok(stable.includes('DIAGNOSTICS'),
-        'must reference DIAGNOSTICS as the door for the agent\'s self-troubleshooting after a paid call fails');
+    // Assert on the paid-APIs-specific door to DIAGNOSTICS, not a generic
+    // DIAGNOSTICS reference — the prompt has a separate generic "see
+    // DIAGNOSTICS.md" line in the Diagnostics section which would let this
+    // pass even if the paid-API guidance dropped its DIAGNOSTICS pointer.
+    // Lock the verbatim phrase "DIAGNOSTICS.md → \"paysh-catalog\"" so the
+    // paid-call failure path stays explicitly wired to that section.
+    assert.ok(stable.includes('DIAGNOSTICS.md → "paysh-catalog"'),
+        'must reference DIAGNOSTICS.md → "paysh-catalog" specifically as the door for post-paid-call-failure self-troubleshooting');
 });
 
 // ── Burner UNCONFIGURED → single-wallet section + Settings hint ─────────────
