@@ -1,7 +1,7 @@
 ---
 name: paysh-catalog
 description: "Catalog of pay.sh services payable via agent_pay (x402). OPT-IN ONLY — activate when the user explicitly invokes pay.sh / paysh / x402 / 'pay for'. Stay dormant otherwise; defer to free tools. Full keyword list and policy in SKILL.md body."
-version: "1.4.0"
+version: "1.5.0"
 metadata:
   openclaw:
     emoji: "🛒"
@@ -89,7 +89,7 @@ Why it activates: contains `pay.sh` + naming a paid lookup.
 
 User: *"What can you pay for?"*
 
-Why it activates: matches the capability-ask phrase *"what can you pay for"*. (NOT every message containing the word "pay" — only the specific capability-ask phrases listed in the opt-in section above.) Agent reads `catalog.json`, lists the 9 supported services with costs, mentions the 63 known-but-not-usable ones. No `agent_pay` call.
+Why it activates: matches the capability-ask phrase *"what can you pay for"*. (NOT every message containing the word "pay" — only the specific capability-ask phrases listed in the opt-in section above.) Agent reads `catalog.json`, lists the 11 supported entries (across 10 services — perplexity has 2 endpoints, all others 1) with costs, mentions the 63 known-but-not-usable ones. No `agent_pay` call.
 
 ### Does NOT activate → vanilla answer
 
@@ -107,7 +107,7 @@ Why it stays dormant: not an x402 query at all. Use `solana_balance` directly. T
 
 ## Reading the catalog efficiently
 
-`catalog.json` is small (currently 9 entries, ~10KB in v2 schema). Always load it first to pick the entry. Then `read` only the matching `entry.doc_file` — never load every services/*.md at once. That's the whole point of the per-entry / per-service-doc layout.
+`catalog.json` is small (currently 11 entries across 10 services, ~12KB in v2 schema — perplexity has 2 endpoints catalogued, others have 1 each). Always load it first to pick the entry. Then `read` only the matching `entry.doc_file` — never load every services/*.md at once. That's the whole point of the per-entry / per-service-doc layout.
 
 v2 schema (see `SCHEMA.md` in this folder for the full spec):
 - One entry per ENDPOINT (not per service) — a service exposing N catalogued endpoints has N entries, all sharing the same `service_id`
@@ -137,7 +137,7 @@ Six reason buckets:
 | `endpoint_not_402_at_probe` | Service is listed upstream but our probe got a non-402 HTTP status (4xx/5xx/200/301) — likely broken, moved, or auth-gated differently. Each entry's `note` records the probe-time status code | Re-probe via `tests/paysh/probe-catalog.js` if pay.sh announces the endpoint is back |
 | `unverified_paid_response_shape` | Paid endpoint exists and parses OK, but available evidence about the response shape is contested or absent (e.g. openapi declares one content-type while product-family inference suggests another). Distinct from `requires_binary_response` — we only assert binary when evidence clearly points there. Conservative refuse pending paid-response capture | BAT-708 — paid-response capture + classification before catalog inclusion |
 
-Some `endpoint_not_402_at_probe` and `invalid_demand` entries also carry BAT-706 audit notes about **sibling endpoints on the same host** that ARE payable but aren't catalogued yet (e.g. paysponge/perplexity, paysponge/nyne). Deferred to BAT-708. Read each entry's `note` field — it tells you whether the audit found more.
+Some `endpoint_not_402_at_probe` and `invalid_demand` entries also carry BAT-706 audit notes about **sibling endpoints on the same host** that ARE payable but aren't catalogued yet (e.g. paysponge/nyne person-search endpoints — deferred to BAT-772 Tier 2c). Each pending endpoint's `deferred_to` field is either a BAT-XXX follow-up ticket id, or `null` when the endpoint is unscheduled (no ticket yet — known to exist, but no decision on when/how to catalog). Read each entry's `note` field — it tells you whether the audit found more and what their status is. (Note: paysponge/perplexity also had audit-discovered siblings; BAT-769 promoted /search and /v1/agent to the catalog, leaving only /v1/async/sonar in audit_pending as unscheduled.)
 
 **NEVER call `agent_pay` on a service in `unsupported.json`.** Reasons and what to tell the user:
 

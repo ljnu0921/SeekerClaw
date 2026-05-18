@@ -175,11 +175,9 @@ Six buckets in v2 (carried from v1 PR #378 R10 state):
     "last_captured_at": null,
     "probe_status": "http_200"
   },
-  "note": "Catalog-listed endpoint returned http_200 — non-402. Sibling endpoints found by BAT-706 audit are listed in audit_pending.",
+  "note": "Catalog-listed endpoint returned http_200 — non-402. Sibling endpoints found by BAT-706 audit: /search and /v1/agent catalogued in BAT-769; /v1/async/sonar remains in audit_pending below (unscheduled — needs async-fetch pattern).",
   "audit_pending": [
-    { "method": "POST", "path": "/search", "cost_usdc": 0.01, "deferred_to": "BAT-769" },
-    { "method": "POST", "path": "/v1/agent", "cost_usdc": 0.01, "deferred_to": "BAT-769" },
-    { "method": "POST", "path": "/v1/async/sonar", "cost_usdc": 0.01, "deferred_to": "BAT-769" }
+    { "method": "POST", "path": "/v1/async/sonar", "cost_usdc": 0.01, "deferred_to": null }
   ]
 }
 ```
@@ -192,7 +190,7 @@ Required: same `id`/`service_id`/`name`/`upstream_ref`/`endpoint`/`verification`
 |---|---|---|
 | `evidence_basis` | enum | For `requires_binary_response` and `unverified_paid_response_shape` only. Values: `paid-response-observed` (settled + observed binary), `openapi-response-content-type` (openapi `responses` declares image/* / video/* / audio/* / application/octet-stream), `product-family-inference` (service's published product is image/video gen — weakest evidence, conservative refuse). Introduced PR #378 R10 — preserve from v1 migration. |
 | `note` | string (markdown) | Free-form per-entry explanation. Useful for documenting specific HTTP error codes, audit findings, deferred BAT pointers. Distinct from the bucket-wide `reasons[<bucket>].explanation` — the note is entry-specific. |
-| `audit_pending` | array | Lists sibling endpoints found by the BAT-706 audit that aren't catalogued. Each entry: `{method, path, cost_usdc, deferred_to: "BAT-XXX"}`. Empty array (or omitted) if the audit found no extras. As endpoints get promoted to catalog.json, drop them from this list. |
+| `audit_pending` | array | Lists sibling endpoints found by the BAT-706 audit that aren't catalogued. Each entry: `{method, path, cost_usdc, deferred_to: "BAT-XXX" \| null}`. `deferred_to` is a BAT ticket id when a follow-up exists, OR `null` when the endpoint is unscheduled (no ticket yet — we know it's there, but haven't decided when/how to catalog it). Empty array (or omitted) if the audit found no extras. As endpoints get promoted to catalog.json, drop them from this list. When a `null`-deferred endpoint gets a ticket, update its `deferred_to` to the ticket id. |
 
 ### Catalog ↔ unsupported lifecycle
 
@@ -281,7 +279,7 @@ Validation failure aborts the migration run and prints which entry/field failed.
 
 Existing user devices have v1 catalog files in `workspace/skills/paysh-catalog/`. The plan:
 
-1. Bump `SKILL.md` frontmatter `version: "1.3.0"` → `"1.4.0"` — triggers `ConfigManager.seedSkill()` re-seed per the BAT-699 R6 pattern
+1. Bump `SKILL.md` frontmatter `version` on EVERY catalog-affecting change — triggers `ConfigManager.seedSkill()` re-seed per the BAT-699 R6 pattern. Version history: `1.3.0` (BAT-704 opt-in gate, last v1 schema) → `1.4.0` (BAT-761 v2 schema migration) → `1.5.0` (BAT-769 perplexity catalog entries) → bump again on the next catalog change (BAT-766, BAT-768, etc.). On every future catalog edit, bump the version so existing installs re-seed.
 2. seedSkill uses the existing stage-then-swap atomicity (BAT-699 R7) to swap v1 → v2 files
 3. User-added catalog entries (rare but possible) are preserved by the stage-then-swap merge logic
 4. Agent in `SKILL.md` body explicitly handles v2 schema (no v1 readers in the agent — re-seed is mandatory)

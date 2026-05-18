@@ -39,6 +39,18 @@ const HEADER_DENYLIST = new Set([
     // for any settle-success captures we add later.
     'x-payment',
     'payment-signature',
+    // BAT-769 R2-1/R2-2: transport-noise headers that embed URL-token identifiers
+    // the long-base64 redactor misses because of `s=` lookbehind interaction
+    // (the `=` in `?s=` is in the base64 alphabet so the negative lookbehind
+    // blocks the match start). These headers carry zero protocol value for
+    // x402 fixtures. Header VALUES become "[REDACTED]" via the HEADER_DENYLIST
+    // path in sanitizeHeaders() — the header KEY stays in the fixture so a
+    // reviewer can still see which transport-noise headers were present (and
+    // that we intentionally scrubbed them, vs forgot to capture them).
+    'report-to',     // W3C Reporting API; URL has `?s=<token>` Cloudflare NEL identifier
+    'nel',           // Network Error Logging policy
+    'rndr-id',       // Render.com request id
+    'x-render-origin-server',
 ]);
 
 const PHONE_RE = /\+\d{6,}/g;
@@ -151,6 +163,18 @@ function sanitizeString(s, opts = {}) {
     }
     out = out.replace(SECRET_PREFIX_RE, REDACTED);
     if (!opts.preserveBase64Hex) {
+        // R6-1 final decision: NO JSON Schema $ref exception. Earlier R2-5
+        // added one (skip redaction for `^#\/[A-Za-z0-9/_-]+$` strings) so
+        // legitimate $refs like `#/components/schemas/FunctionCallOutputInput`
+        // wouldn't be over-redacted by LONG_BASE64_RE. R5-2 narrowed it to
+        // ≤128 chars to close one attack vector. R6-1 surfaced that even
+        // 128 chars is enough to hide a real secret in a path-shaped wrapper
+        // (e.g. `#/components/schemas/<40+ char base64 token>` totals ~62
+        // chars, well under the cap). The honest security trade-off is to
+        // accept over-redaction of $refs — fixtures lose schema-ref aesthetics
+        // but x402 protocol verification still works (X402_PUBLIC_FIELDS
+        // allowlist preserves the fields validators actually read).
+        //
         // BAT-582 R25 (order matters): apply LONG_BASE64_RE FIRST so a
         // base64 token like "AAAA...AAAA==" (which is also valid hex up
         // to the padding) is captured WITH its `=` padding in one
