@@ -682,3 +682,110 @@ Both were red herrings — root cause was always "not enough USDC at the source.
 1. Run `wallet_status` to show the current caps + remaining daily.
 2. Suggest `wallet_set_caps({per_tx_usdc: "..."})` (always with user confirmation) OR wait for daily reset at 00:00 UTC.
 
+## paysh-catalog (BAT-704/761/768/766/769)
+
+> All `<base>` placeholders below mean the actual service URL of the failing entry — derive it by reading `skills/paysh-catalog/catalog.json` and looking up `entries[].upstream_ref.service_url` for the matching `entries[].id`. Hosts vary across services (e.g. `https://stablecrypto.dev`, `https://api.crushrewards.dev`, `https://tripadvisor.x402.paysponge.com`); do not hardcode the paysponge subdomain pattern.
+
+### `agent_pay returned wrong/empty/error data after settle — investigate before retrying (could be gateway / doc-vs-gateway / app-level validation)`
+**Symptoms (POST and GET):** `agent_pay` succeeded the on-chain payment but the response is unusable. USDC was spent. The visible tool result will be one of:
+- `{ error: "settle_http_error", reason: "server returned <status> after payment" }` — the gateway returned any status ≥ 400 after settle (covers 4xx AND 5xx — x402.js:1416 fires on `resp.status >= 400`). **The response body is NOT surfaced to the agent today** (x402.js:1416 discards it). The agent has only the status code; it cannot read the gateway's specific complaint inline. Follow-up to extend the existing `payment_rejected.diag.bodyHead` pattern (x402.js:1403–1413) to the general ≥400 case is tracked separately.
+- HTTP 200 with garbage / silent wrong-shape data — gateway silently ignored unknown query params (common on GET endpoints that proxy upstream loosely). The body IS returned in this case; the agent can inspect what it got back.
+
+Because the agent can't see WHY the server complained on a ≥400, the right next step is always **stop, do not auto-retry, surface the failure to the user** — not "guess at the cause." Causes you cannot distinguish without the body include:
+- **Doc-vs-gateway divergence** (the bug class that motivated PR #382 / #383). Catalog body/param shape diverges from the gateway openapi (arrays vs strings, string-typed numbers, renamed fields). Typically surfaces as 4xx with a shape-validation error.
+- **Application-level validation.** Body/params match the openapi schema fine, but the request itself is invalid: 2captcha rejects an unsupported CAPTCHA task type, reducto rejects an unreachable document URL, textbelt-sms rejects an invalid phone number, perplexity-agent rejects a missing `model`/`models`/`preset`. Typically 4xx.
+- **Gateway 5xx or transient error.** Upstream blip, brief throttling, deploy mid-call. Typically 5xx; same `settle_http_error` shape reaches the agent because x402 doesn't distinguish 4xx from 5xx in its error code.
+
+**Diagnosis:** The catalog markdown doc (`services/<id>.md`) is hand-written, but the v2 cleanup (PR #382 stablecrypto, PR #383 rentcast) derived every body/param table from the live `openapi.json`. If the failing entry was touched in v2, the catalog shape is likely right and you're seeing app-level validation. If it predates v2 or hasn't been verified, openapi check below.
+**Fix (runnable via agent tools — `shell_exec` rejects `|` and `jq` is not in the allowlist; `web_fetch` THROWS on non-2xx so it can't read 402 bodies either. The right tool here is `js_eval` driving `require('https')` directly, which gives full status/header/body access in one call):**
+1. Look up the entry's service URL: `read skills/paysh-catalog/catalog.json`, find your `entries[].id`, copy its `upstream_ref.service_url`. Call this `<base>`.
+2. Fetch + inspect the openapi schema in one `js_eval` call:
+   ```js
+   const https = require('https');
+   const url = new URL('<base>/openapi.json');
+   await new Promise((resolve, reject) => {
+     https.get({ hostname: url.hostname, path: url.pathname, headers: { 'user-agent': 'seekerclaw-diag' } }, (res) => {
+       let body = ''; res.on('data', c => body += c); res.on('end', () => {
+         try {
+           const oa = JSON.parse(body);
+           const p = oa.paths?.['<path>'];
+           // POST: required[] + properties{} of the JSON body schema
+           const post = p?.post?.requestBody?.content?.['application/json']?.schema;
+           // GET: parameters[] array
+           const get = p?.get?.parameters;
+           console.log(JSON.stringify({ status: res.statusCode, post, get }, null, 2));
+           resolve();
+         } catch (e) { console.log('parse failed status=' + res.statusCode + ' body[0..200]=' + body.slice(0,200)); resolve(); }
+       });
+     }).on('error', reject);
+   });
+   ```
+   If the host doesn't expose `/openapi.json` (returns 404), the schema may live inside the committed 402 capture as `extensions.bazaar.schema`. That capture file (`tests/paysh/captures/...`) is in the source tree, NOT in the on-device workspace — the `read` tool can't reach it from the device. **From the device, you cannot verify the schema here.** Stop, surface the failure to the user, and ask them to escalate to the project maintainer (who can read the source-tree capture or the upstream openapi off-device); do NOT silently retry with a guessed shape.
+3. Compare `required[]` and `properties{}` (POST) or `parameters[]` (GET) against the body/params the agent_pay call sent. The truth is on the gateway, not on CoinGecko/DefiLlama/Rentcast/etc. public REST docs.
+4. Re-issue the call with the openapi-correct shape (arrays as arrays, string-typed numbers as quoted strings, gateway-named fields) — but **only after the user explicitly authorizes another paid call** (the previous attempt already cost USDC; a retry is the user's spending decision, not yours). Don't silently re-burn.
+5. If the catalog doc itself is wrong, that's a maintainer fix (rewrite `services/<id>.md` like PR #382/#383 did, bump `paysh-catalog/SKILL.md` version so `ConfigManager.seedSkill()` re-seeds existing devices). The agent can flag this to the user but should not edit catalog docs from chat.
+6. Passthrough exception (GET only): some gateways (tripadvisor, wolframalpha) declare ZERO query params in their openapi yet accept them as upstream passthrough — for THOSE GET endpoints the doc is the source of truth. This exception does NOT apply to POST endpoints (2captcha, reducto, perplexity, textbelt-sms, stablecrypto, etc.): their POST body **shapes** are openapi-verified, so a body outside the schema would be a real shape bug.
+
+### `agent autonomously paid for trivia / activated paysh-catalog without an explicit pay-intent keyword`
+**Symptoms:** User asks a factual/trivia question (e.g., "what is the price of SOL", "what's the mass of the sun") and the agent calls `agent_pay` burning USDC, instead of using free tools (`solana_price`, training data, `web_search`).
+**Diagnosis:** BAT-704 regression. The paysh-catalog skill is OPT-IN — it should activate ONLY when the user's message contains an explicit pay-intent keyword: `pay.sh` / `paysh` / `pay sh` / `x402` / `pay for X` / `pay to X` / `use pay` / `pay <service>` / `use <service> to pay` / `look this up paid` / `fetch this paid` / `buy data from <service>`, plus the capability-ask phrases "what can you pay for", "show me pay.sh services", "list paid services". If the agent reaches for `agent_pay` without one of these triggers in the user's message, it's violating the opt-in policy. Common causes:
+- Skill `paysh-catalog/SKILL.md` corrupted or older version (pre-BAT-704) re-seeded after a workspace reset
+- Agent over-matched a non-pay keyword (e.g., treated "what's the price of SOL" as a pay intent because `solana_price` momentarily wasn't loading)
+- `agent_pay` invoked from a `[skill just installed]` follow-up that the agent treated as authorization
+**Fix:**
+1. Check the skill version: `read skills/paysh-catalog/SKILL.md` — frontmatter `version:` should be `>= "1.1.0"` (BAT-704 opt-in shipped in 1.1.0). If lower, the skill predates the opt-in rule.
+2. Check the prompt door is intact: read the system prompt's Wallets section (visible to you in this turn) — look for the "Paysh-catalog is OPT-IN" paragraph and its keyword list. If it's missing, the build regressed and the user needs a fresh APK.
+3. Apologize and explain — do NOT attempt any kind of refund transfer. The agent has no refund tool, no treasury, and no entitlement to spend from any other wallet. The user's USDC is gone; only the operator can issue an out-of-band refund. Tell the user explicitly what happened ("I called a paid endpoint without your authorization — that violates the opt-in policy") and how to avoid it (use a free tool name, or explicitly say "no paying"). If the user asks for a refund, direct them to contact the project maintainer; do NOT initiate any transfer from any wallet to "make it right."
+4. If the agent persistently auto-activates: report the trigger phrase that mismatched so it can be added to the don't-match list in SKILL.md.
+
+### `paid more than the catalog cost_usdc said (cost discrepancy)`
+**Symptoms:** Agent reply says "Paid: $0.02 USDC" but the user expected $0.01 (matching `catalog.json` `cost_usdc`). The transaction succeeded; the question is just where the extra cost came from.
+**Diagnosis:** Two real possibilities and one rare one:
+1. **Multi-call composition (most common).** Agent issued multiple paid calls to assemble one answer. Example: a "rent trends for ZIP X" reply that includes per-bedroom breakdown likely called `/markets` (current trends) + `/listings/rental/long-term` (to bucket by bedroom count), 2 × $0.01 = $0.02. This is correct agent behavior — but it should be transparent in the reply.
+2. **Stale `cost_usdc` in catalog.** The endpoint actually charges more than the catalog recorded during BAT-706 audit. Verify by live-probing the 402 — `<base>` is the entry's `upstream_ref.service_url` from `catalog.json`, `<path>` is `endpoint.path` **with any `{param}` placeholders substituted with real values** (tripadvisor location-details/reviews/photos use `/api/v1/location/{locationId}/...` — probing the literal `{locationId}` will 404 instead of returning the 402 challenge), and the probe method must match `endpoint.method`. Use `js_eval` with `require('https')` (NOT `shell_exec` curl-pipe-jq — shell_exec rejects `|` and `jq` isn't allowlisted; NOT `web_fetch` either — it throws on non-2xx so it never returns the 402 body or `payment-required` header):
+   ```js
+   const https = require('https');
+   const url = new URL('<base><path>');
+   const method = 'GET';  // or 'POST' — match catalog.json endpoint.method
+   const opts = { hostname: url.hostname, path: url.pathname + (url.search||''), method, headers: { 'user-agent': 'seekerclaw-diag' } };
+   if (method === 'POST') opts.headers['content-type'] = 'application/json';
+   await new Promise((resolve, reject) => {
+     const req = https.request(opts, (res) => {
+       let body = ''; res.on('data', c => body += c); res.on('end', () => {
+         // Pick the Solana leg from BOTH body.accepts[] AND the
+         // payment-required response header — some gateways (e.g.
+         // stablecrypto) deliver the challenge SOLELY in the header
+         // with an empty body; pure body-only parsing misses those.
+         let accepts = [];
+         let source = null;
+         try {
+           const j = JSON.parse(body);
+           accepts = j.accepts || j.paymentRequirements || [];
+           if (accepts.length) source = 'body';
+         } catch(_) {}
+         const hdr = res.headers['payment-required'];
+         if (!accepts.length && hdr) {
+           try {
+             const decoded = JSON.parse(Buffer.from(hdr, 'base64').toString('utf8'));
+             accepts = decoded.accepts || decoded.paymentRequirements || [];
+             if (accepts.length) source = 'header';
+           } catch(_) {}
+         }
+         const solana = accepts.find(a => (a.network||'').startsWith('solana:') || a.network === 'solana');
+         const amount = solana ? (solana.amount || solana.maxAmountRequired) : null;
+         console.log(JSON.stringify({ status: res.statusCode, solanaAmount: amount, source }, null, 2));
+         resolve();
+       });
+     });
+     req.on('error', reject);
+     if (method === 'POST') req.write('{}');
+     req.end();
+   });
+   ```
+   `solanaAmount` is in USDC atomic units (6 decimals): `"10000"` = $0.01, `"20000"` = $0.02. If the live amount > catalog `cost_usdc`, the catalog is stale — flag for maintainer to update.
+3. **(Rare) Gateway promoted the endpoint to a tiered cost** based on response size or query complexity. Some pay.sh services do this; the live 402 will show the higher amount.
+**Fix:**
+1. In the agent's reply, ALWAYS surface multi-call composition transparently: "Paid $0.02 across 2 calls (`/markets` + `/listings/rental/long-term`)" rather than just "Paid $0.02". Users can't tell otherwise.
+2. If the live probe confirms the catalog is stale, tell the user "the recorded price ($0.01) is out of date — actual is $0.02. I'll flag this for the maintainer." Don't refuse the call retroactively (it already settled).
+3. Maintainer-side fix: update `catalog.json` `entries[].endpoint.cost_usdc` for the affected entry, bump `paysh-catalog/SKILL.md` version so devices re-seed.
+

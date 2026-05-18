@@ -161,8 +161,8 @@ SeekerClaw is an Android app built for the Solana Seeker phone (also works on an
 | `/approve` | Approve pending confirmation |
 | `/deny` | Deny pending confirmation |
 
-### Skills (20 bundled + 13 workspace, version-aware seeding)
-**Bundled skills (OpenClaw format, seeded by ConfigManager.kt with SHA-256 integrity + version tracking):** bookmark, briefing, calclaw (AI calorie tracker), calculator, crypto-prices, define, github, joke, movie-tv, netwatch (network monitoring & security audit), news, notes, quote, reminders, research, summarize, timer, todo, translate, weather
+### Skills (22 bundled + 13 workspace, version-aware seeding)
+**Bundled skills (OpenClaw format, seeded by ConfigManager.kt with SHA-256 integrity + version tracking):** bookmark, briefing, burner-wallet, calclaw (AI calorie tracker), calculator, crypto-prices, define, github, joke, movie-tv, netwatch (network monitoring & security audit), news, notes, paysh-catalog, quote, reminders, research, summarize, timer, todo, translate, weather
 **Workspace skills (agent-usable examples):** crypto-prices, device-status, dictionary, exchange-rates, github, location, movie-tv, phone-call, recipe, sms, solana-dapp, solana-wallet, speak
 **Skill format:** YAML frontmatter (name, description, version, emoji, requires) — see `SKILL-FORMAT.md`
 **Skill install** — `skill_install` tool to install skills from URL or Telegram file attachment, with diagnostics via `/skills` command
@@ -259,10 +259,11 @@ User (Telegram/Discord) <--HTTPS/WSS--> Channel API <--polling/WS--> Node.js Gat
 
 | Metric | Count |
 |--------|-------|
-| Total commits | 558+ |
-| PRs merged | 363+ |
+| Total commits | 600+ |
+| PRs merged | 383+ |
 | Tools | 63 (17 Solana/Jupiter, 13 Android bridge, 6 memory, 6 file, 5 cron, 4 telegram, 3 system, 2 web, 2 skill, 2 wallet [wallet_status, wallet_set_caps], 1 session, 1 env, 1 agent_pay [x402]) + MCP dynamic |
-| Skills | 37 (22 bundled + 13 workspace + 2 user-created) |
+| Skills | 37 (22 bundled incl. paysh-catalog + burner-wallet + 13 workspace + 2 user-created) |
+| Paysh-catalog entries | 44 across 10 services (OPT-IN only; 63 unsupported with structured "why not" reasons) |
 | Android Bridge endpoints | 18+ |
 | Telegram commands | 12 |
 | Channels | 2 (Telegram + Discord) |
@@ -302,6 +303,16 @@ User (Telegram/Discord) <--HTTPS/WSS--> Channel API <--polling/WS--> Node.js Gat
 
 | Date | Feature | PR |
 |------|---------|-----|
+| 2026-05-18 | **Release: v2.0.0-rc1** — Burner wallet (BAT-582), `agent_pay` x402 client (BAT-664), paysh-catalog OPT-IN (BAT-704) with 44 endpoints across 10 services, v2 schema (BAT-761), Tier 1 catalog expansion (BAT-705/706/766/768/769), doc body-shape fixes from openapi (#382/#383), SAB-AUDIT-v27 with 3 new DIAGNOSTICS entries for the paysh-catalog failure classes + the release-prep wave (#384). | #364, #366–#371, #377–#384 |
+| 2026-05-18 | Docs: SAB-AUDIT-v27 — paysh-catalog DIAGNOSTICS gap (doc-vs-gateway divergence, OPT-IN regression, cost discrepancy) + multi-call composition transparency hint in Wallets door + memory_save/daily_note secrets-warning. | #384 |
+| 2026-05-18 | Fix: rentcast query params from openapi (#383). Cross-service audit follow-up to #382 — fixes invented `city`/`state`/`bedrooms` on `/markets`, invented `id` query on `/properties`, invented `priceMin`/`priceMax` on `/listings/*`. | #383 |
+| 2026-05-18 | Fix: stablecrypto body shapes from openapi (#382). Test 2 burned $0.02 on HTTP 400 retries before the fix — body shapes were inferred from CoinGecko public REST docs (strings) but the gateway openapi declares arrays. Six blocking shape bugs + six optional-param completions. | #382 |
+| 2026-05-18 | Feat: BAT-768 + BAT-766 Tier 1 catalog expansion (11→44 entries). Stablecrypto market-data (21 endpoints across CoinGecko + DefiLlama), Tripadvisor (5), Rentcast (5), Crushrewards (4), Reducto (2), Wolfram (v2-query), plus singletons. Service-grouping reply hint in SKILL.md body. | #381 |
+| 2026-05-18 | Feat: BAT-769 Tier 1c perplexity catalog entries (search + agent). Sanitize hardening for transport-noise headers (report-to / nel / rndr-id / x-render-origin-server). | #380 |
+| 2026-05-18 | Feat: BAT-761 paysh-catalog v2 schema + maintenance tooling. Per-endpoint entries with upstream_ref + verification metadata, `audit_pending[]` with `deferred_to`, six unsupported-reason buckets, probe-catalog --audit/--drift/--status/--refresh modes, v1→v2 migration script. | #379 |
+| 2026-05-16 | Feat: BAT-705 Textbelt SMS + BAT-706 full-catalog audit crawler. 384 parseable Solana-USDC endpoints discovered across 19 services. | #378 |
+| 2026-05-15 | Feat: BAT-704 paysh-catalog is opt-in. Explicit pay/x402 keywords only; prevents agent autonomously paying for trivia. | #377 |
+| 2026-05-12 | Docs: SAB-AUDIT-v26 — BAT-664 agent_pay POST + body shipped without SAB; surfaced via device test. Cap-vs-max_usdc semantic clarified; new DIAGNOSTICS entries for invalid-schema kill and POST-only burner_not_configured false positive. | direct |
 | 2026-05-04 | Release: v1.10.0 — Env Vars, Extended Thinking on every provider, /model + /provider Telegram switches, live cross-process Settings, Activity Heatmap, BAT-525 graceful Stop. | #359, #360, #361 |
 | 2026-05-02 | Docs: SAB-AUDIT-v24 — BAT-525 + BAT-504 + MAX_STEPS post-merge gap fix. | #357 |
 | 2026-05-02 | Fix: Flush Node state before user-initiated Stop (BAT-525). Bounded shutdown handshake over loopback persists pending session summaries + dirty SQL.js writes within ~1.5s before `killProcess()`. | #349 |

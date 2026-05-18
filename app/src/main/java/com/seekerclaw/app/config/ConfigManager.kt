@@ -2372,14 +2372,48 @@ object ConfigManager {
             )
         }
 
-        // DIAGNOSTICS.md — deep troubleshooting guide (read by agent on demand)
+        // DIAGNOSTICS.md — deep troubleshooting guide (read by agent on demand).
+        // Always overwrite with the bundled asset on every service start.
+        // DIAGNOSTICS.md is bundled documentation, not user content — users have
+        // no reason to edit it, and the system prompt tells the agent to consult
+        // it for troubleshooting recipes. Same overwrite pattern as PLATFORM.md.
+        // Pre-2.0.0 this was a one-time `if (!exists)` seed, which meant existing
+        // users on 1.10.0 never received new entries (e.g. the SAB-AUDIT-v27
+        // paysh-catalog section) added in later releases.
+        //
+        // Atomic write via tmp-file + `Files.move(REPLACE_EXISTING, ATOMIC_MOVE)`
+        // — same pattern as McpTokenStore. File.renameTo is unreliable on Android
+        // when the destination already exists, and the older delete+rename
+        // fallback could blank the file if the second rename failed after delete.
+        // NIO `Files.move` handles overwrite atomically; falls back to
+        // REPLACE_EXISTING (still single-syscall) on the rare AtomicMoveNotSupported
+        // case. Tmp removed on any failure path so stale `.tmp` doesn't accumulate.
+        // On any error the existing DIAGNOSTICS.md is left in place — agent keeps
+        // the previous content rather than getting a blank or half-written file.
         val diagFile = File(workspaceDir, "DIAGNOSTICS.md")
-        if (!diagFile.exists()) {
+        val diagTmp = File(workspaceDir, "DIAGNOSTICS.md.tmp")
+        try {
+            val newContent = context.assets.open("nodejs-project/DIAGNOSTICS.md").use { input ->
+                input.bufferedReader().readText()
+            }
+            diagTmp.writeText(newContent)
             try {
-                context.assets.open("nodejs-project/DIAGNOSTICS.md").use { input ->
-                    diagFile.writeText(input.bufferedReader().readText())
-                }
-            } catch (_: Exception) { /* asset missing — skip */ }
+                java.nio.file.Files.move(
+                    diagTmp.toPath(),
+                    diagFile.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                )
+            } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+                java.nio.file.Files.move(
+                    diagTmp.toPath(),
+                    diagFile.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "DIAGNOSTICS.md seed failed; existing file kept", e)
+            if (diagTmp.exists()) diagTmp.delete()
         }
 
         // Create skills directory and seed example skills

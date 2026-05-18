@@ -194,6 +194,24 @@ check('burner configured: prompt lists both Burner and Main with caps + network'
     // Anti-paraphrase rule from contract.
     assert.ok(stable.includes('never paraphrase as "your wallet"') || stable.includes('Always name them by role'),
         'must instruct agent to name wallets by role');
+
+    // SAB-AUDIT-v27 / payment-safety phrases — locked here so a future prompt
+    // edit can't silently drop them. These are high-risk: dropping them
+    // re-opens the "agent paid $0.02 but reported $0.01" UX (multi-call
+    // transparency) and the post-Test-2 USDC-burn loop (auto-retry on 4xx
+    // catalog body-shape failures, which was the bug PR #382 fixed).
+    assert.ok(stable.includes('Multi-call composition'),
+        'must include "Multi-call composition" transparency hint (SAB-AUDIT-v27 A1)');
+    assert.ok(stable.includes('do NOT auto-retry') || stable.includes('DO NOT auto-retry'),
+        'must instruct agent NOT to auto-retry on HTTP 4xx after settle (SAB-AUDIT-v27 A1)');
+    // Assert on the paid-APIs-specific door to DIAGNOSTICS, not a generic
+    // DIAGNOSTICS reference — the prompt has a separate generic "see
+    // DIAGNOSTICS.md" line in the Diagnostics section which would let this
+    // pass even if the paid-API guidance dropped its DIAGNOSTICS pointer.
+    // Lock the verbatim phrase "DIAGNOSTICS.md → \"paysh-catalog\"" so the
+    // paid-call failure path stays explicitly wired to that section.
+    assert.ok(stable.includes('DIAGNOSTICS.md → "paysh-catalog"'),
+        'must reference DIAGNOSTICS.md → "paysh-catalog" specifically as the door for post-paid-call-failure self-troubleshooting');
 });
 
 // ── Burner UNCONFIGURED → single-wallet section + Settings hint ─────────────
