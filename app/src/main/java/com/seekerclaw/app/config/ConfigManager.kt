@@ -2381,29 +2381,39 @@ object ConfigManager {
         // users on 1.10.0 never received new entries (e.g. the SAB-AUDIT-v27
         // paysh-catalog section) added in later releases.
         //
-        // Atomic write: read the asset fully into memory, write to a tmp file,
-        // then rename onto the live file. If asset open / read / tmp write fails,
-        // the live DIAGNOSTICS.md is untouched — agent keeps the old (possibly
-        // stale) content rather than getting a blank/half-written file from
-        // disk pressure or a closed-stream mid-write. Matches the atomic
-        // tmp+move pattern used by EncryptedPrefsKeyVault and other seed paths.
+        // Atomic write via tmp-file + `Files.move(REPLACE_EXISTING, ATOMIC_MOVE)`
+        // — same pattern as McpTokenStore. File.renameTo is unreliable on Android
+        // when the destination already exists, and the older delete+rename
+        // fallback could blank the file if the second rename failed after delete.
+        // NIO `Files.move` handles overwrite atomically; falls back to
+        // REPLACE_EXISTING (still single-syscall) on the rare AtomicMoveNotSupported
+        // case. Tmp removed on any failure path so stale `.tmp` doesn't accumulate.
+        // On any error the existing DIAGNOSTICS.md is left in place — agent keeps
+        // the previous content rather than getting a blank or half-written file.
         val diagFile = File(workspaceDir, "DIAGNOSTICS.md")
+        val diagTmp = File(workspaceDir, "DIAGNOSTICS.md.tmp")
         try {
             val newContent = context.assets.open("nodejs-project/DIAGNOSTICS.md").use { input ->
                 input.bufferedReader().readText()
             }
-            val tmp = File(workspaceDir, "DIAGNOSTICS.md.tmp")
-            tmp.writeText(newContent)
-            if (!tmp.renameTo(diagFile)) {
-                // renameTo can fail on some Android FS impls if dest exists
-                if (diagFile.exists()) diagFile.delete()
-                if (!tmp.renameTo(diagFile)) {
-                    tmp.delete()
-                    Log.w("ConfigManager", "DIAGNOSTICS.md atomic write failed (rename); existing file kept")
-                }
+            diagTmp.writeText(newContent)
+            try {
+                java.nio.file.Files.move(
+                    diagTmp.toPath(),
+                    diagFile.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                )
+            } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+                java.nio.file.Files.move(
+                    diagTmp.toPath(),
+                    diagFile.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                )
             }
         } catch (e: Exception) {
             Log.w("ConfigManager", "DIAGNOSTICS.md seed failed; existing file kept", e)
+            if (diagTmp.exists()) diagTmp.delete()
         }
 
         // Create skills directory and seed example skills
