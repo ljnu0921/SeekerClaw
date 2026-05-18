@@ -194,6 +194,18 @@ check('burner configured: prompt lists both Burner and Main with caps + network'
     // Anti-paraphrase rule from contract.
     assert.ok(stable.includes('never paraphrase as "your wallet"') || stable.includes('Always name them by role'),
         'must instruct agent to name wallets by role');
+
+    // SAB-AUDIT-v27 / payment-safety phrases — locked here so a future prompt
+    // edit can't silently drop them. These are high-risk: dropping them
+    // re-opens the "agent paid $0.02 but reported $0.01" UX (multi-call
+    // transparency) and the post-Test-2 USDC-burn loop (auto-retry on 4xx
+    // catalog body-shape failures, which was the bug PR #382 fixed).
+    assert.ok(stable.includes('Multi-call composition'),
+        'must include "Multi-call composition" transparency hint (SAB-AUDIT-v27 A1)');
+    assert.ok(stable.includes('do NOT auto-retry') || stable.includes('DO NOT auto-retry'),
+        'must instruct agent NOT to auto-retry on HTTP 4xx after settle (SAB-AUDIT-v27 A1)');
+    assert.ok(stable.includes('DIAGNOSTICS'),
+        'must reference DIAGNOSTICS as the door for the agent\'s self-troubleshooting after a paid call fails');
 });
 
 // ── Burner UNCONFIGURED → single-wallet section + Settings hint ─────────────

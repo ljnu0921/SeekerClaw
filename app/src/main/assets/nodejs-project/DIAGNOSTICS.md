@@ -694,19 +694,30 @@ Both were red herrings — root cause was always "not enough USDC at the source.
 - HTTP 400 on a GET endpoint (e.g., rentcast `/markets?city=Austin`) for a query param the gateway doesn't accept (only `zipCode`, `dataType`, `historyRange` are real).
 - HTTP 200 with garbage / silent wrong-shape data — gateway silently ignored unknown query params (common on GET endpoints that proxy upstream loosely).
 **Diagnosis:** The catalog markdown doc (`services/<id>.md`) was hand-written from the upstream API's public REST docs instead of the gateway's `openapi.json`. Gateways diverge from upstream in three structural ways: (1) arrays where upstream takes comma-separated strings, (2) string types where upstream takes numbers, (3) renamed field names. Fixed in PR #382 (stablecrypto POST bodies) and PR #383 (rentcast GET query params) by deriving every body/param table from the live `openapi.json`.
-**Fix (runnable via agent tools — `shell_exec` rejects `|` and `jq` is not in the allowlist, so don't use curl-pipe-jq; use `web_fetch` to pull the JSON, then `js_eval` to extract the relevant field):**
+**Fix (runnable via agent tools — `shell_exec` rejects `|` and `jq` is not in the allowlist; `web_fetch` THROWS on non-2xx so it can't read 402 bodies either. The right tool here is `js_eval` driving `require('https')` directly, which gives full status/header/body access in one call):**
 1. Look up the entry's service URL: `read skills/paysh-catalog/catalog.json`, find your `entries[].id`, copy its `upstream_ref.service_url`. Call this `<base>`.
-2. Fetch the gateway's openapi.json: `web_fetch(url: "<base>/openapi.json", format: "json")`. (If the host doesn't expose `/openapi.json`, the catalog entry's `verification.last_capture_path` may have the schema baked in — `read tests/paysh/captures/...` as a fallback.)
-3. Inspect the failing path's schema with `js_eval`:
+2. Fetch + inspect the openapi schema in one `js_eval` call:
    ```js
-   const oa = JSON.parse(__last_web_fetch_body);  // or paste from the web_fetch result
-   const path = oa.paths['<path>'];
-   // POST: required[] + properties{} of the JSON body schema
-   const post = path?.post?.requestBody?.content?.['application/json']?.schema;
-   // GET: parameters[] array
-   const get = path?.get?.parameters;
-   JSON.stringify({ post, get }, null, 2);
+   const https = require('https');
+   const url = new URL('<base>/openapi.json');
+   await new Promise((resolve, reject) => {
+     https.get({ hostname: url.hostname, path: url.pathname, headers: { 'user-agent': 'seekerclaw-diag' } }, (res) => {
+       let body = ''; res.on('data', c => body += c); res.on('end', () => {
+         try {
+           const oa = JSON.parse(body);
+           const p = oa.paths?.['<path>'];
+           // POST: required[] + properties{} of the JSON body schema
+           const post = p?.post?.requestBody?.content?.['application/json']?.schema;
+           // GET: parameters[] array
+           const get = p?.get?.parameters;
+           console.log(JSON.stringify({ status: res.statusCode, post, get }, null, 2));
+           resolve();
+         } catch (e) { console.log('parse failed status=' + res.statusCode + ' body[0..200]=' + body.slice(0,200)); resolve(); }
+       });
+     }).on('error', reject);
+   });
    ```
+   If the host doesn't expose `/openapi.json` (returns 404), the catalog entry's `verification.last_capture_path` may have the schema baked into the committed 402 capture as `extensions.bazaar.schema` — `read tests/paysh/captures/...` as a fallback.
 4. Compare `required[]` and `properties{}` (POST) or `parameters[]` (GET) against the body/params the agent_pay call sent. The truth is on the gateway, not on CoinGecko/DefiLlama/Rentcast/etc. public REST docs.
 5. Re-issue the call with the openapi-correct shape (arrays as arrays, string-typed numbers as quoted strings, gateway-named fields).
 6. If the catalog doc itself is wrong, that's a maintainer fix (rewrite `services/<id>.md` like PR #382/#383 did, bump `paysh-catalog/SKILL.md` version so `ConfigManager.seedSkill()` re-seeds existing devices). The agent can flag this to the user but should not edit catalog docs from chat.
@@ -729,26 +740,41 @@ Both were red herrings — root cause was always "not enough USDC at the source.
 **Symptoms:** Agent reply says "Paid: $0.02 USDC" but the user expected $0.01 (matching `catalog.json` `cost_usdc`). The transaction succeeded; the question is just where the extra cost came from.
 **Diagnosis:** Two real possibilities and one rare one:
 1. **Multi-call composition (most common).** Agent issued multiple paid calls to assemble one answer. Example: a "rent trends for ZIP X" reply that includes per-bedroom breakdown likely called `/markets` (current trends) + `/listings/rental/long-term` (to bucket by bedroom count), 2 × $0.01 = $0.02. This is correct agent behavior — but it should be transparent in the reply.
-2. **Stale `cost_usdc` in catalog.** The endpoint actually charges more than the catalog recorded during BAT-706 audit. Verify by live-probing the 402 — `<base>` is the entry's `upstream_ref.service_url` from `catalog.json`, `<path>` is `endpoint.path`, and the probe method must match `endpoint.method`. Use `web_fetch` (NOT `shell_exec` curl-pipe-jq — shell_exec rejects `|` and `jq` isn't allowlisted):
+2. **Stale `cost_usdc` in catalog.** The endpoint actually charges more than the catalog recorded during BAT-706 audit. Verify by live-probing the 402 — `<base>` is the entry's `upstream_ref.service_url` from `catalog.json`, `<path>` is `endpoint.path`, and the probe method must match `endpoint.method`. Use `js_eval` with `require('https')` (NOT `shell_exec` curl-pipe-jq — shell_exec rejects `|` and `jq` isn't allowlisted; NOT `web_fetch` either — it throws on non-2xx so it never returns the 402 body or `payment-required` header):
    ```js
-   // web_fetch(url: '<base><path>', method: 'GET' | 'POST', body: '{}', format: 'json')
-   // The 402 response is structured — pick the Solana leg from BOTH the body
-   // accepts[] array AND the `payment-required` response header (some gateways
-   // like stablecrypto deliver the challenge SOLELY in the header with an empty
-   // body; pure body-only parsing will miss those).
-   const r = __last_web_fetch_response;  // {status, headers, body}
-   let solanaLeg = null;
-   const bodyAccepts = r.body?.accepts || [];
-   solanaLeg = bodyAccepts.find(a => (a.network || '').startsWith('solana:') || a.network === 'solana');
-   if (!solanaLeg && r.headers?.['payment-required']) {
-     // header value is base64-encoded JSON in v2 — decode then parse
-     const decoded = JSON.parse(Buffer.from(r.headers['payment-required'], 'base64').toString('utf8'));
-     const accepts = decoded.accepts || decoded.paymentRequirements || [];
-     solanaLeg = accepts.find(a => (a.network || '').startsWith('solana:') || a.network === 'solana');
-   }
-   solanaLeg ? (solanaLeg.amount || solanaLeg.maxAmountRequired) : null;
+   const https = require('https');
+   const url = new URL('<base><path>');
+   const method = 'GET';  // or 'POST' — match catalog.json endpoint.method
+   const opts = { hostname: url.hostname, path: url.pathname + (url.search||''), method, headers: { 'user-agent': 'seekerclaw-diag' } };
+   if (method === 'POST') opts.headers['content-type'] = 'application/json';
+   await new Promise((resolve, reject) => {
+     const req = https.request(opts, (res) => {
+       let body = ''; res.on('data', c => body += c); res.on('end', () => {
+         // Pick the Solana leg from BOTH body.accepts[] AND the
+         // payment-required response header — some gateways (e.g.
+         // stablecrypto) deliver the challenge SOLELY in the header
+         // with an empty body; pure body-only parsing misses those.
+         let accepts = [];
+         try { const j = JSON.parse(body); accepts = j.accepts || j.paymentRequirements || []; } catch(_) {}
+         const hdr = res.headers['payment-required'];
+         if (!accepts.length && hdr) {
+           try {
+             const decoded = JSON.parse(Buffer.from(hdr, 'base64').toString('utf8'));
+             accepts = decoded.accepts || decoded.paymentRequirements || [];
+           } catch(_) {}
+         }
+         const solana = accepts.find(a => (a.network||'').startsWith('solana:') || a.network === 'solana');
+         const amount = solana ? (solana.amount || solana.maxAmountRequired) : null;
+         console.log(JSON.stringify({ status: res.statusCode, solanaAmount: amount, source: accepts === (res.headers['payment-required'] ? [] : accepts) ? 'body' : (hdr ? 'header' : 'body') }, null, 2));
+         resolve();
+       });
+     });
+     req.on('error', reject);
+     if (method === 'POST') req.write('{}');
+     req.end();
+   });
    ```
-   Result is in USDC atomic units (6 decimals): `"10000"` = $0.01, `"20000"` = $0.02. If the live amount > catalog `cost_usdc`, the catalog is stale — flag for maintainer to update.
+   `solanaAmount` is in USDC atomic units (6 decimals): `"10000"` = $0.01, `"20000"` = $0.02. If the live amount > catalog `cost_usdc`, the catalog is stale — flag for maintainer to update.
 3. **(Rare) Gateway promoted the endpoint to a tiered cost** based on response size or query complexity. Some pay.sh services do this; the live 402 will show the higher amount.
 **Fix:**
 1. In the agent's reply, ALWAYS surface multi-call composition transparently: "Paid $0.02 across 2 calls (`/markets` + `/listings/rental/long-term`)" rather than just "Paid $0.02". Users can't tell otherwise.
