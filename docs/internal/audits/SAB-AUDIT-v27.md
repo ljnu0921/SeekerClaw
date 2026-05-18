@@ -11,7 +11,7 @@
 | PR / Commit | Description | SAB Impact |
 |---|---|---|
 | #377 | BAT-704: paysh-catalog OPT-IN policy | Critical — new prompt door (Wallets section); explicit keyword list for skill activation |
-| #378 | BAT-705 textbelt + BAT-706 audit crawler (105 endpoints found across 19 services) | Content — catalog grew, unsupported set grew |
+| #378 | BAT-705 textbelt + BAT-706 audit crawler (824 endpoints discovered across 72 services audited; 384 parsed as Solana-USDC 402) | Content — catalog grew, unsupported set grew |
 | #379 | BAT-761: paysh-catalog v2 schema + maintenance tooling (probe-catalog --audit/--drift/--refresh) | Schema — per-endpoint catalog entries, upstream_ref + verification metadata; prompt door now mentions SCHEMA.md |
 | #380 | BAT-769: perplexity entries (search + agent) | Content — 2 new entries; prompt-door count bumped to 11 |
 | #381 | BAT-768/766: Tier 1 expansion to 44 endpoints across 10 services | Content — door count bumped to 44; service-grouping hint added to skill body |

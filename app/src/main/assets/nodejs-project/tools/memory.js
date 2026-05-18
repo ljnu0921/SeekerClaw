@@ -47,7 +47,7 @@ function scrubSessionContent(content) {
 const tools = [
     {
         name: 'memory_save',
-        description: 'Save important information to long-term memory (MEMORY.md). Use this to remember facts, preferences, or important details about the user. NEVER pass secrets through this tool — API keys, OAuth tokens, seed phrases, private keys, passwords, and auth headers must be stored in agent_settings.json under apiKeys.* (encrypted at rest), never written to MEMORY.md or daily notes (plain-text on disk + indexed into the SQL search DB).',
+        description: 'Save important information to long-term memory (MEMORY.md). Use this to remember facts, preferences, or important details about the user. NEVER pass secrets through this tool — MEMORY.md and daily notes are plain-text on disk AND indexed into the SQL search DB. For API keys the user provides in chat, save them to agent_settings.json under apiKeys.<service> (the canonical agent-readable key store; built-in tools pick them up immediately). For seed phrases, private keys, passwords, OAuth tokens, and auth headers — direct the user to enter them through Settings UI (Android Keystore-encrypted SharedPreferences) rather than storing them anywhere from chat.',
         input_schema: {
             type: 'object',
             properties: {

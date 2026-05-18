@@ -262,7 +262,7 @@ User (Telegram/Discord) <--HTTPS/WSS--> Channel API <--polling/WS--> Node.js Gat
 | Total commits | 600+ |
 | PRs merged | 383+ |
 | Tools | 63 (17 Solana/Jupiter, 13 Android bridge, 6 memory, 6 file, 5 cron, 4 telegram, 3 system, 2 web, 2 skill, 2 wallet [wallet_status, wallet_set_caps], 1 session, 1 env, 1 agent_pay [x402]) + MCP dynamic |
-| Skills | 38 (23 bundled incl. paysh-catalog + burner-wallet + 13 workspace + 2 user-created) |
+| Skills | 37 (22 bundled incl. paysh-catalog + burner-wallet + 13 workspace + 2 user-created) |
 | Paysh-catalog entries | 44 across 10 services (OPT-IN only; 63 unsupported with structured "why not" reasons) |
 | Android Bridge endpoints | 18+ |
 | Telegram commands | 12 |

@@ -712,7 +712,7 @@ Both were red herrings — root cause was always "not enough USDC at the source.
 1. Check the skill version: `read app/src/main/assets/default-skills/paysh-catalog/SKILL.md` — frontmatter `version:` should be ≥ 1.4.0 (BAT-704 was 1.4.0). If lower, the skill predates the opt-in rule.
 2. Check the prompt door is intact: read `app/src/main/assets/nodejs-project/ai.js` `buildSystemBlocks()` around the Wallets section — look for the "Paysh-catalog is OPT-IN" paragraph and its keyword list. If it's missing, the build regressed.
 3. Refund/apologize to the user: the call already settled (USDC spent). Tell the user explicitly what happened ("I called a paid endpoint without your authorization — that violates the opt-in policy") and how to avoid it (use a free tool name, or explicitly say "no paying").
-4. If the agent persistently auto-activates: report the trigger phrase that mis-matched so it can be added to the don't-match list in SKILL.md.
+4. If the agent persistently auto-activates: report the trigger phrase that mismatched so it can be added to the don't-match list in SKILL.md.
 
 ### `paid more than the catalog cost_usdc said (cost discrepancy)`
 **Symptoms:** Agent reply says "Paid: $0.02 USDC" but the user expected $0.01 (matching `catalog.json` `cost_usdc`). The transaction succeeded; the question is just where the extra cost came from.

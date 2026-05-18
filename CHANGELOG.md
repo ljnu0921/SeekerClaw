@@ -13,7 +13,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 #### Burner Wallet & x402 (BAT-582)
 
-- **Burner wallet subsystem** — a small, app-managed Ed25519 keypair stored in Android Keystore (AES-256-GCM, `userAuthenticationRequired = false`) that the agent can sign with autonomously, within user-configured caps. The user-controlled MAIN wallet (via MWA) is unchanged — every action there still triggers an approval popup. The burner is opt-in; until the user imports a key in Settings → Burner Wallet, the agent has one wallet and behaves exactly as in 1.x.
+- **Burner wallet subsystem** — a small, app-managed Ed25519 keypair encrypted at rest under `filesDir/burner_keys/<id>` using a Keystore-derived AES-256-GCM key (BouncyCastle Ed25519 signing happens inside the vault; the Keystore AES key itself is non-extractable, `userAuthenticationRequired = false`). The agent can sign with the burner autonomously, within user-configured caps. The user-controlled MAIN wallet (via MWA) is unchanged — every action there still triggers an approval popup. The burner is opt-in; until the user imports a key in Settings → Burner Wallet, the agent has one wallet and behaves exactly as in 1.x.
 - **`agent_pay` tool** — fetches x402-protected HTTPS endpoints, settles in USDC from the burner. GET runs silently when under cap; POST always asks for user confirmation. Validates the 402 response against a Solana-mainnet + USDC-asset boundary; rejects non-HTTPS, private IPs (SSRF defense), non-Solana networks, non-USDC assets, and demands exceeding the per-call `max_usdc` ceiling.
 - **`wallet_status` tool** — reports caps, today's spend, and remaining daily budget for the burner. Surfaces both wallets when the burner is configured; when not, reports only the main wallet and points at Settings → Burner Wallet.
 - **`wallet_set_caps` tool** — raise/lower per-tx or daily caps; always confirmed; shows old → new diff.
@@ -36,7 +36,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   - **2captcha (1)**, **textbelt-sms (1)**, **purch (1)** — singletons.
 - **63 unsupported entries** — services we've identified but can't safely route the agent to. Four documented failure sub-cases: (1) protocol-fail (mpp_protocol / siwx_auth_required / invalid_demand), (2) can-pay-can't-deliver (requires_binary_response — would burn USDC on PNG/MP4 bytes), (3) non-402-at-probe (broken/moved/auth-gated catalog URL), (4) unverified_paid_response_shape (evidence about the paid response is contested). Lets the agent answer "I know about X but can't use it because Y" honestly.
 - **Catalog maintenance tooling (BAT-761)** — `tests/paysh/probe-catalog.js` with `--audit`, `--drift`, `--status`, `--refresh <id>` modes. Drift mode checks captured 402 responses against current upstream without writing; `--write-checked-at` updates verification timestamps after a clean sweep.
-- **BAT-706 audit crawler** — discovered 384 parseable Solana-USDC endpoints across 19 pay.sh services. Roughly 30 are user-facing-meaningful and migrated into the catalog; the rest live in unsupported.json with structured "why not" reasons.
+- **BAT-706 audit crawler** — audited 72 pay.sh services, discovered 824 endpoints, of which 384 returned a parseable Solana-USDC 402 (the rest were either non-Solana-USDC paywalls, non-402 HTTP responses, or fetch failures). Snapshot in `tests/paysh/catalog-audit.md`. Roughly 30 of the 384 parsed_ok endpoints are user-facing-meaningful and migrated into the catalog; the rest live in unsupported.json with structured "why not" reasons.
 
 #### Doc Fidelity Fixes
 
@@ -59,7 +59,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ### Changed
 
 - **App version 1.10.0 → 2.0.0 (versionCode 19 → 20).** Major bump signals the burner-wallet inflection.
-- **SKILL.md version bumps for `paysh-catalog`** — 1.4.0 (BAT-704 opt-in) → 1.5.0 (v2 schema) → 1.6.0 (Tier 1 expansion) → 1.7.0 (stablecrypto doc fix) → 1.8.0 (rentcast doc fix). `ConfigManager.seedSkill()` re-seeds workspace files on each bump so existing devices get the latest doc without WIPE.
+- **SKILL.md version bumps for `paysh-catalog`** — 1.1.0 (BAT-704 opt-in, #377) → 1.4.0 (BAT-761 v2 schema, #379) → 1.5.0 (BAT-769 perplexity, #380) → 1.6.0 (BAT-768/766 Tier 1 expansion, #381) → 1.7.0 (stablecrypto doc fix, #382) → 1.8.0 (rentcast doc fix, #383). `ConfigManager.seedSkill()` re-seeds workspace files on each bump so existing devices get the latest doc without WIPE.
 
 ### Fixed
 
@@ -71,7 +71,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ### Security
 
 - **SSRF defense in `agent_pay`** — DNS-resolves the URL host BEFORE any HTTP request; refuses if the resolved IP is in a private range (10/8, 172.16/12, 192.168/16, 127/8, 169.254/16, ::1, fc00::/7, fe80::/10). Pre-DNS rejections (non-HTTPS, invalid URL, disallowed method) fire even earlier — operator typos diagnosed cleanly without touching attacker-supplied hosts.
-- **Burner key never leaves Android Keystore.** Per the Codex pivot: signing is bridge-backed (Node sends a signing request to Kotlin via the localhost bridge; Kotlin signs and returns the signed transaction; Node never sees the raw key). No Node-side raw-key handling anywhere in the codebase.
+- **Burner key never leaves the Kotlin vault.** The Ed25519 seed lives encrypted under `filesDir/burner_keys/<id>` (Keystore-derived AES-256-GCM); BouncyCastle Ed25519 signing happens inside `EncryptedPrefsKeyVault`. Per the Codex pivot: signing is bridge-backed — Node sends a signing request to Kotlin via the localhost bridge; Kotlin decrypts, signs, returns the signed transaction; Node never sees the raw key bytes. No Node-side raw-key handling anywhere in the codebase. App manifest sets `android:allowBackup="false"` so the burner files never enter cloud backups.
 - **Bridge auth token** — the localhost bridge between `:node` and Kotlin requires a per-boot auth token that's freshly generated each service start. No process can spoof a request without it.
 
 ### Migration

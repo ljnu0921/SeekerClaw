@@ -2372,15 +2372,20 @@ object ConfigManager {
             )
         }
 
-        // DIAGNOSTICS.md — deep troubleshooting guide (read by agent on demand)
+        // DIAGNOSTICS.md — deep troubleshooting guide (read by agent on demand).
+        // Always overwrite with the bundled asset on every service start.
+        // DIAGNOSTICS.md is bundled documentation, not user content — users have
+        // no reason to edit it, and the system prompt tells the agent to consult
+        // it for troubleshooting recipes. Same overwrite pattern as PLATFORM.md.
+        // Pre-2.0.0 this was a one-time `if (!exists)` seed, which meant existing
+        // users on 1.10.0 never received new entries (e.g. the SAB-AUDIT-v27
+        // paysh-catalog section) added in later releases.
         val diagFile = File(workspaceDir, "DIAGNOSTICS.md")
-        if (!diagFile.exists()) {
-            try {
-                context.assets.open("nodejs-project/DIAGNOSTICS.md").use { input ->
-                    diagFile.writeText(input.bufferedReader().readText())
-                }
-            } catch (_: Exception) { /* asset missing — skip */ }
-        }
+        try {
+            context.assets.open("nodejs-project/DIAGNOSTICS.md").use { input ->
+                diagFile.writeText(input.bufferedReader().readText())
+            }
+        } catch (_: Exception) { /* asset missing — skip */ }
 
         // Create skills directory and seed example skills
         seedSkills(context, workspaceDir)
