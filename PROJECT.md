@@ -303,7 +303,7 @@ User (Telegram/Discord) <--HTTPS/WSS--> Channel API <--polling/WS--> Node.js Gat
 
 | Date | Feature | PR |
 |------|---------|-----|
-| 2026-05-18 | **Release: v2.0.0-rc1** — Burner wallet (BAT-582), `agent_pay` x402 client (BAT-664), paysh-catalog OPT-IN (BAT-704) with 44 endpoints across 10 services, v2 schema (BAT-761), Tier 1 catalog expansion (BAT-705/706/768/769), doc body-shape fixes from openapi (#382/#383), SAB-AUDIT-v27 with 3 new DIAGNOSTICS entries for the paysh-catalog failure classes. | #364, #366–#371, #377–#383 |
+| 2026-05-18 | **Release: v2.0.0-rc1** — Burner wallet (BAT-582), `agent_pay` x402 client (BAT-664), paysh-catalog OPT-IN (BAT-704) with 44 endpoints across 10 services, v2 schema (BAT-761), Tier 1 catalog expansion (BAT-705/706/766/768/769), doc body-shape fixes from openapi (#382/#383), SAB-AUDIT-v27 with 3 new DIAGNOSTICS entries for the paysh-catalog failure classes + the release-prep wave (#384). | #364, #366–#371, #377–#384 |
 | 2026-05-18 | Docs: SAB-AUDIT-v27 — paysh-catalog DIAGNOSTICS gap (doc-vs-gateway divergence, OPT-IN regression, cost discrepancy) + multi-call composition transparency hint in Wallets door + memory_save/daily_note secrets-warning. | #384 |
 | 2026-05-18 | Fix: rentcast query params from openapi (#383). Cross-service audit follow-up to #382 — fixes invented `city`/`state`/`bedrooms` on `/markets`, invented `id` query on `/properties`, invented `priceMin`/`priceMax` on `/listings/*`. | #383 |
 | 2026-05-18 | Fix: stablecrypto body shapes from openapi (#382). Test 2 burned $0.02 on HTTP 400 retries before the fix — body shapes were inferred from CoinGecko public REST docs (strings) but the gateway openapi declares arrays. Six blocking shape bugs + six optional-param completions. | #382 |
