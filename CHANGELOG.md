@@ -5,6 +5,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+> **Release process note for v2.0.0 final:** the release workflow (`.github/workflows/release.yml`) extracts notes by matching `## [<tag-without-v>]` literally. When promoting `v2.0.0-rc1` → `v2.0.0` final, rename the `## [2.0.0-rc1] - 2026-05-18` header below to `## [2.0.0] - <final-tag-date>` (or duplicate it with both headers if you want the historical RC entry preserved). Without this rename, the `v2.0.0` tag will fall back to auto-generated GitHub release notes instead of these curated ones.
+
 ## [2.0.0-rc1] - 2026-05-18
 
 > **Major version bump.** The agent now has economic agency: it can hold and spend USDC autonomously on x402-protected paid HTTP endpoints, within user-configured per-tx and daily caps. This is the largest single-release surface expansion in SeekerClaw's history (44 new endpoints across 10 services, 3 new agent-facing tools, a new on-device key-management subsystem). The 1.x → 2.0 jump signals the inflection: pre-2.0, the agent was a smart assistant; post-2.0, the agent can transact.

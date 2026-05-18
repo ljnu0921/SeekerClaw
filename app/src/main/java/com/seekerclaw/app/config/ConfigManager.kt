@@ -2380,12 +2380,31 @@ object ConfigManager {
         // Pre-2.0.0 this was a one-time `if (!exists)` seed, which meant existing
         // users on 1.10.0 never received new entries (e.g. the SAB-AUDIT-v27
         // paysh-catalog section) added in later releases.
+        //
+        // Atomic write: read the asset fully into memory, write to a tmp file,
+        // then rename onto the live file. If asset open / read / tmp write fails,
+        // the live DIAGNOSTICS.md is untouched — agent keeps the old (possibly
+        // stale) content rather than getting a blank/half-written file from
+        // disk pressure or a closed-stream mid-write. Matches the atomic
+        // tmp+move pattern used by EncryptedPrefsKeyVault and other seed paths.
         val diagFile = File(workspaceDir, "DIAGNOSTICS.md")
         try {
-            context.assets.open("nodejs-project/DIAGNOSTICS.md").use { input ->
-                diagFile.writeText(input.bufferedReader().readText())
+            val newContent = context.assets.open("nodejs-project/DIAGNOSTICS.md").use { input ->
+                input.bufferedReader().readText()
             }
-        } catch (_: Exception) { /* asset missing — skip */ }
+            val tmp = File(workspaceDir, "DIAGNOSTICS.md.tmp")
+            tmp.writeText(newContent)
+            if (!tmp.renameTo(diagFile)) {
+                // renameTo can fail on some Android FS impls if dest exists
+                if (diagFile.exists()) diagFile.delete()
+                if (!tmp.renameTo(diagFile)) {
+                    tmp.delete()
+                    Log.w("ConfigManager", "DIAGNOSTICS.md atomic write failed (rename); existing file kept")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("ConfigManager", "DIAGNOSTICS.md seed failed; existing file kept", e)
+        }
 
         // Create skills directory and seed example skills
         seedSkills(context, workspaceDir)

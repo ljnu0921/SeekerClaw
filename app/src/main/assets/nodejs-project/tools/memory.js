@@ -47,7 +47,7 @@ function scrubSessionContent(content) {
 const tools = [
     {
         name: 'memory_save',
-        description: 'Save important information to long-term memory (MEMORY.md). Use this to remember facts, preferences, or important details about the user. NEVER pass secrets through this tool — MEMORY.md and daily notes are plain-text on disk AND indexed into the SQL search DB. For API keys the user provides in chat, save them to agent_settings.json under apiKeys.<service> (the canonical agent-readable key store; built-in tools pick them up immediately). For seed phrases, private keys, passwords, OAuth tokens, and auth headers — direct the user to enter them through Settings UI (Android Keystore-encrypted SharedPreferences) rather than storing them anywhere from chat.',
+        description: 'Save important information to long-term memory (MEMORY.md). Use this to remember facts, preferences, or important details about the user. NEVER pass secrets through this tool — MEMORY.md and daily notes are plain-text on disk AND indexed into the SQL search DB. For API keys the user provides in chat, save them to agent_settings.json under apiKeys.<service> (the canonical agent-readable key store; built-in tools pick them up immediately). For seed phrases, private keys, passwords, OAuth tokens, and auth headers — direct the user to enter them through the Settings UI (which uses the appropriate per-secret-class secure storage — wallet seeds go through the burner key vault, API keys/tokens through Keystore-encrypted SharedPreferences). Never store any of those classes anywhere from chat.',
         input_schema: {
             type: 'object',
             properties: {
@@ -66,7 +66,7 @@ const tools = [
     },
     {
         name: 'daily_note',
-        description: 'Add a note to today\'s daily memory file. Use this for logging events, conversations, or daily observations. Same secrets policy as `memory_save` — NEVER pass API keys, OAuth tokens, seed phrases, private keys, passwords, or auth headers through this tool; daily notes are plain-text on disk AND indexed into the SQL search DB. For API keys the user provides in chat, save to agent_settings.json under apiKeys.<service>; for higher-risk secrets (seed phrases, private keys, etc.), direct the user to Settings UI.',
+        description: 'Add a note to today\'s daily memory file. Use this for logging events, conversations, or daily observations. Same secrets policy as `memory_save` — NEVER pass API keys, OAuth tokens, seed phrases, private keys, passwords, or auth headers through this tool; daily notes are plain-text on disk AND indexed into the SQL search DB. For API keys the user provides in chat, save to agent_settings.json under apiKeys.<service>; for higher-risk secrets (seed phrases, private keys, etc.), direct the user to the Settings UI (which routes each secret class to the appropriate secure storage backend).',
         input_schema: {
             type: 'object',
             properties: {
