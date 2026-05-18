@@ -192,6 +192,15 @@ function parseArgs(argv) {
         // but we can't assume that for every service in the upstream
         // catalog — be polite by default.
         auditSideEffects: false,
+        // BAT-761 maintenance modes — mutually exclusive with standard/audit
+        // AND with each other (R1 #7 — enforced below).
+        drift: false,
+        status: false,
+        refreshId: null,
+        // R1 #6 — --drift is a pure check by default. Caller passes
+        // --write-checked-at to persist the manifest_checked_at bump
+        // (e.g. in a scheduled job that wants the freshness signal).
+        writeCheckedAt: false,
     };
     for (let i = 2; i < argv.length; i++) {
         if (argv[i] === '--concurrency' && argv[i + 1]) { out.concurrency = _parseConcurrency(argv[++i]); }
@@ -200,6 +209,41 @@ function parseArgs(argv) {
         else if (argv[i] === '--filter' && argv[i + 1]) out.filter = argv[++i];
         else if (argv[i] === '--audit') out.audit = true;
         else if (argv[i] === '--audit-side-effects') out.auditSideEffects = true;
+        else if (argv[i] === '--drift') out.drift = true;
+        else if (argv[i] === '--status') out.status = true;
+        else if (argv[i] === '--refresh') {
+            // R8-1: --refresh requires an id argument. Pre-fix, `--refresh` without
+            // a following arg silently fell through to standard probe mode — operator
+            // would expect a single-entry refresh and get a full catalog probe instead.
+            if (!argv[i + 1] || argv[i + 1].startsWith('--')) {
+                console.error('ERROR: --refresh requires an entry id argument. Usage: --refresh <entry-id>');
+                process.exit(2);
+            }
+            out.refreshId = argv[++i];
+        }
+        else if (argv[i] === '--write-checked-at') out.writeCheckedAt = true;
+    }
+    // R1 #7 — enforce mutual exclusion. Before this guard, "--audit --status"
+    // silently ran status and ignored audit (or vice-versa).
+    const modeFlags = [out.audit, out.drift, out.status, !!out.refreshId].filter(Boolean);
+    if (modeFlags.length > 1) {
+        console.error('ERROR: --audit / --drift / --status / --refresh are mutually exclusive. Pick one.');
+        process.exit(2);
+    }
+    // R8-1: --write-checked-at only makes sense with --drift (the only mode
+    // that writes manifest_checked_at). Pre-fix it was silently ignored when
+    // passed to other modes — surprising the operator.
+    if (out.writeCheckedAt && !out.drift) {
+        console.error('ERROR: --write-checked-at only valid with --drift (it persists the manifest_checked_at bump after a drift check). Drop the flag or add --drift.');
+        process.exit(2);
+    }
+    // R10-2: symmetric to R8-1 — --audit-side-effects only makes sense with
+    // --audit (the only mode that probes endpoints with arbitrary methods).
+    // Pre-fix the flag was silently ignored in standard/drift/status/refresh
+    // modes; operator typo or misordered flags wouldn't surface.
+    if (out.auditSideEffects && !out.audit) {
+        console.error('ERROR: --audit-side-effects only valid with --audit (it opts into probing non-GET endpoints during the per-endpoint audit). Drop the flag or add --audit.');
+        process.exit(2);
     }
     return out;
 }
@@ -862,8 +906,342 @@ function _bigIntAtomicToDecimal(atomicBig, decimals) {
     return negative ? `-${out}` : out;
 }
 
+// ── BAT-761: maintenance modes (--drift / --status / --refresh <id>) ────────
+
+const SKILL_DIR = path.join(__dirname, '..', '..', 'app', 'src', 'main', 'assets', 'default-skills', 'paysh-catalog');
+const CATALOG_V2 = path.join(SKILL_DIR, 'catalog.json');
+const UNSUPPORTED_V2 = path.join(SKILL_DIR, 'unsupported.json');
+const STATUS_FILE = path.join(__dirname, 'catalog-status.md');
+const FRESHNESS_DAYS = 30;
+const PAY_SKILLS_TREE_URL = 'https://api.github.com/repos/solana-foundation/pay-skills/git/trees/main?recursive=1';
+
+function _readV2(p) {
+    const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+    // R3-1: SCHEMA.md spec says v2 readers should accept `version >= 2` so
+    // future schema bumps (v3+) don't break existing tooling. Treat unknown
+    // future-version fields as opaque (we don't read them; pass-through on write).
+    if (typeof data.version !== 'number' || data.version < 2) {
+        const got = data.version === undefined ? 'v1 (no version field)' : `version=${data.version}`;
+        throw new Error(`${p}: expected version >= 2, got ${got} — run "node tests/paysh/migrate-v1-to-v2.js" first`);
+    }
+    return data;
+}
+
+function _writeV2(p, data) {
+    fs.writeFileSync(p, JSON.stringify(data, null, 2) + '\n', 'utf8');
+}
+
+function _ageDays(isoTimestamp) {
+    if (!isoTimestamp) return Infinity;
+    return (Date.now() - new Date(isoTimestamp).getTime()) / 86400000;
+}
+
+// ─── --drift: fetch upstream pay-skills tree, diff against catalog/unsupported ──
+async function runDrift(args) {
+    console.log(`drift check — fetching ${PAY_SKILLS_TREE_URL}\n`);
+    const tree = await fetchText(PAY_SKILLS_TREE_URL, 30000);
+    if (tree.status !== 200) {
+        console.error(`Failed to fetch pay-skills tree: status ${tree.status}, error ${tree.error || ''}`);
+        process.exit(2);
+    }
+    let upstreamPayMdPaths;
+    try {
+        const json = JSON.parse(tree.body);
+        // R7-2: GitHub Trees API returns `{ truncated: true }` if the recursive
+        // listing exceeds 100k entries OR 7MB. pay-skills today is far smaller
+        // (a few hundred files) but if the repo grows or restructures, we'd
+        // silently see false "no drift" / missing-services false negatives.
+        // Fail loudly so operator notices and switches to a non-truncating
+        // enumeration strategy (e.g. recursive contents API per provider/ dir).
+        if (json.truncated === true) {
+            console.error('ERROR: GitHub Trees API returned truncated=true — upstream PAY.md inventory is INCOMPLETE.');
+            console.error('Drift comparison would be unreliable. Switch to a non-truncating enumeration before re-running --drift.');
+            process.exit(2);
+        }
+        upstreamPayMdPaths = (json.tree || []).filter(n => n.path && n.path.endsWith('/PAY.md')).map(n => n.path);
+    } catch (e) {
+        console.error(`Failed to parse pay-skills tree: ${e.message}`);
+        process.exit(2);
+    }
+    const upstream = new Set(upstreamPayMdPaths);
+
+    const catalog = _readV2(CATALOG_V2);
+    const unsupported = _readV2(UNSUPPORTED_V2);
+    const localPayMdPaths = new Set([
+        ...catalog.entries.map(e => e.upstream_ref.pay_md_path),
+        ...unsupported.entries.map(e => e.upstream_ref.pay_md_path),
+    ]);
+
+    const upstreamAdded = [...upstream].filter(p => !localPayMdPaths.has(p));
+    const localOnly = [...localPayMdPaths].filter(p => !upstream.has(p));
+    // R1 #5 — only entries with a real last_captured_at can be "stale".
+    // Pre-fix _ageDays(null) returned Infinity, so every never-captured entry
+    // got reported as "older than 30d" — drastically inflated the stale count
+    // and made the label misleading.
+    const allEntries = [...catalog.entries, ...unsupported.entries];
+    const stale = allEntries
+        .filter(e => e.verification.last_captured_at && _ageDays(e.verification.last_captured_at) > FRESHNESS_DAYS)
+        .map(e => ({ id: e.id, age_days: Math.floor(_ageDays(e.verification.last_captured_at)) }));
+    const neverCaptured = allEntries.filter(e => !e.verification.last_captured_at);
+
+    console.log(`Upstream PAY.md paths:           ${upstream.size}`);
+    console.log(`Local catalog+unsupported:       ${localPayMdPaths.size}`);
+    console.log(`Upstream added (NEW):            ${upstreamAdded.length}`);
+    console.log(`Local-only (REMOVED upstream):   ${localOnly.length}`);
+    console.log(`Captures older than ${FRESHNESS_DAYS}d:      ${stale.length}`);
+    console.log(`Never captured (probe never 402): ${neverCaptured.length}`);
+    if (upstreamAdded.length) {
+        console.log(`\nNEW upstream services not yet in our catalog/unsupported:`);
+        for (const p of upstreamAdded) console.log(`  + ${p}`);
+    }
+    if (localOnly.length) {
+        console.log(`\nServices in our catalog/unsupported that no longer exist upstream:`);
+        for (const p of localOnly) console.log(`  - ${p}`);
+    }
+    if (stale.length) {
+        console.log(`\nEntries with stale captures (last_captured_at > ${FRESHNESS_DAYS}d):`);
+        for (const s of stale.slice(0, 20)) console.log(`  ${s.id} (${s.age_days}d)`);
+        if (stale.length > 20) console.log(`  … and ${stale.length - 20} more`);
+    }
+
+    // R1 #6 — --drift defaults to a PURE check (no file mutations). Pass
+    // --write-checked-at to persist the manifest_checked_at bump (use in
+    // scheduled jobs that want the freshness signal recorded).
+    if (args && args.writeCheckedAt) {
+        const now = new Date().toISOString();
+        catalog.manifest_checked_at = now;
+        unsupported.manifest_checked_at = now;
+        // R9-1: SCHEMA.md says generated_at = "when this file was written".
+        // --drift --write-checked-at mutates the file → must bump generated_at
+        // too, else --status would report a stale "last modified" timestamp.
+        catalog.generated_at = now;
+        unsupported.generated_at = now;
+        _writeV2(CATALOG_V2, catalog);
+        _writeV2(UNSUPPORTED_V2, unsupported);
+        console.log(`\nmanifest_checked_at + generated_at bumped to ${now} (--write-checked-at)`);
+    } else {
+        console.log(`\nPure check — neither catalog.json nor unsupported.json modified. Pass --write-checked-at to persist manifest_checked_at.`);
+    }
+
+    const drifted = upstreamAdded.length + localOnly.length;
+    if (drifted > 0) {
+        console.error(`\nDRIFT DETECTED — ${drifted} upstream changes`);
+        process.exit(3);  // CI-friendly non-zero
+    }
+    console.log(`\nNo drift detected (all upstream paths accounted for).`);
+}
+
+// ─── --status: read local v2 files, write a human-readable maintenance report ─
+async function runStatus() {
+    const catalog = _readV2(CATALOG_V2);
+    const unsupported = _readV2(UNSUPPORTED_V2);
+    const allEntries = [
+        ...catalog.entries.map(e => ({ ...e, _kind: 'catalog' })),
+        ...unsupported.entries.map(e => ({ ...e, _kind: 'unsupported' })),
+    ];
+    // R1 #5 — filter out null timestamps from fresh/stale (_ageDays(null) returns
+    // Infinity, which would silently land every never-captured entry into "stale"
+    // and miscategorize the "fresh" bucket entirely).
+    const withCapture = allEntries.filter(e => !!e.verification.last_captured_at);
+    const fresh = withCapture.filter(e => _ageDays(e.verification.last_captured_at) <= FRESHNESS_DAYS);
+    const stale = withCapture.filter(e => _ageDays(e.verification.last_captured_at) > FRESHNESS_DAYS);
+    const noCapture = allEntries.filter(e => !e.verification.last_captured_at);
+    const auditPending = unsupported.entries.filter(e => Array.isArray(e.audit_pending) && e.audit_pending.length > 0);
+    const totalAuditPending = auditPending.reduce((sum, e) => sum + e.audit_pending.length, 0);
+
+    const lines = [];
+    lines.push(`# paysh-catalog maintenance status`);
+    lines.push('');
+    lines.push(`Generated: ${new Date().toISOString()}`);
+    lines.push(`Catalog generated_at: ${catalog.generated_at}`);
+    lines.push(`Manifest last checked: ${catalog.manifest_checked_at} (run \`node tests/paysh/probe-catalog.js --drift --write-checked-at\` to refresh — bare \`--drift\` is a pure check and won't update this timestamp)`);
+    lines.push(`Freshness window: ${FRESHNESS_DAYS} days`);
+    lines.push('');
+    lines.push('## Summary');
+    lines.push('');
+    lines.push(`| Bucket | Count |`);
+    lines.push(`|--------|-------|`);
+    lines.push(`| Catalog entries | ${catalog.entries.length} |`);
+    lines.push(`| Unsupported entries | ${unsupported.entries.length} |`);
+    lines.push(`| Fresh (capture ≤ ${FRESHNESS_DAYS}d) | ${fresh.length} |`);
+    lines.push(`| Stale (capture > ${FRESHNESS_DAYS}d) | ${stale.length} |`);
+    lines.push(`| No capture (probe never reached 402) | ${noCapture.length} |`);
+    lines.push(`| Entries with audit_pending siblings | ${auditPending.length} |`);
+    lines.push(`| Total audit_pending sibling endpoints | ${totalAuditPending} |`);
+    lines.push('');
+    if (stale.length) {
+        lines.push(`## Stale captures (> ${FRESHNESS_DAYS}d) — consider \`--refresh <id>\``);
+        lines.push('');
+        lines.push(`| id | kind | age (days) | last_captured_at |`);
+        lines.push(`|---|---|---|---|`);
+        for (const e of stale.sort((a, b) => _ageDays(b.verification.last_captured_at) - _ageDays(a.verification.last_captured_at))) {
+            lines.push(`| \`${e.id}\` | ${e._kind} | ${Math.floor(_ageDays(e.verification.last_captured_at))} | ${e.verification.last_captured_at} |`);
+        }
+        lines.push('');
+    }
+    if (auditPending.length) {
+        lines.push('## Audit-pending siblings (queued for catalog promotion)');
+        lines.push('');
+        lines.push(`| service_id | pending count | deferred_to |`);
+        lines.push(`|---|---|---|`);
+        for (const e of auditPending.sort((a, b) => b.audit_pending.length - a.audit_pending.length)) {
+            const deferred = [...new Set(e.audit_pending.map(p => p.deferred_to).filter(Boolean))].join(', ') || '(unscheduled)';
+            lines.push(`| \`${e.service_id}\` | ${e.audit_pending.length} | ${deferred} |`);
+        }
+        lines.push('');
+    }
+    fs.writeFileSync(STATUS_FILE, lines.join('\n') + '\n', 'utf8');
+    console.log(`Status written to ${path.relative(process.cwd(), STATUS_FILE)}`);
+    console.log(`  catalog: ${catalog.entries.length}, unsupported: ${unsupported.entries.length}, stale: ${stale.length}, audit_pending: ${totalAuditPending}`);
+}
+
+// ─── --refresh <id>: re-probe one entry, update verification metadata ───────
+async function runRefresh(id) {
+    const catalog = _readV2(CATALOG_V2);
+    const unsupported = _readV2(UNSUPPORTED_V2);
+    let entry = catalog.entries.find(e => e.id === id);
+    let containingFile = CATALOG_V2;
+    let containingObj = catalog;
+    let kind = 'catalog';
+    if (!entry) {
+        entry = unsupported.entries.find(e => e.id === id);
+        containingFile = UNSUPPORTED_V2;
+        containingObj = unsupported;
+        kind = 'unsupported';
+    }
+    if (!entry) {
+        console.error(`No entry found with id "${id}" in catalog.json or unsupported.json`);
+        process.exit(2);
+    }
+    console.log(`Refreshing ${kind}/${id}`);
+    console.log(`  upstream_ref: ${entry.upstream_ref.pay_md_path}`);
+
+    // Re-discover via existing discoverOne (also fetches PAY.md frontmatter + openapi).
+    // R1 #3 — use discoverOne's freshly-read service_url, NOT entry.upstream_ref.service_url
+    // (which may be null for unsupported entries that never had a capture). discoverOne
+    // returns disc.serviceUrl from PAY.md frontmatter; combine with our entry's endpoint.path.
+    const disc = await discoverOne(entry.upstream_ref.pay_md_path);
+    if (!disc.ok) {
+        console.error(`discoverOne failed: ${disc.error}`);
+        // R7-1: parallel to R4-1 — catalog entries MUST stay parsed_ok per
+        // v2 schema. If discoverOne fails (PAY.md unreachable, openapi gone,
+        // etc.), refuse to mutate catalog.json with probe_status: fetch_failed
+        // — that would silently degrade the catalog. Operator must investigate
+        // + manually demote to unsupported.json. For unsupported entries,
+        // recording fetch_failed is fine (they're already not in catalog).
+        if (kind === 'catalog') {
+            console.error(`REFUSING to write: catalog entry "${id}" failed discovery (would degrade catalog).`);
+            console.error('catalog.json was NOT modified. Investigate the failure and manually move the entry to unsupported.json if confirmed broken.');
+            process.exit(3);
+        }
+        const failNow = new Date().toISOString();
+        entry.verification.last_probed_at = failNow;
+        entry.verification.probe_status = 'fetch_failed';
+        containingObj.generated_at = failNow;
+        _writeV2(containingFile, containingObj);
+        process.exit(2);
+    }
+    const baseUrl = disc.serviceUrl || entry.upstream_ref.service_url;
+    if (!baseUrl) {
+        console.error(`No service_url available (disc.serviceUrl and entry.upstream_ref.service_url both empty)`);
+        process.exit(2);
+    }
+    // R3-3: persist disc.serviceUrl back into entry.upstream_ref.service_url so
+    // future --refresh calls (and other tooling) don't need to re-discover. This
+    // is especially useful for unsupported entries that started with null service_url.
+    if (disc.serviceUrl && entry.upstream_ref.service_url !== disc.serviceUrl) {
+        if (!entry.upstream_ref.service_url) {
+            console.log(`  service_url backfilled from PAY.md: ${disc.serviceUrl}`);
+        } else {
+            console.log(`  service_url updated: ${entry.upstream_ref.service_url} → ${disc.serviceUrl}`);
+        }
+        entry.upstream_ref.service_url = disc.serviceUrl;
+    }
+    disc.probeUrl = baseUrl.replace(/\/$/, '') + entry.endpoint.path;
+    disc.probeMethod = entry.endpoint.method;
+    console.log(`  endpoint:     ${disc.probeMethod} ${disc.probeUrl}`);
+
+    // R1 #4 — use a real X402Protocol instance, not the payment-registry module
+    // (which exports { register, detectProtocol, ... } — no .detect()/.build()).
+    // Pre-fix probeAndParse would crash on the first proto.detect() call.
+    const proto = new X402Protocol();
+    const probed = await probeAndParse(disc, proto);
+    const status = probed.row.result;
+    console.log(`  probe_status: ${status}`);
+
+    // R4-1: catalog entries MUST have probe_status === 'parsed_ok' per SCHEMA.md.
+    // If a refresh degrades a catalog entry (service broke upstream, parser now
+    // rejects, etc.), refuse to write — otherwise we'd ship a "supported" entry
+    // that doesn't probe. Surface the problem and exit non-zero so CI/operator
+    // notices; demoting catalog → unsupported is intentionally OUT OF SCOPE here
+    // (needs human review of which `reason` bucket applies, what to put in note,
+    // whether other catalog endpoints from the same service still work, etc.).
+    if (kind === 'catalog' && status !== 'parsed_ok') {
+        console.error(`\nREFUSING to write: catalog entry "${id}" refreshed with probe_status="${status}" but catalog requires parsed_ok.`);
+        console.error('The service may have degraded upstream. Human review needed:');
+        console.error('  1. Investigate the probe failure (rerun in standard mode or check the service directly).');
+        console.error(`  2. If genuinely broken, manually move "${id}" from catalog.json to unsupported.json with an appropriate reason bucket.`);
+        console.error('  3. catalog.json and unsupported.json were NOT modified by this refresh.');
+        process.exit(3);
+    }
+
+    const now = new Date().toISOString();
+    entry.verification.last_probed_at = now;
+    entry.verification.probe_status = status;
+
+    if (status === 'parsed_ok' && probed.captured) {
+        // R1 #4 — sanitize before committing. Pre-fix wrote raw headers/body
+        // to the repo fixture, which could leak secret-shaped tokens (api keys,
+        // session cookies, internal IDs). sanitize() is the same helper used by
+        // --commit-captures and the live probe path.
+        // R2-6: when no existing capture path, include entry.id in the default
+        // filename. Pre-fix the default was operator+slug only — once we have
+        // multiple v2 entries per service (e.g. stablecrypto-price + stablecrypto-charts),
+        // they'd collide on the same capture file and overwrite each other.
+        const captureName = entry.verification.last_capture_path
+            ? path.basename(entry.verification.last_capture_path)
+            : `${entry.upstream_ref.operator}-${entry.upstream_ref.slug.replace(/\//g, '_')}__${entry.id}.json`;
+        const captureFullPath = path.join(__dirname, 'captures', 'catalog', captureName);
+        // R3-2: capture path stored in v2 JSON must be relative to repo root
+        // (e.g. `tests/paysh/captures/catalog/foo.json`), not relative to tests/
+        // (`paysh/captures/catalog/foo.json`). __dirname is `tests/paysh`, so go
+        // up TWO levels to reach repo root.
+        const repoRoot = path.join(__dirname, '..', '..');
+        const captureRel = path.relative(repoRoot, captureFullPath).split(path.sep).join('/');
+        const captureContent = sanitize({
+            _meta: {
+                label: `${entry.upstream_ref.operator}-${entry.upstream_ref.slug.replace(/\//g, '_')}-402`,
+                capturedAt: now,
+                source: 'probe-catalog --refresh',
+                payMdPath: entry.upstream_ref.pay_md_path,
+                note: `Refreshed via probe-catalog.js --refresh ${id} (BAT-761).`,
+            },
+            url: disc.probeUrl,
+            method: disc.probeMethod,
+            status: probed.captured.status,
+            headers: probed.captured.headers,
+            body: probed.captured.body,
+        });
+        fs.mkdirSync(path.dirname(captureFullPath), { recursive: true });
+        fs.writeFileSync(captureFullPath, JSON.stringify(captureContent, null, 2) + '\n', 'utf8');
+        entry.verification.last_capture_path = captureRel;
+        entry.verification.last_captured_at = now;
+        console.log(`  capture written: ${captureRel}`);
+    }
+
+    containingObj.generated_at = now;
+    _writeV2(containingFile, containingObj);
+    console.log(`  ${path.relative(process.cwd(), containingFile)} updated`);
+}
+
 async function main() {
     const args = parseArgs(process.argv);
+
+    // BAT-761 maintenance modes — dispatch before standard/audit flow.
+    if (args.drift) return runDrift(args);
+    if (args.status) return runStatus();
+    if (args.refreshId) return runRefresh(args.refreshId);
+
     let workItems = PAY_MD_PATHS;
     if (args.filter) workItems = workItems.filter(p => p.toLowerCase().includes(args.filter.toLowerCase()));
     if (args.limit > 0) workItems = workItems.slice(0, args.limit);
