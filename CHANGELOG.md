@@ -47,7 +47,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 #### Infrastructure & Tests
 
-- **402 detect/settle test harnesses** — `tests/paysh/validate-detect.js` (Layer 2) + `validate-settle.js` (Layer 2.5 mocked) cover 42 detect entries and 40 settle entries with byte-exact pay.sh challenge captures. Catches gateway-protocol regressions before they ship.
+- **402 detect/settle test harnesses** — `tests/paysh/validate-detect.js` (Layer 2) + `validate-settle.js` (Layer 2.5 mocked) cover 42 `EXPECTATIONS` entries and 37 `SETTLE_CAPTURES` entries with byte-exact pay.sh challenge captures. Catches gateway-protocol regressions before they ship.
 - **Capture sanitize hardening (BAT-769)** — `tests/paysh/lib/sanitize.js` redacts payment-signature headers, long base64/hex blobs, and transport-noise headers (`report-to`, `nel`, `rndr-id`, `x-render-origin-server`) so committed capture fixtures contain no live secrets.
 - **Tool input-schema validity CI gate** — every tool's `input_schema` is now validated as JSON Schema in pre-push and CI. Catches the BAT-664 schema-kill class (`type: ['object', 'array', 'string']` without `items`) before it takes down agent turns.
 
