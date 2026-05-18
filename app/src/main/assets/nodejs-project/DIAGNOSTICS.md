@@ -682,3 +682,50 @@ Both were red herrings — root cause was always "not enough USDC at the source.
 1. Run `wallet_status` to show the current caps + remaining daily.
 2. Suggest `wallet_set_caps({per_tx_usdc: "..."})` (always with user confirmation) OR wait for daily reset at 00:00 UTC.
 
+## paysh-catalog (BAT-704/761/768/766/769)
+
+### `agent_pay 200/400/422 after settle — gateway rejected the body/params (doc-vs-gateway divergence)`
+**Symptoms:** `agent_pay` POST returns HTTP 4xx (most often 400) AFTER payment settled — USDC was spent, no usable response. Agent may retry once or twice (more burn) before falling back. Common forms:
+- HTTP 400 with body `{"error": "ids must be array"}` (or similar field-shape complaint) — sent strings where the gateway openapi declared `array<string>`.
+- HTTP 400 with body `{"error": "Unknown field: pool_address"}` — used the upstream API's field name; the gateway renamed it (`pool_address` → `address`, `protocol` → `name`).
+- HTTP 400 with `{"error": "expected days to be string"}` — sent a number where openapi declared `string` (CoinGecko `days` is `"7"` not `7` through the gateway).
+- HTTP 200 with garbage / silent wrong-shape data — gateway silently ignored unknown query params (common on GET endpoints that proxy upstream loosely).
+**Diagnosis:** The catalog markdown doc (`services/<id>.md`) was hand-written from the upstream API's public REST docs instead of the gateway's `openapi.json`. The merit-systems / paysponge gateways diverge from upstream in three structural ways: (1) arrays where upstream takes comma-separated strings, (2) string types where upstream takes numbers, (3) renamed field names. Fixed in PR #382 (stablecrypto) and PR #383 (rentcast) by deriving every body/param table from the live `openapi.json`.
+**Fix:**
+1. Fetch the service's openapi schema for the failing endpoint:
+   ```
+   curl -s https://<service>.x402.paysponge.com/openapi.json | jq '.paths["<path>"].post.requestBody.content["application/json"].schema'
+   ```
+   (Use `.get.parameters` for GET endpoints.)
+2. Compare `required[]` and `properties{}` against the body/params the agent_pay call sent. The truth is on the gateway, not on CoinGecko/DefiLlama/etc. public REST docs.
+3. Re-issue the call with the openapi-correct shape (arrays as arrays, string-typed numbers as quoted strings, gateway-named fields).
+4. If the catalog doc itself is wrong, that's a maintainer fix (rewrite `services/<id>.md` like PR #382/#383 did, bump `paysh-catalog/SKILL.md` version so `ConfigManager.seedSkill()` re-seeds existing devices). The agent can flag this to the user but should not edit catalog docs from chat.
+5. Some gateways (tripadvisor, wolframalpha, 2captcha, reducto) declare ZERO query params in their openapi yet accept them as upstream passthrough — for those, the doc IS the source of truth and the openapi-grounded verification doesn't apply. Verify by reading `services/<id>.md` and trying the documented shape.
+
+### `agent autonomously paid for trivia / activated paysh-catalog without an explicit pay-intent keyword`
+**Symptoms:** User asks a factual/trivia question (e.g., "what is the price of SOL", "what's the mass of the sun") and the agent calls `agent_pay` burning USDC, instead of using free tools (`solana_price`, training data, `web_search`).
+**Diagnosis:** BAT-704 regression. The paysh-catalog skill is OPT-IN — it should activate ONLY when the user's message contains an explicit pay-intent keyword: `pay.sh` / `paysh` / `pay sh` / `x402` / `pay for X` / `pay to X` / `use pay` / `pay <service>` / `use <service> to pay` / `look this up paid` / `fetch this paid` / `buy data from <service>`, plus the capability-ask phrases "what can you pay for", "show me pay.sh services", "list paid services". If the agent reaches for `agent_pay` without one of these triggers in the user's message, it's violating the opt-in policy. Common causes:
+- Skill `paysh-catalog/SKILL.md` corrupted or older version (pre-BAT-704) re-seeded after a workspace reset
+- Agent over-matched a non-pay keyword (e.g., treated "what's the price of SOL" as a pay intent because `solana_price` momentarily wasn't loading)
+- `agent_pay` invoked from a `[skill just installed]` follow-up that the agent treated as authorization
+**Fix:**
+1. Check the skill version: `read app/src/main/assets/default-skills/paysh-catalog/SKILL.md` — frontmatter `version:` should be ≥ 1.4.0 (BAT-704 was 1.4.0). If lower, the skill predates the opt-in rule.
+2. Check the prompt door is intact: read `app/src/main/assets/nodejs-project/ai.js` `buildSystemBlocks()` around the Wallets section — look for the "Paysh-catalog is OPT-IN" paragraph and its keyword list. If it's missing, the build regressed.
+3. Refund/apologize to the user: the call already settled (USDC spent). Tell the user explicitly what happened ("I called a paid endpoint without your authorization — that violates the opt-in policy") and how to avoid it (use a free tool name, or explicitly say "no paying").
+4. If the agent persistently auto-activates: report the trigger phrase that mis-matched so it can be added to the don't-match list in SKILL.md.
+
+### `paid more than the catalog cost_usdc said (cost discrepancy)`
+**Symptoms:** Agent reply says "Paid: $0.02 USDC" but the user expected $0.01 (matching `catalog.json` `cost_usdc`). The transaction succeeded; the question is just where the extra cost came from.
+**Diagnosis:** Two real possibilities and one rare one:
+1. **Multi-call composition (most common).** Agent issued multiple paid calls to assemble one answer. Example: a "rent trends for ZIP X" reply that includes per-bedroom breakdown likely called `/markets` (current trends) + `/listings/rental/long-term` (to bucket by bedroom count), 2 × $0.01 = $0.02. This is correct agent behavior — but it should be transparent in the reply.
+2. **Stale `cost_usdc` in catalog.** The endpoint actually charges more than the catalog recorded during BAT-706 audit. Verify by probing the live 402:
+   ```
+   curl -s https://<service>.x402.paysponge.com/<path> | jq '.accepts[] | select(.network | startswith("solana:")) | .amount'
+   ```
+   Result is in USDC atomic units (6 decimals): `"10000"` = $0.01, `"20000"` = $0.02. If the live amount > catalog `cost_usdc`, the catalog is stale — flag for maintainer to update.
+3. **(Rare) Gateway promoted the endpoint to a tiered cost** based on response size or query complexity. Some pay.sh services do this; the live 402 will show the higher amount.
+**Fix:**
+1. In the agent's reply, ALWAYS surface multi-call composition transparently: "Paid $0.02 across 2 calls (`/markets` + `/listings/rental/long-term`)" rather than just "Paid $0.02". Users can't tell otherwise.
+2. If the live probe confirms the catalog is stale, tell the user "the recorded price ($0.01) is out of date — actual is $0.02. I'll flag this for the maintainer." Don't refuse the call retroactively (it already settled).
+3. Maintainer-side fix: update `catalog.json` `entries[].endpoint.cost_usdc` for the affected entry, bump `paysh-catalog/SKILL.md` version so devices re-seed.
+

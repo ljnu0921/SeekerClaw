@@ -47,7 +47,7 @@ function scrubSessionContent(content) {
 const tools = [
     {
         name: 'memory_save',
-        description: 'Save important information to long-term memory (MEMORY.md). Use this to remember facts, preferences, or important details about the user.',
+        description: 'Save important information to long-term memory (MEMORY.md). Use this to remember facts, preferences, or important details about the user. NEVER pass secrets through this tool — API keys, OAuth tokens, seed phrases, private keys, passwords, and auth headers must be stored in agent_settings.json under apiKeys.* (encrypted at rest), never written to MEMORY.md or daily notes (plain-text on disk + indexed into the SQL search DB).',
         input_schema: {
             type: 'object',
             properties: {
