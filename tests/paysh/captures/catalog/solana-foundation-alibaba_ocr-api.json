@@ -1,0 +1,44 @@
+{
+  "_meta": {
+    "label": "solana-foundation-alibaba_ocr-api-402",
+    "capturedAt": "2026-05-12T11:03:30.241Z",
+    "source": "probe-catalog",
+    "payMdPath": "providers/solana-foundation/alibaba/ocr-api/PAY.md",
+    "note": "Sanitized per BAT-582 v1.6 contract amendment 6."
+  },
+  "url": "https://ocr-api.alibaba.gateway-402.com/recognize-advanced",
+  "method": "POST",
+  "status": 402,
+  "headers": {
+    "content-type": "application/json",
+    "www-authenticate": "Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:29.80477192Z\", Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:29.925535876Z\", Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:30.119742775Z\"",
+    "x-cloud-trace-context": "[REDACTED]",
+    "date": "Tue, 12 May 2026 11:03:30 GMT",
+    "server": "Google Frontend",
+    "content-length": "268",
+    "via": "1.1 google",
+    "alt-svc": "h3=\":443\"; ma=2592000,h3-29=\":443\"; ma=2592000"
+  },
+  "body": {
+    "endpoint": {
+      "method": "POST",
+      "path": "recognize-advanced"
+    },
+    "error": "payment_required",
+    "message": "This endpoint requires payment.",
+    "payment": {
+      "challenges": 3,
+      "protocol": "mpp"
+    },
+    "pricing": {
+      "dimensions": [
+        {
+          "direction": "usage",
+          "price_usd": 0.001,
+          "scale": 1,
+          "unit": "requests"
+        }
+      ]
+    }
+  }
+}

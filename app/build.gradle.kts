@@ -38,8 +38,8 @@ android {
         applicationId = "com.seekerclaw.app"
         minSdk = 34
         targetSdk = 35
-        versionCode = 19
-        versionName = "1.10.0"
+        versionCode = 20
+        versionName = "2.0.0"
 
         // Keep these in sync when updating OpenClaw or nodejs-mobile
         buildConfigField("String", "OPENCLAW_VERSION", "\"2026.4.10\"")
@@ -267,6 +267,12 @@ dependencies {
 
     // Solana transaction building (pure Kotlin)
     implementation("org.sol4k:sol4k:0.4.2")
+
+    // BouncyCastle — Ed25519 signing for the burner wallet (BAT-582).
+    // Not transitively available from Android Keystore (which uses platform
+    // crypto for AES-GCM); must be declared explicitly. R8/ProGuard strips
+    // unused BC classes, so APK impact is bounded to the Ed25519 surface.
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
 
     // Coil — image loading for skill avatars
     implementation(libs.coil.compose)

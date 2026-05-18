@@ -1,0 +1,31 @@
+{
+  "_meta": {
+    "label": "tripadvisor-v2-success",
+    "description": "v2 PAYMENT-RESPONSE captured during Layer 3 live-pay (tripadvisor)",
+    "capturedAt": "2026-05-12T11:16:41.128Z",
+    "onChainSignature": "48dRv3WfXtDzYAZ1CE34C81Nk9r5LEgoC1CKfEtvt8JtBnb9WPMNWjtJBkmEbeyzCb7YQ5tzF4mB2cGDANnrEgxT",
+    "demandAtomic": "10000",
+    "note": "Spent real USDC. Body redacted via paidSummary=true (we paid for that content). Captured for regression pinning of v2 settle path."
+  },
+  "url": "https://tripadvisor.x402.paysponge.com/api/v1/location/search?searchQuery=Tbilisi&category=restaurants",
+  "method": "GET",
+  "status": 200,
+  "headers": {
+    "date": "Tue, 12 May 2026 11:16:41 GMT",
+    "content-type": "application/json",
+    "transfer-encoding": "chunked",
+    "connection": "keep-alive",
+    "access-control-allow-credentials": "true",
+    "cf-cache-status": "DYNAMIC",
+    "payment-response": "[REDACTED]",
+    "rndr-id": "bae23a9b-774e-4bde",
+    "server": "cloudflare",
+    "vary": "Origin, Accept-Encoding",
+    "x-render-origin-server": "Render",
+    "report-to": "{\"group\":\"cf-nel\",\"max_age\":604800,\"endpoints\":[{\"url\":\"https://a.nel.cloudflare.com/report/v4?s=10l2zquVgifAWahw%[REDACTED]%[REDACTED]%2BeCYQePTzg%3D\"}]}",
+    "nel": "{\"report_to\":\"cf-nel\",\"success_fraction\":0.0,\"max_age\":604800}",
+    "cf-ray": "9fa9032df9f4f9bb-SOF",
+    "alt-svc": "h3=\":443\"; ma=86400"
+  },
+  "body": "[REDACTED — paid response body summarized; ? bytes original]"
+}

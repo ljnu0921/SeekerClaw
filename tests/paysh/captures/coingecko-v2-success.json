@@ -1,0 +1,42 @@
+{
+  "_meta": {
+    "label": "coingecko-v2-success",
+    "description": "v2 PAYMENT-RESPONSE captured during Layer 3 live-pay (coingecko)",
+    "capturedAt": "2026-05-12T11:16:45.947Z",
+    "onChainSignature": "4G3KRMr9YTecPRmihK7kj6shnWEQMaVGGdQCuE2uAp7Xo1uQC2Gk7yVhUK2CFYnXnWx36u9qbb4c6YSsoSNoh45u",
+    "demandAtomic": "10000",
+    "note": "Spent real USDC. Body redacted via paidSummary=true (we paid for that content). Captured for regression pinning of v2 settle path."
+  },
+  "url": "https://pro-api.coingecko.com/api/v3/x402/onchain/networks/solana/trending_pools",
+  "method": "GET",
+  "status": 200,
+  "headers": {
+    "date": "Tue, 12 May 2026 11:16:45 GMT",
+    "content-type": "application/json; charset=utf-8",
+    "transfer-encoding": "chunked",
+    "connection": "keep-alive",
+    "server": "cloudflare",
+    "x-frame-options": "SAMEORIGIN",
+    "x-xss-protection": "0",
+    "x-content-type-options": "nosniff",
+    "x-permitted-cross-domain-policies": "none",
+    "referrer-policy": "strict-origin-when-cross-origin",
+    "cache-control": "max-age=30, public, must-revalidate, s-maxage=30",
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "POST, PUT, DELETE, GET, OPTIONS",
+    "access-control-request-method": "*",
+    "access-control-allow-headers": "Origin, X-Requested-With, Content-Type, Accept, Authorization",
+    "access-control-expose-headers": "link, per-page, total",
+    "payment-response": "[REDACTED]",
+    "vary": "Accept-Encoding, Origin",
+    "etag": "W/\"[REDACTED]\"",
+    "x-request-id": "4fe9a0e4-d135-4a88-937d-8f8cb9b05f22",
+    "x-runtime": "2.164215",
+    "alternate-protocol": "443:npn-spdy/2",
+    "content-security-policy-report-only": "script-src https://accounts.google.com/gsi/client; frame-src https://accounts.google.com/gsi/; connect-src https://accounts.google.com/gsi/;",
+    "strict-transport-security": "max-age=15724800; includeSubdomains",
+    "cf-cache-status": "MISS",
+    "cf-ray": "9fa9034cc9ac8ee6-SOF"
+  },
+  "body": "[REDACTED — paid response body summarized; ? bytes original]"
+}

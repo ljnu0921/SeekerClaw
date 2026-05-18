@@ -100,6 +100,20 @@ grep "\[Trace\]" node_debug.log | tail -10
 3. The system automatically retries with backoff — no manual intervention usually needed
 4. API timeout is configurable in agent_settings.json (`apiTimeoutMs`, default 120000)
 
+### Invalid Tool Schema (400 Error) — Agent Won't Respond
+**Symptoms:** Every agent turn fails with `API error (400): Invalid schema for function 'TOOLNAME'`. NO tool is dispatched; the model rejects the entire toolset before producing any output. Agent appears completely dead.
+**Check:**
+```
+grep -i "Invalid schema for function" node_debug.log | tail -3
+```
+**Diagnosis:** The Anthropic API validates every tool's `input_schema` before allowing the model to call any of them. A single malformed schema rejects the WHOLE toolset, not just calls to the bad tool. Common bug shapes that bite:
+- `type: ['object', 'array', 'string']` without `items: {}` — when a union includes `array`, `items` is required even for the polymorphic case. Caught: BAT-664 (`tools/agent_pay.js` `body` parameter).
+- `required: ['foo']` where `foo` isn't in `properties`.
+- Misspelled JSON Schema type names (`"strng"` instead of `"string"`).
+**Fix:** `node tests/nodejs-project/tool-schemas.test.js` walks every tool's schema and points at the bad one. CI runs this on every PR (`.github/workflows/build.yml` `node-tests` job). If you see this error in production, the safety net was bypassed — investigate. Once the schema is corrected:
+- **Node-bundle change** (any `app/src/main/assets/nodejs-project/**` file, including `tools/index.js` and all `tools/*.js`): the assets are extracted from the APK to `filesDir/nodejs-project/` on first launch, so a fresh APK install ships the fix; on an already-installed device, the bundle re-extracts on the next service restart. No Kotlin recompile needed.
+- **Android/Kotlin change** (any `app/src/main/java/com/seekerclaw/**` file — Settings UI, bridge endpoints, KeyVault, etc.): requires `./gradlew assembleDappStoreDebug` + `adb install -r`, then service restart.
+
 ### Context Overflow (400 Error)
 **Symptoms:** API returns 400 error, message mentions "maximum context length" or "too many tokens".
 **Check:**
@@ -477,3 +491,301 @@ grep -i "MCP.*reconcile\|MCP.*Failed to" node_debug.log | tail -20
 1. The cleartext loopback fix (`ee29727`) repaired this path — pre-fix, `[NodeControlClient] reconcile failed: Cleartext HTTP not permitted` was silent and fell through to "next service start picks up the change."
 2. If reconcile is still failing post-`ee29727`: stop and restart the agent — the next service start reads `mcp_servers.json` fresh and connects all enabled servers via the normal startup path.
 3. If a specific server keeps failing in `[MCP] Failed to (re)connect`: verify the URL and auth in Settings → MCP Servers. Test reachability with `curl -I <server-url>` if it has a public health endpoint.
+
+---
+
+## Burner Wallet (BAT-582)
+
+### `burner: invalid key format`
+**Symptoms:** Burner setup screen rejects the pasted key with "invalid key format."
+**Diagnosis:** `KeyImporter` could not parse the input as base58 OR a JSON byte array of length 32 or 64 bytes. Common causes: trailing whitespace, extra characters, wrong format (e.g., a hex string), wrong length (the wallet exported a 33-byte compressed key instead of a 32-byte seed).
+**Fix:**
+1. Re-export the key from the source wallet (Phantom: Settings → Security → Reveal Secret Recovery Phrase → derive specific account).
+2. Strip whitespace; ensure the value is base58 OR a `[1, 2, …, 64]` JSON array.
+3. If the source provides only a seed phrase (12/24 words), use a wallet's "export private key" feature — SeekerClaw does not derive from mnemonics in V1.
+
+### `burner: invalid keypair (pubkey/seed mismatch)`
+**Symptoms:** Burner setup rejects a 64-byte expanded key with "pubkey mismatch."
+**Diagnosis:** The trailing 32 bytes of the expanded key don't match the public key derived from the leading 32-byte seed. The key is corrupted or was assembled incorrectly.
+**Fix:** Re-export from the source wallet. If the issue persists, switch to importing only the 32-byte seed (SeekerClaw will derive the public half itself).
+
+### `burner: storage_failure (Failed to persist key)`
+**Symptoms:** Burner setup parses + validates the key, but the Save step returns `storage_failure`. Bridge endpoints / Settings UI report "Failed to persist key" or `error: "storage_failure"`.
+**Diagnosis:** `KeyImporter` accepted the bytes (format + pubkey check passed), but writing to encrypted storage failed AFTER validation. This is NOT an invalid-key error — the key itself is fine. Likely causes:
+- Device storage is full or near full (atomic move + ciphertext write fails on ENOSPC).
+- Android Keystore initialization failure (rare on Solana Seeker, more common on heavily customized OEM ROMs).
+- Filesystem permissions / SELinux denial under `filesDir/burner_keys/` (also rare).
+**Fix:**
+1. Tell the user: "The burner key looked valid but couldn't be saved to encrypted storage." Do NOT tell them to re-paste — the key wasn't the problem.
+2. Check device storage: `android_storage` tool or Settings → Storage. Free space if under ~100 MB.
+3. Restart the app — Keystore alias may re-initialize cleanly on next start.
+4. If persistent across restarts: collect logcat (`adb logcat | grep KeystoreHelper\|EncryptedPrefsKeyVault`) and file a bug.
+
+### `burner: cap exceeded (per-tx)`
+**Symptoms:** Tool result includes `error: "burner_cap_exceeded"` or `over_per_tx_cap`. Agent tells the user "this is over your burner per-tx cap."
+**Diagnosis:** The principal (lamports for SOL, microunits for USDC) of the tx exceeds the configured `capPerTxSol` / `capPerTxUsdc`.
+**Fix:**
+1. Use `wallet_set_caps` to raise the per-tx cap (confirmation popup shows old → new diff).
+2. Or pass `_allowMainFallback: true` in the tool args to retry through the main MWA wallet (popup required).
+3. Or split the spend into smaller chunks if appropriate.
+
+### `burner: cap exceeded (daily, X remaining, resets at HH:MM UTC)`
+**Symptoms:** Tool result includes `over_daily_cap`. Agent should report remaining daily allowance.
+**Diagnosis:** `spentTodaySol + atomicAmount > capDailySol` (or USDC equivalent). The 24-hour window resets at 00:00 UTC.
+**Fix:**
+1. Wait for the daily reset (00:00 UTC).
+2. Raise the daily cap via `wallet_set_caps`.
+3. Use the main wallet (popup) for the over-cap portion.
+
+### `burner: no burner configured`
+**Symptoms:** `wallet_status` returns `burner: null`. Tools route to main MWA path with confirmation popup. Bridge calls return `burner_not_configured`.
+**Diagnosis:** No private key has been imported yet; the burner is in the "single-wallet" baseline mode.
+**Fix:** Open SeekerClaw → Settings → Burner Wallet → import a key. Until then, every tool routes through MWA exactly like v1.0.
+
+### `burner: tx unsupported`
+**Symptoms:** `/burner/sign-transaction` returns one of:
+- `unsupported_tx_format` — the bytes aren't a recognizable Solana legacy or v0 tx
+- `burner_not_required_signer` — the burner pubkey is not in the required-signers list
+- `additional_signers_required` — there are other required signers who haven't signed yet (V1 only supports single-signer or pre-signed-by-others)
+- `bogus_shortvec` — compact-u16 length encoding is malformed
+**Diagnosis:** The Jupiter Ultra / Trigger / Recurring API returned an unexpected tx shape, OR the tool built a tx with the wrong signer. Most common in development when adding a new flow.
+**Fix:**
+1. Check `node_debug.log` for `[Jupiter ...] Tx verified` lines preceding the failure.
+2. Verify the tool is passing the correct signer pubkey to the Jupiter API (`maker` / `payer` / `user` field).
+3. Re-fetch the order — Jupiter Ultra payloads have ~2 min TTL; an expired payload re-served from cache could mismatch.
+
+### `burner: reservation expired (tx took longer than 60s)`
+**Symptoms:** `/burner/sign-transaction` returns `reservation_expired`. The reservation TTL elapsed before signing happened.
+**Diagnosis:** Default reservation TTL is 60s. Signing should be near-instant; if it took longer, something blocked the sign path (heavy GC, bridge stall).
+**Fix:**
+1. Retry the operation — the agent's tool-use loop will request a fresh reservation.
+2. If recurrent, check device load — is another foreground app starving the :node process?
+3. Android's periodic sweep auto-releases stale reservations every 30s, so daily spend isn't burned.
+
+### `burner: reservation not found`
+**Symptoms:** `/burner/sign-transaction` or `/burner/commit` returns `reservation_not_found`. Caller passed a reservationId that the cap state machine has never seen (or that aged out of the in-memory disposed-id ring).
+**Diagnosis:** Most common cause is a code bug: a caller forged a reservationId or held one across a process restart (the disposed-id ring is process-local). Could also happen if a very old id was retried after the ring evicted it (bound: 1024 most recent ids).
+**Fix:**
+1. Always go through `/burner/reserve` to mint an id, then immediately use it for sign + commit/release. Never reuse ids across operations.
+2. If the bug is in a tool: trace the lifecycle of the reservationId through your code path. Per contract, the issuer of `/burner/reserve` is the same caller that does `/burner/sign-transaction` + commit/release.
+3. BAT-582 R2 added this validation. Pre-R2, sign-transaction would silently sign without verifying the id — that was a security gap, not a feature.
+
+### `burner: reservation not pending`
+**Symptoms:** `/burner/sign-transaction` returns `reservation_not_pending`. The reservationId was previously committed or released; re-using a finalized id is a state-machine violation.
+**Diagnosis:** Caller is double-spending a reservation OR retrying after a transient error without re-reserving. The cap state machine refuses because either:
+- the id was already committed (the reservation already counted toward daily spend), or
+- the id was already released (the caller already abandoned it).
+**Fix:**
+1. Don't retry sign-transaction with the same id after a successful commit. Reserve a new one.
+2. If you need to retry after a transient error: `/burner/release` the old id (idempotent), then `/burner/reserve` for a fresh attempt.
+3. `/burner/commit` is idempotent in the OTHER direction: a second commit with the same id returns ok=true (no-op). Sign-transaction is intentionally stricter.
+
+### `burner: bridge unreachable (Node ↔ Android)`
+**Symptoms:** Tool result `error: "bridge_unreachable"` or `Android Bridge unavailable`. /burner/* calls fail at the HTTP transport.
+**Diagnosis:** AndroidBridge HTTP server (localhost:8765) isn't responding. Either the foreground service isn't running, the bridge port is blocked, or the auth token is wrong.
+**Fix:**
+1. Check `grep -i "Android Bridge" node_debug.log | tail -20`.
+2. Open the Dashboard in SeekerClaw — is the agent showing GREEN? If RED/yellow, restart the agent from Settings → Service Control.
+3. If persistent: stop and start the SeekerClawService. The bridge initializes on service start.
+
+### Jupiter ownership map missed a write
+**Symptoms:** Cancel-tool returns `creatorRole: "unknown"` for an order created via SeekerClaw on this device.
+**Diagnosis:** `/jupiter/order-owner/set` failed AFTER the create succeeded. Per contract, the create is not unwound — the order is real on-chain — but the cancel falls back to the "unknown → main + confirm + diagnostic" path.
+**Fix:**
+1. Confirm the user wants to cancel via main wallet (MWA popup).
+2. If the order was actually created from the burner: the cancel still works through main if the main wallet is the same authority (it isn't, in V1 — burner ≠ main pubkey). For now, this means the cancel will fail to authorize at Jupiter; the user must wait for the order to expire OR contact Jupiter support.
+3. Long-term fix: enable the Jupiter ownership write retry queue (Phase 6+ scope).
+
+---
+
+## agent_pay (BAT-582 — x402 client)
+
+### `agent_pay: rejected (non-HTTPS / private IP / non-Solana / non-USDC / demand > max_usdc / method or body invalid / URL or DNS errors)`
+**Symptoms:** Tool result `error: "non_https" | "private_ip" | "non_solana_network" | "non_usdc_asset" | "demand_exceeds_max_usdc" | "method_not_allowed" | "body_required_for_post" | "body_not_json" | "body_too_large" | "invalid_url" | "dns_timeout" | "dns_lookup_failed"`. (List is non-exhaustive — the tool can also surface bridge / settle / response errors documented in their own sections below.)
+**Diagnosis:** Pre-flight or 402-body validation refused the call. Two layers:
+
+**Pre-DNS rejections** (fire BEFORE any DNS lookup — operator typos diagnosed cleanly without touching attacker-supplied hosts):
+- `invalid_url` — string URL fails `new URL()` parsing (missing scheme, invalid characters, etc.). Note: a non-string `url` argument is rejected earlier as `invalid_input`, not `invalid_url`.
+- `non_https` — URL must be `https://`
+- `method_not_allowed` — only GET / POST supported (BAT-664)
+- `body_required_for_post` / `body_not_json` / `body_too_large` — POST body issues (BAT-664)
+
+**Post-DNS, pre-HTTP rejections** (fire AFTER the DNS resolve attempt but BEFORE any HTTP request to the URL):
+- `private_ip` — DNS resolved to a private IP (SSRF defense — rejection happens immediately after resolve, before any HTTP fetch)
+- `dns_timeout` — DNS lookup exceeded the shared 30 s wall-clock budget
+- `dns_lookup_failed` — DNS resolver returned an error (NXDOMAIN, ENOTFOUND, etc.)
+
+**Post-fetch, pre-payment rejections** (fire AFTER fetching the 402 challenge but BEFORE attempting payment — server response failed v1.6 boundary checks):
+- `non_solana_network` — pay.sh requirement `network` field was not `solana`
+- `non_usdc_asset` — pay.sh requirement `asset` was not USDC (mint `EPjFWdd5...`)
+- `demand_exceeds_max_usdc` — server demanded more than the agent's `max_usdc` cap
+
+All errors below:
+- `non_https` — URL must be `https://` (debug builds also accept `http://localhost`)
+- `private_ip` — DNS resolved to a private/loopback IP (10/8, 172.16/12, 192.168/16, 127/8, 169.254/16, ::1, fc00::/7, fe80::/10) — SSRF defense
+- `non_solana_network` — pay.sh requirement `network` field was not `solana`
+- `non_usdc_asset` — pay.sh requirement `asset` was not USDC (mint `EPjFWdd5...`)
+- `demand_exceeds_max_usdc` — server demanded more than the agent's `max_usdc` cap
+- `method_not_allowed` — BAT-664 supports GET and POST only (no PUT/PATCH/DELETE)
+- `body_required_for_post` — `method: "POST"` requires a `body` parameter — BAT-664
+- `body_not_json` — `body` must be a JSON-serializable object/array (or a string that parses as JSON). No `text/plain` — BAT-664
+- `body_too_large` — `body` exceeded the 8 KB UTF-8 cap (after compact serialization) OR, for string inputs, the 16 KB pre-parse DoS cap. BOTH caps apply: a multi-MB JSON string with extreme whitespace padding is rejected even if its compact form would fit — BAT-664
+
+**Fix:**
+1. For `demand_exceeds_max_usdc`: re-invoke with a higher `max_usdc` if the user agrees, OR accept the rejection (this is the cap working as designed).
+2. For `non_https` / `private_ip`: this is a security boundary — do not bypass. If the user genuinely wants to call a localhost service from a debug build, ensure NODE_ENV=development is set.
+3. For `non_solana_network` / `non_usdc_asset`: the endpoint isn't compatible with V1. Tell the user "this endpoint requires <network>/<asset>, which agent_pay doesn't support yet (V1 = Solana mainnet USDC only)."
+4. For `method_not_allowed`: only GET and POST are supported. Restructure the call to use one of them, or skip if the endpoint requires e.g. PATCH.
+5. For `body_required_for_post`: pass a `body` arg (JSON-serializable). If the endpoint genuinely has no body, switch to `method: "GET"` if appropriate.
+6. For `body_not_json`: ensure the body is a plain object/array. Functions, symbols, circular refs cause this. If passing a string, it must parse as JSON (no `text/plain`).
+7. For `body_too_large`: trim the body. 8 KB UTF-8 covers nearly every realistic SMS/API call — if you genuinely need more, that's a follow-up BAT to lift the cap.
+
+### `agent_pay: response too large` / `agent_pay: timeout`
+**Symptoms:** Tool result `error: "response_too_large"` or `error: "timeout"`.
+**Diagnosis:** V1 caps response body at 1 MB and total request time at 30 s. Either the endpoint streams more than 1 MB or it's slow.
+**Fix:**
+1. For large responses: the endpoint isn't a fit for agent_pay V1. Suggest the user fetch directly via web browser, or escalate to a follow-up ticket if the use case is common.
+2. For timeouts: retry once. If persistent, the endpoint is degraded — wait, OR check connectivity (`grep -i ENOTFOUND node_debug.log | tail -5`).
+
+### `agent_pay: burner not configured`
+**Symptoms:** Tool result `error: "burner_not_configured"`. NO HTTP request to the URL was made.
+**Diagnosis:** agent_pay refuses to fetch when there's no burner wallet; it would have nothing to pay with. /burner/status returned `configured: false`.
+**Fix:** Open SeekerClaw → Settings → Burner Wallet → import a key. Fund the burner with USDC (mainnet). Re-invoke agent_pay.
+
+**False-positive scenario (BAT-664 device-test 2026-05-12):** `burner_not_configured` was returned **only for POST**, while same-session GET worked fine. Root cause was NOT the burner — it was configured. `wallet/index.js _BURNER_STATUS_GATE_TOOLS` had `agent_pay` excluded under R9's v1.4-era optimization, so the confirmation gate received the empty short-circuit state (`burnerConfigured: false`) and the BAT-664 POST branch in `confirmation/policy.js:367` fast-failed every call. Fixed by re-including `agent_pay` in the gate set (commit `6957604c`). Guard: `tests/nodejs-project/wallet-registry.test.js` now asserts the gate fetches `/burner/status` for agent_pay AND propagates `configured: true` through to the policy hook. If the symptom recurs (POST-only `burner_not_configured` with GET working), check that test first, then `_BURNER_STATUS_GATE_TOOLS` membership.
+
+### `agent_pay: no x402 protocol detected for this response`
+**Symptoms:** Tool result `error: "no_protocol_match"` after a 402 response.
+**Diagnosis:** The endpoint returned 402 but the JSON body didn't match any registered payment-protocol shape (V1 supports pay.sh-style x402 only). Possibilities: a non-x402 paywall (Stripe, custom), an unknown x402 dialect, or a malformed body.
+**Fix:**
+1. Check the response body shape — does it have `accepts: [...]` or `paymentRequirements: [...]` with `scheme: "exact"` and `network: "solana"`?
+2. If it's a different x402 dialect (e.g., Coinbase's variant), V1 doesn't support it — track as a follow-up to commit a fixture for that variant.
+3. If it's a non-x402 paywall, agent_pay can't handle it. Tell the user "this endpoint uses a paywall format I don't support."
+
+### `agent_pay: insufficient burner balance`
+**Symptoms:** Tool result `error: "insufficient_burner_balance"` with `reason` like `"Burner has 0.003378 USDC; this call needs 0.02 USDC. Fund the burner with at least 0.016622 more USDC (send to <pubkey>) and retry."` NO probe sent, NO settle attempted, NO money moved.
+**Diagnosis:** The pre-flight balance check (BAT-664 device-test fix) queries the burner's USDC ATA on-chain BEFORE probing. If the ATA balance < demand, refuse immediately. This catches what used to surface as confusing downstream errors (`no_protocol_match` or `payment_rejected` — both caused by paysponge's server-side balance check rejecting with 402).
+**Fix:**
+1. Tell the user the EXACT shortfall (in the error reason).
+2. User funds the burner — send USDC to the burner pubkey (shown in the error and in `wallet_status`).
+3. Retry. The pre-flight will re-check on each invocation.
+
+**Failure mode evolution:** Pre-fix (commit `54845b57` and earlier), an under-funded burner produced:
+- `no_protocol_match` when paysponge stripped accepts from its 402 response (looked like a parser bug)
+- `payment_rejected — server returned 402 again` when paysponge returned a full challenge but rejected the proof (looked like a settle bug)
+Both were red herrings — root cause was always "not enough USDC at the source." The pre-flight surfaces the real reason with the dollar gap.
+
+### `agent_pay: cap exceeded` (per-tx or daily USDC)
+**Symptoms:** Tool result `error: "burner_cap_exceeded"` mentioning USDC. The 402 demand was within `max_usdc` but exceeded the burner's per-tx or daily USDC cap.
+**Diagnosis:** Two different ceilings: `max_usdc` is the agent-side cap (per-call), `burner.pertx.usdc` and `burner.daily.usdc` are user-controlled caps (per-burner). Both must allow the demand.
+**Fix:**
+1. Run `wallet_status` to show the current caps + remaining daily.
+2. Suggest `wallet_set_caps({per_tx_usdc: "..."})` (always with user confirmation) OR wait for daily reset at 00:00 UTC.
+
+## paysh-catalog (BAT-704/761/768/766/769)
+
+> All `<base>` placeholders below mean the actual service URL of the failing entry — derive it by reading `skills/paysh-catalog/catalog.json` and looking up `entries[].upstream_ref.service_url` for the matching `entries[].id`. Hosts vary across services (e.g. `https://stablecrypto.dev`, `https://api.crushrewards.dev`, `https://tripadvisor.x402.paysponge.com`); do not hardcode the paysponge subdomain pattern.
+
+### `agent_pay returned wrong/empty/error data after settle — investigate before retrying (could be gateway / doc-vs-gateway / app-level validation)`
+**Symptoms (POST and GET):** `agent_pay` succeeded the on-chain payment but the response is unusable. USDC was spent. The visible tool result will be one of:
+- `{ error: "settle_http_error", reason: "server returned <status> after payment" }` — the gateway returned any status ≥ 400 after settle (covers 4xx AND 5xx — x402.js:1416 fires on `resp.status >= 400`). **The response body is NOT surfaced to the agent today** (x402.js:1416 discards it). The agent has only the status code; it cannot read the gateway's specific complaint inline. Follow-up to extend the existing `payment_rejected.diag.bodyHead` pattern (x402.js:1403–1413) to the general ≥400 case is tracked separately.
+- HTTP 200 with garbage / silent wrong-shape data — gateway silently ignored unknown query params (common on GET endpoints that proxy upstream loosely). The body IS returned in this case; the agent can inspect what it got back.
+
+Because the agent can't see WHY the server complained on a ≥400, the right next step is always **stop, do not auto-retry, surface the failure to the user** — not "guess at the cause." Causes you cannot distinguish without the body include:
+- **Doc-vs-gateway divergence** (the bug class that motivated PR #382 / #383). Catalog body/param shape diverges from the gateway openapi (arrays vs strings, string-typed numbers, renamed fields). Typically surfaces as 4xx with a shape-validation error.
+- **Application-level validation.** Body/params match the openapi schema fine, but the request itself is invalid: 2captcha rejects an unsupported CAPTCHA task type, reducto rejects an unreachable document URL, textbelt-sms rejects an invalid phone number, perplexity-agent rejects a missing `model`/`models`/`preset`. Typically 4xx.
+- **Gateway 5xx or transient error.** Upstream blip, brief throttling, deploy mid-call. Typically 5xx; same `settle_http_error` shape reaches the agent because x402 doesn't distinguish 4xx from 5xx in its error code.
+
+**Diagnosis:** The catalog markdown doc (`services/<id>.md`) is hand-written, but the v2 cleanup (PR #382 stablecrypto, PR #383 rentcast) derived every body/param table from the live `openapi.json`. If the failing entry was touched in v2, the catalog shape is likely right and you're seeing app-level validation. If it predates v2 or hasn't been verified, openapi check below.
+**Fix (runnable via agent tools — `shell_exec` rejects `|` and `jq` is not in the allowlist; `web_fetch` THROWS on non-2xx so it can't read 402 bodies either. The right tool here is `js_eval` driving `require('https')` directly, which gives full status/header/body access in one call):**
+1. Look up the entry's service URL: `read skills/paysh-catalog/catalog.json`, find your `entries[].id`, copy its `upstream_ref.service_url`. Call this `<base>`.
+2. Fetch + inspect the openapi schema in one `js_eval` call:
+   ```js
+   const https = require('https');
+   const url = new URL('<base>/openapi.json');
+   await new Promise((resolve, reject) => {
+     https.get({ hostname: url.hostname, path: url.pathname, headers: { 'user-agent': 'seekerclaw-diag' } }, (res) => {
+       let body = ''; res.on('data', c => body += c); res.on('end', () => {
+         try {
+           const oa = JSON.parse(body);
+           const p = oa.paths?.['<path>'];
+           // POST: required[] + properties{} of the JSON body schema
+           const post = p?.post?.requestBody?.content?.['application/json']?.schema;
+           // GET: parameters[] array
+           const get = p?.get?.parameters;
+           console.log(JSON.stringify({ status: res.statusCode, post, get }, null, 2));
+           resolve();
+         } catch (e) { console.log('parse failed status=' + res.statusCode + ' body[0..200]=' + body.slice(0,200)); resolve(); }
+       });
+     }).on('error', reject);
+   });
+   ```
+   If the host doesn't expose `/openapi.json` (returns 404), the schema may live inside the committed 402 capture as `extensions.bazaar.schema`. That capture file (`tests/paysh/captures/...`) is in the source tree, NOT in the on-device workspace — the `read` tool can't reach it from the device. **From the device, you cannot verify the schema here.** Stop, surface the failure to the user, and ask them to escalate to the project maintainer (who can read the source-tree capture or the upstream openapi off-device); do NOT silently retry with a guessed shape.
+3. Compare `required[]` and `properties{}` (POST) or `parameters[]` (GET) against the body/params the agent_pay call sent. The truth is on the gateway, not on CoinGecko/DefiLlama/Rentcast/etc. public REST docs.
+4. Re-issue the call with the openapi-correct shape (arrays as arrays, string-typed numbers as quoted strings, gateway-named fields) — but **only after the user explicitly authorizes another paid call** (the previous attempt already cost USDC; a retry is the user's spending decision, not yours). Don't silently re-burn.
+5. If the catalog doc itself is wrong, that's a maintainer fix (rewrite `services/<id>.md` like PR #382/#383 did, bump `paysh-catalog/SKILL.md` version so `ConfigManager.seedSkill()` re-seeds existing devices). The agent can flag this to the user but should not edit catalog docs from chat.
+6. Passthrough exception (GET only): some gateways (tripadvisor, wolframalpha) declare ZERO query params in their openapi yet accept them as upstream passthrough — for THOSE GET endpoints the doc is the source of truth. This exception does NOT apply to POST endpoints (2captcha, reducto, perplexity, textbelt-sms, stablecrypto, etc.): their POST body **shapes** are openapi-verified, so a body outside the schema would be a real shape bug.
+
+### `agent autonomously paid for trivia / activated paysh-catalog without an explicit pay-intent keyword`
+**Symptoms:** User asks a factual/trivia question (e.g., "what is the price of SOL", "what's the mass of the sun") and the agent calls `agent_pay` burning USDC, instead of using free tools (`solana_price`, training data, `web_search`).
+**Diagnosis:** BAT-704 regression. The paysh-catalog skill is OPT-IN — it should activate ONLY when the user's message contains an explicit pay-intent keyword: `pay.sh` / `paysh` / `pay sh` / `x402` / `pay for X` / `pay to X` / `use pay` / `pay <service>` / `use <service> to pay` / `look this up paid` / `fetch this paid` / `buy data from <service>`, plus the capability-ask phrases "what can you pay for", "show me pay.sh services", "list paid services". If the agent reaches for `agent_pay` without one of these triggers in the user's message, it's violating the opt-in policy. Common causes:
+- Skill `paysh-catalog/SKILL.md` corrupted or older version (pre-BAT-704) re-seeded after a workspace reset
+- Agent over-matched a non-pay keyword (e.g., treated "what's the price of SOL" as a pay intent because `solana_price` momentarily wasn't loading)
+- `agent_pay` invoked from a `[skill just installed]` follow-up that the agent treated as authorization
+**Fix:**
+1. Check the skill version: `read skills/paysh-catalog/SKILL.md` — frontmatter `version:` should be `>= "1.1.0"` (BAT-704 opt-in shipped in 1.1.0). If lower, the skill predates the opt-in rule.
+2. Check the prompt door is intact: read the system prompt's Wallets section (visible to you in this turn) — look for the "Paysh-catalog is OPT-IN" paragraph and its keyword list. If it's missing, the build regressed and the user needs a fresh APK.
+3. Apologize and explain — do NOT attempt any kind of refund transfer. The agent has no refund tool, no treasury, and no entitlement to spend from any other wallet. The user's USDC is gone; only the operator can issue an out-of-band refund. Tell the user explicitly what happened ("I called a paid endpoint without your authorization — that violates the opt-in policy") and how to avoid it (use a free tool name, or explicitly say "no paying"). If the user asks for a refund, direct them to contact the project maintainer; do NOT initiate any transfer from any wallet to "make it right."
+4. If the agent persistently auto-activates: report the trigger phrase that mismatched so it can be added to the don't-match list in SKILL.md.
+
+### `paid more than the catalog cost_usdc said (cost discrepancy)`
+**Symptoms:** Agent reply says "Paid: $0.02 USDC" but the user expected $0.01 (matching `catalog.json` `cost_usdc`). The transaction succeeded; the question is just where the extra cost came from.
+**Diagnosis:** Two real possibilities and one rare one:
+1. **Multi-call composition (most common).** Agent issued multiple paid calls to assemble one answer. Example: a "rent trends for ZIP X" reply that includes per-bedroom breakdown likely called `/markets` (current trends) + `/listings/rental/long-term` (to bucket by bedroom count), 2 × $0.01 = $0.02. This is correct agent behavior — but it should be transparent in the reply.
+2. **Stale `cost_usdc` in catalog.** The endpoint actually charges more than the catalog recorded during BAT-706 audit. Verify by live-probing the 402 — `<base>` is the entry's `upstream_ref.service_url` from `catalog.json`, `<path>` is `endpoint.path` **with any `{param}` placeholders substituted with real values** (tripadvisor location-details/reviews/photos use `/api/v1/location/{locationId}/...` — probing the literal `{locationId}` will 404 instead of returning the 402 challenge), and the probe method must match `endpoint.method`. Use `js_eval` with `require('https')` (NOT `shell_exec` curl-pipe-jq — shell_exec rejects `|` and `jq` isn't allowlisted; NOT `web_fetch` either — it throws on non-2xx so it never returns the 402 body or `payment-required` header):
+   ```js
+   const https = require('https');
+   const url = new URL('<base><path>');
+   const method = 'GET';  // or 'POST' — match catalog.json endpoint.method
+   const opts = { hostname: url.hostname, path: url.pathname + (url.search||''), method, headers: { 'user-agent': 'seekerclaw-diag' } };
+   if (method === 'POST') opts.headers['content-type'] = 'application/json';
+   await new Promise((resolve, reject) => {
+     const req = https.request(opts, (res) => {
+       let body = ''; res.on('data', c => body += c); res.on('end', () => {
+         // Pick the Solana leg from BOTH body.accepts[] AND the
+         // payment-required response header — some gateways (e.g.
+         // stablecrypto) deliver the challenge SOLELY in the header
+         // with an empty body; pure body-only parsing misses those.
+         let accepts = [];
+         let source = null;
+         try {
+           const j = JSON.parse(body);
+           accepts = j.accepts || j.paymentRequirements || [];
+           if (accepts.length) source = 'body';
+         } catch(_) {}
+         const hdr = res.headers['payment-required'];
+         if (!accepts.length && hdr) {
+           try {
+             const decoded = JSON.parse(Buffer.from(hdr, 'base64').toString('utf8'));
+             accepts = decoded.accepts || decoded.paymentRequirements || [];
+             if (accepts.length) source = 'header';
+           } catch(_) {}
+         }
+         const solana = accepts.find(a => (a.network||'').startsWith('solana:') || a.network === 'solana');
+         const amount = solana ? (solana.amount || solana.maxAmountRequired) : null;
+         console.log(JSON.stringify({ status: res.statusCode, solanaAmount: amount, source }, null, 2));
+         resolve();
+       });
+     });
+     req.on('error', reject);
+     if (method === 'POST') req.write('{}');
+     req.end();
+   });
+   ```
+   `solanaAmount` is in USDC atomic units (6 decimals): `"10000"` = $0.01, `"20000"` = $0.02. If the live amount > catalog `cost_usdc`, the catalog is stale — flag for maintainer to update.
+3. **(Rare) Gateway promoted the endpoint to a tiered cost** based on response size or query complexity. Some pay.sh services do this; the live 402 will show the higher amount.
+**Fix:**
+1. In the agent's reply, ALWAYS surface multi-call composition transparently: "Paid $0.02 across 2 calls (`/markets` + `/listings/rental/long-term`)" rather than just "Paid $0.02". Users can't tell otherwise.
+2. If the live probe confirms the catalog is stale, tell the user "the recorded price ($0.01) is out of date — actual is $0.02. I'll flag this for the maintainer." Don't refuse the call retroactively (it already settled).
+3. Maintainer-side fix: update `catalog.json` `entries[].endpoint.cost_usdc` for the affected entry, bump `paysh-catalog/SKILL.md` version so devices re-seed.
+

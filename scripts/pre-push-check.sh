@@ -16,7 +16,20 @@
 #
 # What it checks (in order, fail-fast):
 #   1. Node.js smoke test (`tests/nodejs-project/smoke.js`) — syntax + module load
-#   2. Kotlin compile (`compileDappStoreDebugKotlin`) — catches import errors,
+#   2. Tool input_schema validity (`tests/nodejs-project/tool-schemas.test.js`)
+#      — catches schemas the Anthropic API would reject (which would take down
+#      EVERY agent turn, not just the bad tool). Added 2026-05-12 after the
+#      BAT-664 `body: { type: ['object','array','string'] }` shipped without
+#      the required `items` and broke the integration branch on first device
+#      message.
+#   3. Wallets/payment-safety prompt assertions
+#      (`tests/nodejs-project/system-prompt-wallets.test.js`) — locks the
+#      BAT-582 wallets-section phrases + the SAB-AUDIT-v27 payment-safety
+#      additions (multi-call composition transparency, do-NOT-auto-retry-on-
+#      4xx/5xx, DIAGNOSTICS.md → "paysh-catalog" door). Added 2026-05-18
+#      after Copilot R7 flagged that the SAB-AUDIT-v27 phrases weren't
+#      regression-protected. <1s.
+#   4. Kotlin compile (`compileDappStoreDebugKotlin`) — catches import errors,
 #      type mismatches, unresolved references BEFORE CI
 #
 # Usage:
@@ -29,6 +42,8 @@
 #   3 = JDK 17+ not found (see JDK_CANDIDATES below)
 #   4 = Android SDK not found (ANDROID_HOME / local.properties / standard paths)
 #   5 = Script couldn't cd to repo root (broken path / permissions)
+#   6 = Tool input_schema validation failed (would cause API 400 on device)
+#   7 = Wallets/payment-safety prompt assertions failed (SAB-AUDIT-v27 regression)
 #
 # Optional: wire this into `.git/hooks/pre-push` by symlinking:
 #   ln -s ../../scripts/pre-push-check.sh .git/hooks/pre-push
@@ -224,7 +239,7 @@ export PATH="$RESOLVED_JDK/bin:$PATH"
 
 
 # ── 1. Node.js smoke test ───────────────────────────────────────────────────
-echo "── 1/2  Node smoke test ─────────────────────────"
+echo "── 1/4  Node smoke test ─────────────────────────"
 if ! node tests/nodejs-project/smoke.js; then
     echo ""
     echo "❌ Node smoke test failed — don't push."
@@ -232,10 +247,36 @@ if ! node tests/nodejs-project/smoke.js; then
 fi
 echo ""
 
-# ── 2. Kotlin compile (dappStore debug) ─────────────────────────────────────
+# ── 2. Tool input_schema validity ──────────────────────────────────────────
+# Catches schemas the Anthropic API would reject. A single bad schema takes
+# down EVERY agent turn (not just calls to the bad tool) — see BAT-664
+# device-test incident 2026-05-12. This step takes <1s and shipping without
+# it directly affects users.
+echo "── 2/4  Tool input_schema validity ──────────────"
+if ! node tests/nodejs-project/tool-schemas.test.js; then
+    echo ""
+    echo "❌ Tool input_schema check failed — don't push (would break agent on device)."
+    exit 6
+fi
+echo ""
+
+# ── 3. Wallets/payment-safety prompt assertions ────────────────────────────
+# Locks the BAT-582 wallets-section phrases + the SAB-AUDIT-v27 payment-safety
+# additions (multi-call composition transparency, do-NOT-auto-retry-on-4xx,
+# DIAGNOSTICS.md → "paysh-catalog" door). Dropping these silently re-opens
+# the post-Test-2 USDC-burn loop. <1s, so always run.
+echo "── 3/4  Wallets prompt regression test ──────────"
+if ! node tests/nodejs-project/system-prompt-wallets.test.js; then
+    echo ""
+    echo "❌ Wallets prompt assertions failed — don't push (would regress agent's payment-safety self-awareness)."
+    exit 7
+fi
+echo ""
+
+# ── 4. Kotlin compile (dappStore debug) ─────────────────────────────────────
 # Only compile the dappStore flavor — googlePlay is identical Kotlin source, so
 # dappStore catches every compile error at ~half the time of both flavors.
-echo "── 2/2  Kotlin compile (dappStoreDebug) ─────────"
+echo "── 4/4  Kotlin compile (dappStoreDebug) ─────────"
 
 # Unique temp log per invocation — avoids races between concurrent runs and
 # symlink-clobber risk on multi-user systems. Path is printed below on failure.

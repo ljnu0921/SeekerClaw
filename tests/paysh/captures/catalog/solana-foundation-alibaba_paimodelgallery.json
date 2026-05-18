@@ -1,0 +1,45 @@
+{
+  "_meta": {
+    "label": "solana-foundation-alibaba_paimodelgallery-402",
+    "capturedAt": "2026-05-12T11:03:30.305Z",
+    "source": "probe-catalog",
+    "payMdPath": "providers/solana-foundation/alibaba/paimodelgallery/PAY.md",
+    "note": "Sanitized per BAT-582 v1.6 contract amendment 6."
+  },
+  "url": "https://paimodelgallery.alibaba.gateway-402.com/api/v1/modelgallery/models",
+  "method": "GET",
+  "status": 402,
+  "headers": {
+    "content-type": "application/json",
+    "www-authenticate": "Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:29.921325814Z\", Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:30.089178094Z\", Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:30.182221018Z\"",
+    "content-length": "275",
+    "date": "Tue, 12 May 2026 11:03:29 GMT",
+    "server": "Google Frontend",
+    "traceparent": "[REDACTED]",
+    "x-cloud-trace-context": "[REDACTED]",
+    "via": "1.1 google",
+    "alt-svc": "h3=\":443\"; ma=2592000,h3-29=\":443\"; ma=2592000"
+  },
+  "body": {
+    "endpoint": {
+      "method": "GET",
+      "path": "api/v1/modelgallery/models"
+    },
+    "error": "payment_required",
+    "message": "This endpoint requires payment.",
+    "payment": {
+      "challenges": 3,
+      "protocol": "mpp"
+    },
+    "pricing": {
+      "dimensions": [
+        {
+          "direction": "usage",
+          "price_usd": 0.001,
+          "scale": 1,
+          "unit": "requests"
+        }
+      ]
+    }
+  }
+}

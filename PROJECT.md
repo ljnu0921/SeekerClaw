@@ -108,6 +108,28 @@ SeekerClaw is an Android app built for the Solana Seeker phone (also works on an
 - **Token security** — Check token security/legitimacy before trading
 - **Wallet holdings** — Full portfolio view with USD values via Jupiter
 
+### Burner Wallet — Autonomous Solana Signing + x402 Payments (BAT-582, 3 tools)
+- **App-managed Solana keypair** — private key encrypted in Android KeyVault (BouncyCastle Ed25519, KeystoreHelper-backed AES-256-GCM, Base64 boundary). **Key never crosses the bridge into Node** — Android signs, Node calls bridge endpoints.
+- **Per-tx + daily caps** for SOL and USDC (atomic units, BigInteger throughout, UTC midnight rollover). Defaults: 0.05 / 0.5 SOL, 5 / 50 USDC.
+- **Reserve / commit / release** state machine with stale-reservation sweep (60s TTL, 30s sweep). Mutex-guarded. Android is the SOLE writer of cap state.
+- **Wallet routing** in `caps/preflight.js` decides burner vs main on every spending tool. Under-cap burner → silent (`policy: "none"`); main wallet → MWA popup (`policy: "confirm"`); over-cap with no fallback → blocked. `solana_send`, `solana_swap`, `jupiter_trigger_create`, `jupiter_dca_create`, `jupiter_trigger_cancel`, `jupiter_dca_cancel` all participate.
+- **`wallet_status`** — read both wallets' state (configured, pubkey, caps, today's spend, remaining daily).
+- **`wallet_set_caps`** — update burner caps (per-tx and daily, SOL + USDC). Always confirms; surface shows old → new diff.
+- **`agent_pay`** — pay an x402-protected HTTP endpoint and fetch its response. Object-shaped args `{ url, max_usdc, method?, body? }`. `max_usdc` is a decimal string. `body` is a JSON object/array for POST (rejected on primitives via `body_not_json`).
+  - **Security envelope (SeekerClaw V1 boundary, unrelated to the x402 protocol version):** HTTPS only, Solana mainnet only, USDC only, private-IP rejection, DNS rebinding defense, max 1 MB response, 30s timeout. pay.sh-compatible.
+  - **GET and POST both supported.** GET runs silently when under burner cap. POST always requires user confirmation (side-effect-aware: SMS, content posts, etc.) — confirmation fires regardless of caps. POST bodies ≤ 8 KB.
+  - **x402 protocol version support:** detect + build accept both **x402 v1** (`maxAmountRequired`, bare `network: "solana"`) and **x402 v2** (`amount`, CAIP-2 `network: "solana:<genesis>"`, `payment-required` header delivery, multi-chain pick-Solana). **v2 settle works** — verified end-to-end against pay.sh services including Tripadvisor, CoinGecko, Textbelt SMS POST (real on-chain signature captured in `tests/paysh/captures/textbelt-text-v2-success.json`). v3+ rejected as `unsupported_version`.
+- **Settings → Burner Wallet** — paste private key (base58 or JSON byte array, 32-byte seed or 64-byte expanded), Test, Save, Wipe, Rotate, edit caps. FLAG_SECURE while screen visible. Address shown post-save with tap-to-copy on both truncated (status card header) and full (funding card) forms. **Live SOL + USDC balance** fetched directly from Solana RPC in the UI process via `SolanaBalanceFetcher` (auto-fetch on screen open + manual refresh button). Returns null/`unavailable` on transient RPC outage rather than misleading "0". QR deferred to follow-up.
+- **Dynamic confirmation hook** in `ai.js` replaces the v1.0 static `CONFIRM_REQUIRED` set in `config.js`. Regression-safe: when burner is unconfigured the hook returns identical v1.0 behavior for every existing tool — pinned by `tests/nodejs-project/confirmation-policy.test.js`.
+
+### pay.sh Service Catalog (BAT-699 → BAT-761 v2 schema)
+- **`paysh-catalog` skill v2 schema** (BAT-761) — per-endpoint catalog entries with `upstream_ref` (operator/slug/pay_md_path/service_url) + `verification` metadata (last_probed_at / last_capture_path / last_captured_at / probe_status). Schema documented in `app/src/main/assets/default-skills/paysh-catalog/SCHEMA.md`. One `services/<id>.md` per service, optionally sectioned per endpoint via `doc_anchor`. Agent reads `catalog.json` to pick the right entry (matching `intents[]`), then reads only the matching `entry.doc_file` for body schema + examples.
+- **44 catalog entries** in v2 across **10 services** (genuinely multi-endpoint now: stablecrypto-market-data has 21 endpoints covering CoinGecko price/chart/markets + DefiLlama TVL/yields/stablecoins; tripadvisor 5 endpoints (search/nearby/details/reviews/photos); rentcast 5 endpoints (markets/avm/properties/listings-sale/listings-rental); crushrewards 4 endpoints (best-price/price-history/deal-finder/inflation); perplexity 2 (search/agent); wolframalpha 2 (v1-result/v2-query); reducto 2 (extract/parse); singletons: 2Captcha, Purch, Textbelt SMS. Service breakdown: StableCrypto Market Data, Wolfram Alpha, Tripadvisor, 2Captcha, Rentcast, Reducto, Crushrewards, Perplexity, Purch, Textbelt SMS. StableEnrich was demoted to unsupported in BAT-761 PR #379 R7 — re-probe + re-promote planned in BAT-772. Skill is OPT-IN ONLY (activates on explicit pay.sh / paysh / x402 / 'pay for' keywords) per BAT-704. Tier 1 catalog expansion was BAT-769 (perplexity, 2 entries) + BAT-768+766 combined (stablecrypto extras 20 + same-provider extras 13 = 33 entries).
+- **`unsupported.json` v2** — 63 known-but-not-usable entries with **six reason buckets** in the top-level `reasons` registry: `mpp_protocol`, `siwx_auth_required`, `invalid_demand`, `requires_binary_response`, `endpoint_not_402_at_probe`, `unverified_paid_response_shape`. Many entries carry an `audit_pending[]` field listing sibling endpoints found by the BAT-706 full-catalog audit (238 sibling endpoints total across 10 services — quicknode 133, stablesocial 36, stableenrich 32 [from the demoted catalog entry — see Tier 2c BAT-772], stablecrypto extras, perplexity (1 remaining: /v1/async/sonar after BAT-769 promoted /search + /v1/agent — async-fetch follow-up unscheduled, `deferred_to: null`), fal, etc.) — each pending endpoint's `deferred_to` is either a BAT-XXX follow-up ticket id (BAT-766/768/770/771/772/764 — note BAT-769 is closed; perplexity is now catalogued except for /v1/async/sonar which is unscheduled) when a follow-up exists, or `null` when the endpoint is unscheduled (no ticket yet). Agent can answer "I know about Google Vision but can't pay it — our probe got HTTP 400" honestly instead of generic "I don't have that."
+- **Maintenance tooling** (`tests/paysh/probe-catalog.js` BAT-761): `--drift` fetches pay.sh upstream tree + diffs against catalog (exits non-zero on drift, CI-friendly); `--status` writes `tests/paysh/catalog-status.md` with fresh/stale/audit-pending sections; `--refresh <id>` re-probes one entry and updates its verification + capture file. v1 → v2 migration via `tests/paysh/migrate-v1-to-v2.js` (one-shot, idempotent, with built-in schema validation per SCHEMA.md).
+- **Folder seeding** — Bundled skills' support files (catalog.json, unsupported.json, services/*.md, SCHEMA.md) are copied from `assets/default-skills/<name>/` to `workspace/skills/<name>/` recursively on first install and version upgrade (BAT-699 R6 extended `ConfigManager.seedSkill()`; BAT-699 R7 stage-then-swap preserves user-added entries). SKILL.md version 1.6.0 (bumped 1.3.0 → 1.4.0 in BAT-761, → 1.5.0 in BAT-769, → 1.6.0 in BAT-768+766) triggers re-seed for existing installs on each catalog change.
+- **Static bundle** — Ships with APK. Auto-refresh from upstream pay.sh is a follow-up (BAT-700 / BAT-765 weekly CI drift check).
+
 ### Execution
 - **Shell exec** — 33 sandboxed commands including Android tools (cat, ls, curl, grep, find, sed, diff, screencap, getprop, etc.), workspace-restricted
 - **JS eval** — Run JavaScript inside Node.js process, async/await, require() for builtins
@@ -139,8 +161,8 @@ SeekerClaw is an Android app built for the Solana Seeker phone (also works on an
 | `/approve` | Approve pending confirmation |
 | `/deny` | Deny pending confirmation |
 
-### Skills (20 bundled + 13 workspace, version-aware seeding)
-**Bundled skills (OpenClaw format, seeded by ConfigManager.kt with SHA-256 integrity + version tracking):** bookmark, briefing, calclaw (AI calorie tracker), calculator, crypto-prices, define, github, joke, movie-tv, netwatch (network monitoring & security audit), news, notes, quote, reminders, research, summarize, timer, todo, translate, weather
+### Skills (22 bundled + 13 workspace, version-aware seeding)
+**Bundled skills (OpenClaw format, seeded by ConfigManager.kt with SHA-256 integrity + version tracking):** bookmark, briefing, burner-wallet, calclaw (AI calorie tracker), calculator, crypto-prices, define, github, joke, movie-tv, netwatch (network monitoring & security audit), news, notes, paysh-catalog, quote, reminders, research, summarize, timer, todo, translate, weather
 **Workspace skills (agent-usable examples):** crypto-prices, device-status, dictionary, exchange-rates, github, location, movie-tv, phone-call, recipe, sms, solana-dapp, solana-wallet, speak
 **Skill format:** YAML frontmatter (name, description, version, emoji, requires) — see `SKILL-FORMAT.md`
 **Skill install** — `skill_install` tool to install skills from URL or Telegram file attachment, with diagnostics via `/skills` command
@@ -237,10 +259,11 @@ User (Telegram/Discord) <--HTTPS/WSS--> Channel API <--polling/WS--> Node.js Gat
 
 | Metric | Count |
 |--------|-------|
-| Total commits | 548+ |
-| PRs merged | 361+ |
-| Tools | 60 (17 Solana/Jupiter, 13 Android bridge, 6 memory, 6 file, 5 cron, 4 telegram, 3 system, 2 web, 2 skill, 1 session, 1 env) + MCP dynamic |
-| Skills | 35 (20 bundled + 13 workspace + 2 user-created) |
+| Total commits | 600+ |
+| PRs merged | 383+ |
+| Tools | 63 (17 Solana/Jupiter, 13 Android bridge, 6 memory, 6 file, 5 cron, 4 telegram, 3 system, 2 web, 2 skill, 2 wallet [wallet_status, wallet_set_caps], 1 session, 1 env, 1 agent_pay [x402]) + MCP dynamic |
+| Skills | 37 (22 bundled incl. paysh-catalog + burner-wallet + 13 workspace + 2 user-created) |
+| Paysh-catalog entries | 44 across 10 services (OPT-IN only; 63 unsupported with structured "why not" reasons) |
 | Android Bridge endpoints | 18+ |
 | Telegram commands | 12 |
 | Channels | 2 (Telegram + Discord) |
@@ -280,6 +303,16 @@ User (Telegram/Discord) <--HTTPS/WSS--> Channel API <--polling/WS--> Node.js Gat
 
 | Date | Feature | PR |
 |------|---------|-----|
+| 2026-05-18 | **Release: v2.0.0-rc1** — Burner wallet (BAT-582), `agent_pay` x402 client (BAT-664), paysh-catalog OPT-IN (BAT-704) with 44 endpoints across 10 services, v2 schema (BAT-761), Tier 1 catalog expansion (BAT-705/706/766/768/769), doc body-shape fixes from openapi (#382/#383), SAB-AUDIT-v27 with 3 new DIAGNOSTICS entries for the paysh-catalog failure classes + the release-prep wave (#384). | #364, #366–#371, #377–#384 |
+| 2026-05-18 | Docs: SAB-AUDIT-v27 — paysh-catalog DIAGNOSTICS gap (doc-vs-gateway divergence, OPT-IN regression, cost discrepancy) + multi-call composition transparency hint in Wallets door + memory_save/daily_note secrets-warning. | #384 |
+| 2026-05-18 | Fix: rentcast query params from openapi (#383). Cross-service audit follow-up to #382 — fixes invented `city`/`state`/`bedrooms` on `/markets`, invented `id` query on `/properties`, invented `priceMin`/`priceMax` on `/listings/*`. | #383 |
+| 2026-05-18 | Fix: stablecrypto body shapes from openapi (#382). Test 2 burned $0.02 on HTTP 400 retries before the fix — body shapes were inferred from CoinGecko public REST docs (strings) but the gateway openapi declares arrays. Six blocking shape bugs + six optional-param completions. | #382 |
+| 2026-05-18 | Feat: BAT-768 + BAT-766 Tier 1 catalog expansion (11→44 entries). Stablecrypto market-data (21 endpoints across CoinGecko + DefiLlama), Tripadvisor (5), Rentcast (5), Crushrewards (4), Reducto (2), Wolfram (v2-query), plus singletons. Service-grouping reply hint in SKILL.md body. | #381 |
+| 2026-05-18 | Feat: BAT-769 Tier 1c perplexity catalog entries (search + agent). Sanitize hardening for transport-noise headers (report-to / nel / rndr-id / x-render-origin-server). | #380 |
+| 2026-05-18 | Feat: BAT-761 paysh-catalog v2 schema + maintenance tooling. Per-endpoint entries with upstream_ref + verification metadata, `audit_pending[]` with `deferred_to`, six unsupported-reason buckets, probe-catalog --audit/--drift/--status/--refresh modes, v1→v2 migration script. | #379 |
+| 2026-05-16 | Feat: BAT-705 Textbelt SMS + BAT-706 full-catalog audit crawler. 384 parseable Solana-USDC endpoints discovered across 19 services. | #378 |
+| 2026-05-15 | Feat: BAT-704 paysh-catalog is opt-in. Explicit pay/x402 keywords only; prevents agent autonomously paying for trivia. | #377 |
+| 2026-05-12 | Docs: SAB-AUDIT-v26 — BAT-664 agent_pay POST + body shipped without SAB; surfaced via device test. Cap-vs-max_usdc semantic clarified; new DIAGNOSTICS entries for invalid-schema kill and POST-only burner_not_configured false positive. | direct |
 | 2026-05-04 | Release: v1.10.0 — Env Vars, Extended Thinking on every provider, /model + /provider Telegram switches, live cross-process Settings, Activity Heatmap, BAT-525 graceful Stop. | #359, #360, #361 |
 | 2026-05-02 | Docs: SAB-AUDIT-v24 — BAT-525 + BAT-504 + MAX_STEPS post-merge gap fix. | #357 |
 | 2026-05-02 | Fix: Flush Node state before user-initiated Stop (BAT-525). Bounded shutdown handshake over loopback persists pending session summaries + dirty SQL.js writes within ~1.5s before `killProcess()`. | #349 |

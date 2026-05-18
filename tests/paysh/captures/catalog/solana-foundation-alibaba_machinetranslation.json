@@ -1,0 +1,44 @@
+{
+  "_meta": {
+    "label": "solana-foundation-alibaba_machinetranslation-402",
+    "capturedAt": "2026-05-12T11:03:30.186Z",
+    "source": "probe-catalog",
+    "payMdPath": "providers/solana-foundation/alibaba/machinetranslation/PAY.md",
+    "note": "Sanitized per BAT-582 v1.6 contract amendment 6."
+  },
+  "url": "https://machinetranslation.alibaba.gateway-402.com/api/translate/web/ecommerce",
+  "method": "POST",
+  "status": 402,
+  "headers": {
+    "content-type": "application/json",
+    "www-authenticate": "Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:29.764733681Z\", Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:29.916910476Z\", Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:30.059036003Z\"",
+    "x-cloud-trace-context": "[REDACTED]",
+    "date": "Tue, 12 May 2026 11:03:30 GMT",
+    "server": "Google Frontend",
+    "content-length": "277",
+    "via": "1.1 google",
+    "alt-svc": "h3=\":443\"; ma=2592000,h3-29=\":443\"; ma=2592000"
+  },
+  "body": {
+    "endpoint": {
+      "method": "POST",
+      "path": "api/translate/web/ecommerce"
+    },
+    "error": "payment_required",
+    "message": "This endpoint requires payment.",
+    "payment": {
+      "challenges": 3,
+      "protocol": "mpp"
+    },
+    "pricing": {
+      "dimensions": [
+        {
+          "direction": "usage",
+          "price_usd": 0.001,
+          "scale": 1,
+          "unit": "requests"
+        }
+      ]
+    }
+  }
+}

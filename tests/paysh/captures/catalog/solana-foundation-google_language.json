@@ -1,0 +1,44 @@
+{
+  "_meta": {
+    "label": "solana-foundation-google_language-402",
+    "capturedAt": "2026-05-12T11:03:45.340Z",
+    "source": "probe-catalog",
+    "payMdPath": "providers/solana-foundation/google/language/PAY.md",
+    "note": "Sanitized per BAT-582 v1.6 contract amendment 6."
+  },
+  "url": "https://language.google.gateway-402.com/v2/documents:analyzeEntities",
+  "method": "POST",
+  "status": 402,
+  "headers": {
+    "content-type": "application/json",
+    "www-authenticate": "Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:44.969494723Z\", Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:45.139498204Z\", Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:45.298945988Z\"",
+    "x-cloud-trace-context": "[REDACTED]",
+    "date": "Tue, 12 May 2026 11:03:45 GMT",
+    "server": "Google Frontend",
+    "content-length": "278",
+    "via": "1.1 google",
+    "alt-svc": "h3=\":443\"; ma=2592000"
+  },
+  "body": {
+    "endpoint": {
+      "method": "POST",
+      "path": "v2/documents:analyzeEntities"
+    },
+    "error": "payment_required",
+    "message": "This endpoint requires payment.",
+    "payment": {
+      "challenges": 3,
+      "protocol": "mpp"
+    },
+    "pricing": {
+      "dimensions": [
+        {
+          "direction": "usage",
+          "price_usd": 0.001,
+          "scale": 1,
+          "unit": "requests"
+        }
+      ]
+    }
+  }
+}

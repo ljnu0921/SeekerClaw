@@ -1,0 +1,38 @@
+{
+  "_meta": {
+    "label": "purch-marketplace-v2-success",
+    "description": "v2 PAYMENT-RESPONSE captured during Layer 3 live-pay (purch-marketplace)",
+    "capturedAt": "2026-05-12T11:16:56.252Z",
+    "onChainSignature": "5uehgrKdCD5yHQHHx5rpgDjzBX4CaPNeVFT86REaPA53gWBWpPJg3bgjKjV8ME1t1ep5X24J9xrXJQdjmW9zuDwg",
+    "demandAtomic": "10000",
+    "note": "Spent real USDC. Body redacted via paidSummary=true (we paid for that content). Captured for regression pinning of v2 settle path."
+  },
+  "url": "https://api.purch.xyz/x402/search?q=wireless+headphones",
+  "method": "GET",
+  "status": 200,
+  "headers": {
+    "access-control-allow-origin": "*",
+    "content-type": "application/json",
+    "cross-origin-resource-policy": "same-origin",
+    "cross-origin-opener-policy": "same-origin",
+    "referrer-policy": "no-referrer",
+    "strict-transport-security": "max-age=15552000; includeSubDomains",
+    "x-content-type-options": "nosniff",
+    "x-dns-prefetch-control": "off",
+    "x-frame-options": "SAMEORIGIN",
+    "x-xss-protection": "0",
+    "x-ratelimit-limit": "60",
+    "x-ratelimit-remaining": "57",
+    "x-ratelimit-reset": "23",
+    "payment-response": "[REDACTED]",
+    "origin-agent-cluster": "?1",
+    "x-download-options": "noopen",
+    "x-permitted-cross-domain-policies": "none",
+    "date": "Tue, 12 May 2026 11:16:55 GMT",
+    "content-length": "14626",
+    "server": "Google Frontend",
+    "traceparent": "[REDACTED]",
+    "x-cloud-trace-context": "[REDACTED]"
+  },
+  "body": "[REDACTED — paid response body summarized; ? bytes original]"
+}

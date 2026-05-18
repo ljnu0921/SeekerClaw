@@ -1,0 +1,45 @@
+{
+  "_meta": {
+    "label": "solana-foundation-alibaba_imagerecog-402",
+    "capturedAt": "2026-05-12T11:03:29.433Z",
+    "source": "probe-catalog",
+    "payMdPath": "providers/solana-foundation/alibaba/imagerecog/PAY.md",
+    "note": "Sanitized per BAT-582 v1.6 contract amendment 6."
+  },
+  "url": "https://imagerecog.alibaba.gateway-402.com/classifying-rubbish",
+  "method": "POST",
+  "status": 402,
+  "headers": {
+    "content-type": "application/json",
+    "www-authenticate": "Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:29.144814709Z\", Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:29.249903046Z\", Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:29.304423957Z\"",
+    "content-length": "269",
+    "date": "Tue, 12 May 2026 11:03:28 GMT",
+    "server": "Google Frontend",
+    "traceparent": "[REDACTED]",
+    "x-cloud-trace-context": "[REDACTED]",
+    "via": "1.1 google",
+    "alt-svc": "h3=\":443\"; ma=2592000"
+  },
+  "body": {
+    "endpoint": {
+      "method": "POST",
+      "path": "classifying-rubbish"
+    },
+    "error": "payment_required",
+    "message": "This endpoint requires payment.",
+    "payment": {
+      "challenges": 3,
+      "protocol": "mpp"
+    },
+    "pricing": {
+      "dimensions": [
+        {
+          "direction": "usage",
+          "price_usd": 0.001,
+          "scale": 1,
+          "unit": "requests"
+        }
+      ]
+    }
+  }
+}

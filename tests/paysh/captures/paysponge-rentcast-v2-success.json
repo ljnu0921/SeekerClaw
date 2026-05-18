@@ -1,0 +1,31 @@
+{
+  "_meta": {
+    "label": "paysponge-rentcast-v2-success",
+    "description": "v2 PAYMENT-RESPONSE captured during Layer 3 live-pay (paysponge-rentcast)",
+    "capturedAt": "2026-05-12T11:17:00.930Z",
+    "onChainSignature": "4PvKCB8dqQAQzUiQSaQaDU4onnBdLwksKfmxkhcw7HN29rJkJJzoukGPxRWurP6rCRoV8yQDvweZ5rNhCXmue4Tn",
+    "demandAtomic": "10000",
+    "note": "Spent real USDC. Body redacted via paidSummary=true (we paid for that content). Captured for regression pinning of v2 settle path."
+  },
+  "url": "https://rentcast.x402.paysponge.com/markets?zipCode=10001",
+  "method": "GET",
+  "status": 200,
+  "headers": {
+    "date": "Tue, 12 May 2026 11:17:00 GMT",
+    "content-type": "application/json",
+    "transfer-encoding": "chunked",
+    "connection": "keep-alive",
+    "access-control-allow-credentials": "true",
+    "cf-cache-status": "DYNAMIC",
+    "payment-response": "[REDACTED]",
+    "rndr-id": "b8d0d0f9-dd06-4635",
+    "server": "cloudflare",
+    "vary": "Origin, Accept-Encoding",
+    "x-render-origin-server": "Render",
+    "report-to": "{\"group\":\"cf-nel\",\"max_age\":604800,\"endpoints\":[{\"url\":\"https://a.nel.cloudflare.com/report/v4?s=RJMn1%2Fu%2BbPtzTWKJ%2BsDvp%2BOT03SgwdH4dWIDTCs08wro%2FTQ3%2FJQF2aE4TGeooigdgbzNA5ArlDkNE%2FVzaiV0kolr685CKj6cuw4DgUJo7iTw%2Fr%2Bsj5xXDvJUS4pizx%2BVp0D1Ht9vBKgVf8RNFLI%3D\"}]}",
+    "nel": "{\"report_to\":\"cf-nel\",\"success_fraction\":0.0,\"max_age\":604800}",
+    "cf-ray": "9fa903ac2c6e0bcf-SOF",
+    "alt-svc": "h3=\":443\"; ma=86400"
+  },
+  "body": "[REDACTED — paid response body summarized; ? bytes original]"
+}

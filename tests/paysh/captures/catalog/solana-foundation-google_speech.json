@@ -1,0 +1,44 @@
+{
+  "_meta": {
+    "label": "solana-foundation-google_speech-402",
+    "capturedAt": "2026-05-12T11:03:45.103Z",
+    "source": "probe-catalog",
+    "payMdPath": "providers/solana-foundation/google/speech/PAY.md",
+    "note": "Sanitized per BAT-582 v1.6 contract amendment 6."
+  },
+  "url": "https://speech.google.gateway-402.com/v1/speech:recognize",
+  "method": "POST",
+  "status": 402,
+  "headers": {
+    "content-type": "application/json",
+    "www-authenticate": "Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:44.737266871Z\", Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:44.902014768Z\", Payment id=\"[REDACTED]\", realm=\"MPP Payment\", method=\"solana\", intent=\"charge\", request=\"[REDACTED]\", expires=\"2026-05-12T11:08:45.062414733Z\"",
+    "x-cloud-trace-context": "[REDACTED]",
+    "date": "Tue, 12 May 2026 11:03:45 GMT",
+    "server": "Google Frontend",
+    "content-length": "268",
+    "via": "1.1 google",
+    "alt-svc": "h3=\":443\"; ma=2592000,h3-29=\":443\"; ma=2592000"
+  },
+  "body": {
+    "endpoint": {
+      "method": "POST",
+      "path": "v1/speech:recognize"
+    },
+    "error": "payment_required",
+    "message": "This endpoint requires payment.",
+    "payment": {
+      "challenges": 3,
+      "protocol": "mpp"
+    },
+    "pricing": {
+      "dimensions": [
+        {
+          "direction": "usage",
+          "price_usd": 0.016,
+          "scale": 1,
+          "unit": "minutes"
+        }
+      ]
+    }
+  }
+}

@@ -5,6 +5,90 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+> **Release process note for v2.0.0 final:** the release workflow (`.github/workflows/release.yml`) extracts notes by matching `## [<tag-without-v>]` literally. When promoting `v2.0.0-rc1` → `v2.0.0` final, rename the `## [2.0.0-rc1] - 2026-05-18` header below to `## [2.0.0] - <final-tag-date>` (or duplicate it with both headers if you want the historical RC entry preserved). Without this rename, the `v2.0.0` tag will fall back to auto-generated GitHub release notes instead of these curated ones.
+
+## [2.0.0-rc1] - 2026-05-18
+
+> **Major version bump.** The agent now has economic agency: it can hold and spend USDC autonomously on x402-protected paid HTTP endpoints, within user-configured per-tx and daily caps. This is the largest single-release surface expansion in SeekerClaw's history (44 new endpoints across 10 services, 3 new agent-facing tools, a new on-device key-management subsystem). The 1.x → 2.0 jump signals the inflection: pre-2.0, the agent was a smart assistant; post-2.0, the agent can transact.
+
+### Added
+
+#### Burner Wallet & x402 (BAT-582)
+
+- **Burner wallet subsystem** — a small, app-managed Ed25519 keypair encrypted at rest under `filesDir/burner_keys/<id>` using a Keystore-derived AES-256-GCM key (BouncyCastle Ed25519 signing happens inside the vault; the Keystore AES key itself is non-extractable, `userAuthenticationRequired = false`). The agent can sign with the burner autonomously, within user-configured caps. The user-controlled MAIN wallet (via MWA) is unchanged — every action there still triggers an approval popup. The burner is opt-in; until the user imports a key in Settings → Burner Wallet, the agent has one wallet and behaves exactly as in 1.x.
+- **`agent_pay` tool** — fetches x402-protected HTTPS endpoints, settles in USDC from the burner. GET runs silently when under cap; POST always asks for user confirmation. Validates the 402 response against a Solana-mainnet + USDC-asset boundary; rejects non-HTTPS, private IPs (SSRF defense), non-Solana networks, non-USDC assets, and demands exceeding the per-call `max_usdc` ceiling.
+- **`wallet_status` tool** — reports caps, today's spend, and remaining daily budget for the burner. Surfaces both wallets when the burner is configured; when not, reports only the main wallet and points at Settings → Burner Wallet.
+- **`wallet_set_caps` tool** — raise/lower per-tx or daily caps; always confirmed; shows old → new diff.
+- **Two independent ceilings** for paid calls — `max_usdc` is the agent-side per-call cap, the burner per-tx + daily caps are the user-controlled hard ceiling. Both must allow the on-chain demand. Pre-flight USDC balance check on the burner ATA refuses underfunded calls BEFORE any 402 probe so users see "send X more USDC to <pubkey>" instead of confusing downstream protocol errors.
+- **Cap-routed swap & DCA** — `solana_swap`, `jupiter_dca_create`, `jupiter_trigger_create` are now cap-aware. Under cap → silent burner sign; over cap or burner not configured → main wallet popup. The agent never silently transacts above caps, and never silently transacts WITHOUT a configured burner.
+- **POST + body support (BAT-664)** — `agent_pay` accepts `method: "POST"` with `body: <JSON object | array | parseable string>`, up to 8 KB UTF-8 compact. Powers paid services like Textbelt SMS, Reducto document parsing, Perplexity agent queries, and the 21-endpoint stablecrypto market-data wrapper.
+
+#### Paysh-Catalog — 44 Endpoints Across 10 Services
+
+- **`paysh-catalog` skill (BAT-704)** — bundled folder skill listing pay.sh services the agent can reach via `agent_pay`. **OPT-IN ONLY** — activates only when the user's message contains an explicit pay-intent keyword (`pay.sh`, `paysh`, `x402`, `pay for X`, `use <service> to pay`, etc.) or one of the capability-ask phrases ("what can you pay for", "show me pay.sh services"). For all other queries — including ones the catalog could technically answer — the agent uses free tools (training data, `web_search`, `web_fetch`, `solana_*`/`jupiter_*`). Prevents the pre-BAT-704 footgun where the agent autonomously paid for trivia.
+- **v2 catalog schema (BAT-761)** — per-endpoint entries (not per-service) with `upstream_ref`, `verification` metadata, `service_id` grouping, `doc_anchor` per-section, and an `audit_pending[]` list of sibling endpoints found-but-not-yet-catalogued. See `paysh-catalog/SCHEMA.md` for the full spec.
+- **44 catalogued endpoints across 10 services:**
+  - **stablecrypto-market-data (21)** — CoinGecko (price/markets/chart/ohlc/top-movers/trending/categories/onchain-pool/onchain-trending/new-pools, 10 endpoints) + DefiLlama (protocols/protocol/chains/chain-tvl/yields-pools/yields-perps/stablecoins/dex-overview/fees-overview/derivatives-overview/coins-prices-historical, 11 endpoints).
+  - **tripadvisor (5)** — nearby-search, search, location-details, location-reviews, location-photos.
+  - **rentcast (5)** — markets, avm-value, properties, listings-sale, listings-rental.
+  - **crushrewards-pricing (4)** — shopper-best-price, shopper-price-history, shopper-deal-finder, analyst-inflation.
+  - **perplexity (2)** — search, v1-agent.
+  - **wolframalpha (2)** — v1-result, v2-query.
+  - **reducto (2)** — extract, parse (document AI).
+  - **2captcha (1)**, **textbelt-sms (1)**, **purch (1)** — singletons.
+- **63 unsupported entries** — services we've identified but can't safely route the agent to. Four documented failure sub-cases: (1) protocol-fail (mpp_protocol / siwx_auth_required / invalid_demand), (2) can-pay-can't-deliver (requires_binary_response — would burn USDC on PNG/MP4 bytes), (3) non-402-at-probe (broken/moved/auth-gated catalog URL), (4) unverified_paid_response_shape (evidence about the paid response is contested). Lets the agent answer "I know about X but can't use it because Y" honestly.
+- **Catalog maintenance tooling (BAT-761)** — `tests/paysh/probe-catalog.js` with `--audit`, `--drift`, `--status`, `--refresh <id>` modes. Drift mode checks captured 402 responses against current upstream without writing; `--write-checked-at` updates verification timestamps after a clean sweep.
+- **BAT-706 audit crawler** — audited 72 pay.sh services, discovered 824 endpoints, of which 384 returned a parseable Solana-USDC 402 (the rest were either non-Solana-USDC paywalls, non-402 HTTP responses, or fetch failures). Snapshot in `tests/paysh/catalog-audit.md`. Roughly 30 of the 384 parsed_ok endpoints are user-facing-meaningful and migrated into the catalog; the rest live in unsupported.json with structured "why not" reasons.
+
+#### Doc Fidelity Fixes
+
+- **BAT-768 fix: stablecrypto body shapes from openapi (#382)** — six blocking shape bugs fixed where the doc inferred bodies from CoinGecko's public REST API (strings, comma-separated) but the gateway openapi declared arrays and string-typed `days`. Six optional-param completions added. The doc now uses `Field | Type | Required | Notes` tables sourced directly from `openapi.json` `requestBody.content.application/json.schema`.
+- **BAT-768 fix: rentcast query params from openapi (#383)** — three blocking shape bugs fixed (`/markets` invented `city`/`state`/`bedrooms`; `/properties` invented `id` query param; `/listings/{sale,rental}` invented `priceMin`/`priceMax` instead of the single `price` with numeric-range syntax). Plus completed missing optional params on `/avm/value` and others.
+
+#### Infrastructure & Tests
+
+- **402 detect/settle test harnesses** — `tests/paysh/validate-detect.js` (Layer 2) + `validate-settle.js` (Layer 2.5 mocked) cover 42 `EXPECTATIONS` entries and 37 `SETTLE_CAPTURES` entries with byte-exact pay.sh challenge captures. Catches gateway-protocol regressions before they ship.
+- **Capture sanitize hardening (BAT-769)** — `tests/paysh/lib/sanitize.js` redacts payment-signature headers, long base64/hex blobs, and transport-noise headers (`report-to`, `nel`, `rndr-id`, `x-render-origin-server`) so committed capture fixtures contain no live secrets.
+- **Tool input-schema validity CI gate** — every tool's `input_schema` is now validated as JSON Schema in pre-push and CI. Catches the BAT-664 schema-kill class (`type: ['object', 'array', 'string']` without `items`) before it takes down agent turns.
+
+#### Agent Self-Awareness
+
+- **Wallets section in `buildSystemBlocks()`** — agent knows about both wallets, their roles, the burner's caps, the network constraint (Solana mainnet only), the OPT-IN policy for `paysh-catalog`, the two-ceiling semantic, the multi-call composition cost transparency rule, and the "do not auto-retry on HTTP 4xx — consult DIAGNOSTICS" guidance.
+- **DIAGNOSTICS.md `agent_pay` section** — covers every rejection error code (`non_https`, `private_ip`, `non_solana_network`, `non_usdc_asset`, `demand_exceeds_max_usdc`, `method_not_allowed`, `body_required_for_post`, `body_not_json`, `body_too_large`, `invalid_url`, `dns_timeout`, `dns_lookup_failed`, `response_too_large`, `timeout`, `burner_not_configured`, `no_protocol_match`, `insufficient_burner_balance`, `burner_cap_exceeded`) with symptoms / diagnosis / fix.
+- **DIAGNOSTICS.md `paysh-catalog` section** (SAB-AUDIT-v27) — three new entries: (1) doc-vs-gateway divergence (the bug class behind #382/#383), (2) OPT-IN regression (agent autonomously paid for trivia), (3) cost discrepancy (paid more than the catalog `cost_usdc` says).
+- **Tool description hardening** — both `memory_save` AND `daily_note` descriptions now explicitly forbid storing secrets (mirrors the prompt's negative-knowledge anchor). Same rule on both dispatch surfaces because daily_note writes to the same plain-text-on-disk + SQL-indexed store as memory_save.
+
+### Changed
+
+- **App version 1.10.0 → 2.0.0 (versionCode 19 → 20).** Major bump signals the burner-wallet inflection.
+- **SKILL.md version bumps for `paysh-catalog`** — 1.1.0 (BAT-704 opt-in, #377) → 1.4.0 (BAT-761 v2 schema, #379) → 1.5.0 (BAT-769 perplexity, #380) → 1.6.0 (BAT-768/766 Tier 1 expansion, #381) → 1.7.0 (stablecrypto doc fix, #382) → 1.8.0 (rentcast doc fix, #383). `ConfigManager.seedSkill()` re-seeds workspace files on each bump so existing devices get the latest doc without WIPE.
+
+### Fixed
+
+- **BAT-582 R9 / BAT-664 false-positive `burner_not_configured` for POST only** (commit `6957604c`). The confirmation gate's `_BURNER_STATUS_GATE_TOOLS` had `agent_pay` excluded under R9's v1.4-era optimization, so the BAT-664 POST branch fast-failed every call even when the burner was configured. Now agent_pay is in the gate set; `wallet-registry.test.js` regression-guard locks the membership.
+- **agent_pay schema-kill that took down every agent turn** (commit `36e54b1a`). Input-schema had `type: ['object', 'array', 'string']` without `items` for the `body` field — Anthropic API rejected with 400 on every turn before any tool dispatched. New tool-schema validity test + pre-push + CI gate.
+- **Insufficient-burner-balance false-protocol-error** — pre-fix, under-funded burners produced confusing `no_protocol_match` or `payment_rejected — server returned 402 again` errors (red herrings; root cause was always "not enough USDC at source"). Now a pre-flight ATA balance check surfaces the exact shortfall with the funding pubkey BEFORE any probe is sent.
+- **Layer 3 live-pay memo encoding** (PR #369). Settlement payments now include the correct memo per pay.sh contract.
+
+### Security
+
+- **SSRF defense in `agent_pay`** — DNS-resolves the URL host BEFORE any HTTP request; refuses if the resolved IP is in a private range (10/8, 172.16/12, 192.168/16, 127/8, 169.254/16, ::1, fc00::/7, fe80::/10). Pre-DNS rejections (non-HTTPS, invalid URL, disallowed method) fire even earlier — operator typos diagnosed cleanly without touching attacker-supplied hosts.
+- **Burner key never leaves the Kotlin vault.** The Ed25519 seed lives encrypted under `filesDir/burner_keys/<id>` (Keystore-derived AES-256-GCM); BouncyCastle Ed25519 signing happens inside `EncryptedPrefsKeyVault`. Per the Codex pivot: signing is bridge-backed — Node sends a signing request to Kotlin via the localhost bridge; Kotlin decrypts, signs, returns the signed transaction; Node never sees the raw key bytes. No Node-side raw-key handling anywhere in the codebase. App manifest sets `android:allowBackup="false"` so the burner files never enter cloud backups.
+- **Bridge auth token** — the localhost bridge between `:node` and Kotlin requires a per-boot auth token that's freshly generated each service start. No process can spoof a request without it.
+
+### Migration
+
+For existing 1.10.0 users on Solana Seeker (or any Android 14+ device):
+
+- **App update (Store / `adb install -r`):** user memory files (SOUL.md, MEMORY.md, IDENTITY.md, USER.md, daily notes, cron jobs) preserved verbatim — no impact on prior conversations, agent personality, or scheduled tasks. User-created skills (anything not shipped in the bundled `assets/default-skills/` set) preserved verbatim. **Bundled default skills** (the 22 in `assets/default-skills/`) are version-aware via `ConfigManager.seedSkill()`:
+   - If the user has NOT modified the bundled `SKILL.md` (hash matches manifest), a bundled-version bump **overwrites both `SKILL.md` and all support files** in the skill folder (e.g., paysh-catalog's `catalog.json` + `services/*.md` are re-seeded through 1.1.0 → 1.4.0 → … → 1.8.0 this release). This is the intended path — how 2.0.0 ships updated catalog docs to existing devices.
+   - If the user HAS modified the bundled `SKILL.md` (hash mismatch), the seed is skipped entirely and the user's customized version is kept; support files are NOT touched in that case.
+   - There is currently no per-support-file hash tracking, so if you edited `catalog.json` or `services/<id>.md` directly on a bundled skill while leaving the `SKILL.md` unchanged, those edits will be overwritten on the next version bump. Bundled folder-shaped skills are intended as curated catalogs — fork them under a new name if you need persistent customization.
+- **DIAGNOSTICS.md (behavior change in 2.0.0):** now overwritten from the bundled asset on every service start, replacing the prior one-time `if (!exists)` seed. DIAGNOSTICS.md is bundled documentation read by the agent on demand — same overwrite pattern as PLATFORM.md. Without this change, existing 1.10.0 users would never receive new troubleshooting entries (including the SAB-AUDIT-v27 paysh-catalog section). If a user had hand-edited their workspace DIAGNOSTICS.md (uncommon — there's no UI for it), those edits will be replaced on next launch.
+- **Burner wallet:** the agent does NOT auto-create one. Until the user opens Settings → Burner Wallet and imports a key (or uses the in-app "Generate New" flow), the agent runs in single-wallet mode exactly like 1.10.0. The `paysh-catalog` skill stays dormant.
+- **Paysh-catalog skill:** auto-seeds on first launch (because it's a default-skill), but OPT-IN means it stays inert until the user invokes a pay-intent keyword. Zero behavior change for users who don't intentionally engage it.
+- **Settings changes:** no Settings layout migration needed — Burner Wallet is a new section, doesn't move anything existing.
+
 ## [1.10.0] - 2026-05-02
 
 ### Added
