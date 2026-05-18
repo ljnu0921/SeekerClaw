@@ -56,7 +56,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - **Wallets section in `buildSystemBlocks()`** — agent knows about both wallets, their roles, the burner's caps, the network constraint (Solana mainnet only), the OPT-IN policy for `paysh-catalog`, the two-ceiling semantic, the multi-call composition cost transparency rule, and the "do not auto-retry on HTTP 4xx — consult DIAGNOSTICS" guidance.
 - **DIAGNOSTICS.md `agent_pay` section** — covers every rejection error code (`non_https`, `private_ip`, `non_solana_network`, `non_usdc_asset`, `demand_exceeds_max_usdc`, `method_not_allowed`, `body_required_for_post`, `body_not_json`, `body_too_large`, `invalid_url`, `dns_timeout`, `dns_lookup_failed`, `response_too_large`, `timeout`, `burner_not_configured`, `no_protocol_match`, `insufficient_burner_balance`, `burner_cap_exceeded`) with symptoms / diagnosis / fix.
 - **DIAGNOSTICS.md `paysh-catalog` section** (SAB-AUDIT-v27) — three new entries: (1) doc-vs-gateway divergence (the bug class behind #382/#383), (2) OPT-IN regression (agent autonomously paid for trivia), (3) cost discrepancy (paid more than the catalog `cost_usdc` says).
-- **Tool description hardening** — `memory_save` description now explicitly forbids storing secrets (mirrors the prompt's negative-knowledge anchor), so the rule lives on the dispatch surface, not just in the prompt body.
+- **Tool description hardening** — both `memory_save` AND `daily_note` descriptions now explicitly forbid storing secrets (mirrors the prompt's negative-knowledge anchor). Same rule on both dispatch surfaces because daily_note writes to the same plain-text-on-disk + SQL-indexed store as memory_save.
 
 ### Changed
 

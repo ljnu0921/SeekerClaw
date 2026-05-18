@@ -22,7 +22,14 @@
 #      BAT-664 `body: { type: ['object','array','string'] }` shipped without
 #      the required `items` and broke the integration branch on first device
 #      message.
-#   3. Kotlin compile (`compileDappStoreDebugKotlin`) — catches import errors,
+#   3. Wallets/payment-safety prompt assertions
+#      (`tests/nodejs-project/system-prompt-wallets.test.js`) — locks the
+#      BAT-582 wallets-section phrases + the SAB-AUDIT-v27 payment-safety
+#      additions (multi-call composition transparency, do-NOT-auto-retry-on-
+#      4xx/5xx, DIAGNOSTICS.md → "paysh-catalog" door). Added 2026-05-18
+#      after Copilot R7 flagged that the SAB-AUDIT-v27 phrases weren't
+#      regression-protected. <1s.
+#   4. Kotlin compile (`compileDappStoreDebugKotlin`) — catches import errors,
 #      type mismatches, unresolved references BEFORE CI
 #
 # Usage:

@@ -2412,7 +2412,7 @@ object ConfigManager {
                 )
             }
         } catch (e: Exception) {
-            Log.w("ConfigManager", "DIAGNOSTICS.md seed failed; existing file kept", e)
+            Log.w(TAG, "DIAGNOSTICS.md seed failed; existing file kept", e)
             if (diagTmp.exists()) diagTmp.delete()
         }
 
