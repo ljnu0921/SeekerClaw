@@ -5,11 +5,11 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-> **Release process note for v2.0.0 final:** the release workflow (`.github/workflows/release.yml`) extracts notes by matching `## [<tag-without-v>]` literally. When promoting `v2.0.0-rc1` → `v2.0.0` final, rename the `## [2.0.0-rc1] - 2026-05-18` header below to `## [2.0.0] - <final-tag-date>` (or duplicate it with both headers if you want the historical RC entry preserved). Without this rename, the `v2.0.0` tag will fall back to auto-generated GitHub release notes instead of these curated ones.
+## [2.0.0] - 2026-05-19
 
-## [2.0.0-rc1] - 2026-05-18
-
-> **Major version bump.** The agent now has economic agency: it can hold and spend USDC autonomously on x402-protected paid HTTP endpoints, within user-configured per-tx and daily caps. This is the largest single-release surface expansion in SeekerClaw's history (44 new endpoints across 10 services, 3 new agent-facing tools, a new on-device key-management subsystem). The 1.x → 2.0 jump signals the inflection: pre-2.0, the agent was a smart assistant; post-2.0, the agent can transact.
+> **Major version bump.** Promoted from `v2.0.0-rc1` (tagged 2026-05-18) after on-device smoke test on Solana Seeker confirmed all four checklist items: install-over-1.10.0 preserves user memory, System screen reads `2.0.0 (20)` with SHA `54696d42`, Telegram round-trip, paid call via tripadvisor returns real data for $0.01 first try with no retry burn.
+>
+> The agent now has economic agency: it can hold and spend USDC autonomously on x402-protected paid HTTP endpoints, within user-configured per-tx and daily caps. This is the largest single-release surface expansion in SeekerClaw's history (44 new endpoints across 10 services, 3 new agent-facing tools, a new on-device key-management subsystem). The 1.x → 2.0 jump signals the inflection: pre-2.0, the agent was a smart assistant; post-2.0, the agent can transact.
 
 ### Added
 
