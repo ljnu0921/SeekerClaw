@@ -2,11 +2,17 @@
   <img src="design/banner.png" alt="SeekerClaw" width="100%">
   <br><br>
   <p>
+    <img src="https://img.shields.io/badge/🏆_Solana_Mobile_Hackathon-Winner-FFD700?style=for-the-badge&labelColor=0d1117" alt="Solana Mobile Hackathon Winner">
+  </p>
+  <p>
     <img src="https://img.shields.io/badge/Android-14+-3DDC84?logo=android&logoColor=white" alt="Android 14+">
     <img src="https://img.shields.io/badge/Kotlin-2.0-7F52FF?logo=kotlin&logoColor=white" alt="Kotlin">
+    <img src="https://img.shields.io/badge/Compose-Material_3-4285F4?logo=jetpackcompose&logoColor=white" alt="Jetpack Compose">
+    <img src="https://img.shields.io/badge/Node.js-18_on--device-339933?logo=nodedotjs&logoColor=white" alt="Node.js">
     <img src="https://img.shields.io/badge/Claude-Powered-cc785c?logo=anthropic&logoColor=white" alt="Claude">
     <img src="https://img.shields.io/badge/OpenAI-Powered-412991?logo=openai&logoColor=white" alt="OpenAI">
     <img src="https://img.shields.io/badge/OpenRouter-Powered-6467F2?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0xMiAyQzYuNDggMiAyIDYuNDggMiAxMnM0LjQ4IDEwIDEwIDEwIDEwLTQuNDggMTAtMTBTMTcuNTIgMiAxMiAyem0wIDE4Yy00LjQyIDAtOC0zLjU4LTgtOHMzLjU4LTggOC04IDggMy41OCA4IDgtMy41OCA4LTggOHoiLz48L3N2Zz4=&logoColor=white" alt="OpenRouter">
+    <img src="https://img.shields.io/badge/MCP-Streamable_HTTP-1a1a2e" alt="MCP">
     <img src="https://img.shields.io/badge/Solana-Seeker-9945FF?logo=solana&logoColor=white" alt="Solana">
     <img src="https://img.shields.io/badge/Telegram-Bot-26A5E4?logo=telegram&logoColor=white" alt="Telegram">
     <img src="https://img.shields.io/badge/License-MIT-blue" alt="MIT License">
@@ -23,7 +29,7 @@
 
 ---
 
-SeekerClaw embeds a Node.js AI agent inside an Android app, running 24/7 as a foreground service. You interact through Telegram or Discord — ask questions, control your phone, trade crypto, schedule tasks. **60+ built-in tools (plus MCP remote tools), 35+ partner skills, Solana wallet, multi-provider AI (Claude + OpenAI + OpenRouter + any OpenAI-compatible gateway), extended thinking, graceful Stop**, all running locally on your device. Built for the Solana Seeker, runs on any Android 14+ phone.
+SeekerClaw embeds a Node.js AI agent inside an Android app, running 24/7 as a foreground service. You interact through Telegram or Discord — ask questions, control your phone, trade crypto, schedule tasks. **66 built-in tools (plus MCP remote tools), 35+ partner skills, Solana wallet, multi-provider AI (Claude + OpenAI + OpenRouter + any OpenAI-compatible gateway), extended thinking, graceful Stop**, all running locally on your device. Built for the Solana Seeker, runs on any Android 14+ phone.
 
 <div align="center">
   <img src="design/screenshots/01-first-launch.png" width="130">
@@ -33,6 +39,14 @@ SeekerClaw embeds a Node.js AI agent inside an Android app, running 24/7 as a fo
   <img src="design/screenshots/05-solana.png" width="130">
   <img src="design/screenshots/06-skills.png" width="130">
 </div>
+
+## 🏆 Award
+
+**Winner — Solana Mobile Hackathon** · April 2026
+
+SeekerClaw was selected as a winner of the Solana Mobile Hackathon, recognized for running a full AI agent on-device on the Solana Seeker.
+
+[Announcement →](https://x.com/RadiantsDAO/status/2049549148395798847)
 
 ## Features
 
