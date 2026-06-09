@@ -309,7 +309,7 @@ User (Telegram/Discord) <--HTTPS/WSS--> Channel API <--polling/WS--> Node.js Gat
 
 | Date | Feature | PR |
 |------|---------|-----|
-| 2026-06-09 | Fix: custom model silently reverted by config reconcile — equality gate trusts UI-saved values; UI/agent split-brain + restart-revert resolved. Feat: add Fable 5 + Opus 4.8 (new Anthropic default); Opus 4.6 retained (registry drives Extended Thinking) (BAT-1032). | — |
+| 2026-06-09 | Fix: custom model silently reverted by config reconcile — equality gate trusts UI-saved values; UI/agent split-brain + restart-revert resolved. Feat: add Fable 5 + Opus 4.8 (new Anthropic default); Opus 4.6 retained (registry drives Extended Thinking) (BAT-1032). | #403 |
 | 2026-05-31 | Docs (BAT-990): README + PROJECT.md v2 sync — rewrite intro to lead with v2 thesis (autonomous USDC payments + hackathon win), add Autonomous Payments section, new x402 features row, rename to Solana Wallets, expand Live Settings, fix Extended Thinking model list, add Graceful Stop row, bundled-skills note, burner-wallet safety bullet. Tool count reconciled to 63 across 13 modules; bundled skills 22. Burner wording paste/import-only per BAT-936. | direct |
 | 2026-05-30 | Docs: add Solana Mobile Hackathon Winner badge + Award section in README; add Compose / Node.js / MCP badges | direct |
 | 2026-05-29 | Chore (tests): Jupiter Trigger V2 contract-probe + refund dev tools (BAT-697) — dev-only, not bundled in app | direct |
