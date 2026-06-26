@@ -260,7 +260,7 @@ class SeekerClawService : Service() {
         ServiceState.init(applicationContext)
         LogCollector.init(applicationContext)
 
-        val notification = createNotification("SeekerClaw is running")
+        val notification = createNotification("NodeAIgent is running")
         startForeground(NOTIFICATION_ID, notification)
 
         // Clear any lingering setup-required notification from a previous version.
@@ -344,7 +344,7 @@ class SeekerClawService : Service() {
         val newCrashCount = if (now - lastStart < 30_000) crashCount + 1 else 0
         prefs.edit().putLong("last_start", now).putInt("crash_count", newCrashCount).apply()
 
-        LogCollector.append("[Service] Starting Claw Engine... (attempt ${newCrashCount + 1})")
+        LogCollector.append("[Service] Starting NodeAIgent Engine... (attempt ${newCrashCount + 1})")
         ServiceState.updateStatus(ServiceStatus.STARTING)
 
         // Generate per-boot auth token for bridge security
@@ -414,7 +414,7 @@ class SeekerClawService : Service() {
 
         // Mark as running
         ServiceState.updateStatus(ServiceStatus.RUNNING)
-        LogCollector.append("[Service] Claw Engine is now RUNNING")
+        LogCollector.append("[Service] NodeAIgent Engine is now RUNNING")
 
         // BAT-582 Phase 3: periodic sweep of stale Burner Wallet cap
         // reservations. Every 30s, any reservation whose expiresAtMs has
@@ -618,13 +618,13 @@ class SeekerClawService : Service() {
         // locally once per second for display only.
         ServiceState.setServiceStartTimeMs(System.currentTimeMillis())
 
-        LogCollector.append("[Service] Claw Engine started")
+        LogCollector.append("[Service] NodeAIgent Engine started")
 
         return START_STICKY
     }
 
     override fun onDestroy() {
-        LogCollector.append("[Service] Stopping Claw Engine...")
+        LogCollector.append("[Service] Stopping NodeAIgent Engine...")
         // BAT-525: flush Node BEFORE everything else. The bridge token
         // and Node process must both still be alive for the loopback
         // POST /shutdown/flush to land. This call is bounded
@@ -678,7 +678,7 @@ class SeekerClawService : Service() {
 .putInt("crash_count", 0)
 .commit()
 
-        LogCollector.append("[Service] Claw Engine stopped")
+        LogCollector.append("[Service] NodeAIgent Engine stopped")
         super.onDestroy()
 
         // Service is isolated in :node process. Kill process so Node runtime cannot linger.
@@ -729,7 +729,7 @@ class SeekerClawService : Service() {
 )
 
         return NotificationCompat.Builder(this, SeekerClawApplication.CHANNEL_ID)
-.setContentTitle("SeekerClaw")
+.setContentTitle("NodeAIgent")
 .setContentText(text)
 .setSmallIcon(R.drawable.ic_notification)
 .setContentIntent(pendingIntent)
@@ -747,7 +747,7 @@ class SeekerClawService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
 )
         return NotificationCompat.Builder(this, SeekerClawApplication.ERROR_CHANNEL_ID)
-.setContentTitle("SeekerClaw")
+.setContentTitle("NodeAIgent")
 .setContentText(text)
 .setSmallIcon(R.drawable.ic_notification)
 .setContentIntent(pendingIntent)

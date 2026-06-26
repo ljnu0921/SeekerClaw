@@ -112,7 +112,7 @@ fun SystemScreen(onBack: () -> Unit) {
 
     val cfgVersion by ConfigManager.configVersion
     val config = remember(cfgVersion) { ConfigManager.loadConfig(context) }
-    val agentName = remember(config) { config?.agentName?.ifBlank { "SeekerClaw" } ?: "SeekerClaw" }
+    val agentName = remember(config) { config?.agentName?.ifBlank { "NodeAIgent" } ?: "NodeAIgent" }
     val modelName = remember(config) {
         config?.model
             ?.ifBlank { null }
@@ -173,7 +173,7 @@ fun SystemScreen(onBack: () -> Unit) {
                 append("${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
                 if (BuildConfig.DEBUG) append(" · ${BuildConfig.GIT_SHA}")
             })
-            InfoRow("Claw Engine", BuildConfig.OPENCLAW_VERSION)
+            InfoRow("NodeAIgent Engine", BuildConfig.OPENCLAW_VERSION)
             InfoRow(
                 label = "Node.js",
                 value = "${BuildConfig.NODEJS_VERSION} — ${when (status) {

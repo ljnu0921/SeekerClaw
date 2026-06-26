@@ -481,7 +481,7 @@ class AndroidBridge(
     private fun handleClipboardSet(params: JSONObject): Response {
         val content = params.optString("content", "")
         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val clip = ClipData.newPlainText("SeekerClaw", content)
+        val clip = ClipData.newPlainText("NodeAIgent", content)
         clipboard.setPrimaryClip(clip)
         return jsonResponse(200, mapOf("success" to true))
     }

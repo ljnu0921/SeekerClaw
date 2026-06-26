@@ -32,7 +32,7 @@ class BootReceiver : BroadcastReceiver() {
             return
         }
 
-        LogCollector.append("[Boot] Auto-starting Claw Engine...")
+        LogCollector.append("[Boot] Auto-starting NodeAIgent Engine...")
         SeekerClawService.start(context)
     }
 }

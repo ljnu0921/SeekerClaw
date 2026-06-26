@@ -47,13 +47,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import com.seekerclaw.app.ui.theme.RethinkSans
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.seekerclaw.app.config.ConfigManager
@@ -129,7 +126,7 @@ fun DashboardScreen(
 
     val cfgVersion by ConfigManager.configVersion
     val config = remember(cfgVersion) { ConfigManager.loadConfig(context) }
-    val agentName = remember(config) { config?.agentName?.ifBlank { "SeekerClaw" } ?: "SeekerClaw" }
+    val agentName = remember(config) { config?.agentName?.ifBlank { "NodeAIgent" } ?: "NodeAIgent" }
     val hasBotToken = remember(config) {
         if (config?.channel == "discord") config?.discordBotToken?.isNotBlank() == true
         else config?.telegramBotToken?.isNotBlank() == true
@@ -308,18 +305,13 @@ fun DashboardScreen(
             .verticalScroll(rememberScrollState())
             .padding(16.dp),
     ) {
-        // Header — two-tone logo
+        // Header — temporary rebrand label
         Text(
-            text = buildAnnotatedString {
-                withStyle(SpanStyle(color = SeekerClawColors.TextPrimary, fontWeight = FontWeight.ExtraBold)) {
-                    append("Seeker")
-                }
-                withStyle(SpanStyle(color = SeekerClawColors.Primary, fontWeight = FontWeight.ExtraBold)) {
-                    append("C/aw")
-                }
-            },
+            text = "NodeAIgent",
             fontFamily = RethinkSans,
             fontSize = 28.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = SeekerClawColors.TextPrimary,
         )
 
         Spacer(modifier = Modifier.height(2.dp))
@@ -655,7 +647,7 @@ fun DashboardScreen(
                     "degraded" -> "Engine retrying"
                     "error" -> "Engine error"
                     "stale" -> "Engine unresponsive"
-                    else -> "Claw Engine"
+                    else -> "NodeAIgent Engine"
                 }
                 ServiceStatus.STARTING -> "Starting..."
                 ServiceStatus.STOPPED -> "Offline"

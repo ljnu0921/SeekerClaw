@@ -165,7 +165,7 @@ fun LogsScreen() {
             Row {
                 IconButton(onClick = {
                     val logText = buildString {
-                        appendLine("SeekerClaw Logs — ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US).format(Date())}")
+                        appendLine("NodeAIgent Logs — ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US).format(Date())}")
                         appendLine("─".repeat(40))
                         filteredLogs.forEach { entry ->
                             val timeStr = android.text.format.DateFormat.format(timePattern, Date(entry.timestamp))
@@ -175,7 +175,7 @@ fun LogsScreen() {
                     val sendIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
                         type = "text/plain"
                         putExtra(android.content.Intent.EXTRA_TEXT, logText)
-                        putExtra(android.content.Intent.EXTRA_SUBJECT, "SeekerClaw Logs")
+                        putExtra(android.content.Intent.EXTRA_SUBJECT, "NodeAIgent Logs")
                     }
                     context.startActivity(android.content.Intent.createChooser(sendIntent, "Share Logs"))
                 }) {

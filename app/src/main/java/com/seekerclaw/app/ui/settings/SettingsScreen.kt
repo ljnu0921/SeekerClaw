@@ -342,7 +342,7 @@ fun SettingsScreen(
             Toast.makeText(
                 context,
                 if (success) "Memory imported. Restart agent to apply."
-                else "Import failed. Ensure the file is a valid SeekerClaw backup.",
+                else "Import failed. Ensure the file is a valid NodeAIgent backup.",
                 Toast.LENGTH_LONG
             ).show()
         }
@@ -508,7 +508,7 @@ fun SettingsScreen(
                 )
                 ConfigField(
                     label = "Agent Name",
-                    value = config?.agentName?.ifBlank { "SeekerClaw" } ?: "SeekerClaw",
+                    value = config?.agentName?.ifBlank { "NodeAIgent" } ?: "NodeAIgent",
                     onClick = {
                         editField = "agentName"
                         editLabel = "Agent Name"
@@ -908,7 +908,7 @@ fun SettingsScreen(
                     onClick = {
                         Analytics.featureUsed("memory_exported")
                         val timestamp = android.text.format.DateFormat.format("yyyyMMdd_HHmm", Date())
-                        exportLauncher.launch("seekerclaw_backup_$timestamp.zip")
+                        exportLauncher.launch("nodeaigent_backup_$timestamp.zip")
                     },
                     modifier = Modifier.fillMaxWidth(),
                     shape = shape,
@@ -950,7 +950,7 @@ fun SettingsScreen(
                 OutlinedButton(
                     onClick = {
                         val timestamp = android.text.format.DateFormat.format("yyyyMMdd", java.util.Date())
-                        skillsExportLauncher.launch("seekerclaw_skills_$timestamp.zip")
+                        skillsExportLauncher.launch("nodeaigent_skills_$timestamp.zip")
                     },
                     modifier = Modifier.fillMaxWidth(),
                     shape = shape,
@@ -1025,7 +1025,7 @@ fun SettingsScreen(
             Spacer(modifier = Modifier.height(10.dp))
 
             Text(
-                text = "Generate a config QR at seekerclaw.xyz to set up your agent in seconds.",
+                text = "Generate a config QR at [ NodeAIgent link ] to set up your agent in seconds.",
                 fontFamily = RethinkSans,
                 fontSize = 12.sp,
                 color = SeekerClawColors.TextDim,
@@ -1051,7 +1051,7 @@ fun SettingsScreen(
 
         CardSurface {
             InfoRow("Version", "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
-            InfoRow("Claw Engine", BuildConfig.OPENCLAW_VERSION)
+            InfoRow("NodeAIgent Engine", BuildConfig.OPENCLAW_VERSION)
             InfoRow("Node.js", BuildConfig.NODEJS_VERSION, isLast = true)
         }
 
@@ -1768,7 +1768,7 @@ private fun RevokePermissionDialog(
         },
         text = {
             Text(
-                text = "Android doesn't allow apps to revoke their own permissions.\n\nTo disable $permissionLabel, go to:\nSystem Settings \u2192 Apps \u2192 SeekerClaw \u2192 Permissions",
+                text = "Android doesn't allow apps to revoke their own permissions.\n\nTo disable $permissionLabel, go to:\nSystem Settings \u2192 Apps \u2192 NodeAIgent \u2192 Permissions",
                 fontFamily = RethinkSans,
                 fontSize = 14.sp,
                 color = SeekerClawColors.TextSecondary,

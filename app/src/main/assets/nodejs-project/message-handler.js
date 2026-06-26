@@ -222,7 +222,7 @@ Use YAML frontmatter with \`name\`, \`description\`, and \`triggers\` fields.`;
                     if (pkg.version) pkgVersion = pkg.version;
                 } catch (_) {}
             }
-            return `**SeekerClaw**
+            return `**NodeAIgent**
 Agent: \`${deps.getAgentName()}\`
 Package: \`${pkgVersion}\`
 Model: \`${resolveActiveModel()}\`
@@ -898,7 +898,7 @@ async function handleProviderCommand(chatId, args, messageId = null) {
             // forever for a restart that never happens.
             deps.sendMessage(
                 chatId,
-                `⚠️ Couldn't trigger the restart automatically. Please restart the SeekerClaw app manually and run \`/provider ${newProvider}\` again to finish switching.`,
+                `⚠️ Couldn't trigger the restart automatically. Please restart the NodeAIgent app manually and run \`/provider ${newProvider}\` again to finish switching.`,
                 messageId,
             ).catch((e) => deps.log(`[/provider] restart-fallback sendMessage failed: ${e && e.message}`, 'WARN'));
         });
@@ -1356,7 +1356,7 @@ async function handleThinkCommand(chatId, args) {
             lines.push('This model does not support extended thinking, so these settings will not affect responses on this model.');
         } else if (support === 'unknown') {
             lines.push('');
-            lines.push('This model is not in SeekerClaw\'s known model list, so extended thinking may not be available.');
+            lines.push('This model is not in NodeAIgent\'s known model list, so extended thinking may not be available.');
         }
         lines.push('');
         lines.push('**Commands:**');

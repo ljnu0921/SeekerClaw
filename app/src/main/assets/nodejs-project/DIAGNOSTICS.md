@@ -1,4 +1,4 @@
-# DIAGNOSTICS.md — SeekerClaw Agent Troubleshooting Guide
+# DIAGNOSTICS.md — NodeAIgent Agent Troubleshooting Guide
 
 > **Purpose:** Deep troubleshooting for failure modes not covered by the quick playbook in your system prompt.
 > Read this file on demand when you need detailed diagnosis steps.
@@ -21,7 +21,7 @@ The agent runs on one of two channels, configured by the `CHANNEL` setting (`tel
 grep -i "401\|Unauthorized\|FORBIDDEN" node_debug.log | tail -10
 ```
 **Diagnosis:** If you see `401 Unauthorized` from api.telegram.org (not api.anthropic.com), the Telegram bot token is invalid or revoked.
-**Fix:** Tell the user: "Your Telegram bot token appears invalid. Go to @BotFather on Telegram, regenerate the token, then update it in SeekerClaw Settings > Telegram Token." This requires an app restart.
+**Fix:** Tell the user: "Your Telegram bot token appears invalid. Go to @BotFather on Telegram, regenerate the token, then update it in NodeAIgent Settings > Telegram Token." This requires an app restart.
 
 ### Telegram Rate Limited (429)
 **Symptoms:** Messages delayed or dropped, 429 responses from Telegram API in logs.
@@ -59,8 +59,8 @@ grep -i "4004\|4014\|Authentication\|Disallowed intent\|DISCORD" node_debug.log 
 - **4004 Authentication failed:** The Discord bot token is invalid, revoked, or malformed.
 - **4014 Disallowed intents:** The bot requires Message Content Intent enabled in Discord Developer Portal (discord.com/developers → Bot → Privileged Gateway Intents).
 **Fix:**
-- For invalid token: "Go to discord.com/developers, select your application, copy the bot token, and update it in SeekerClaw Settings > Discord Token." Requires restart.
-- For missing intents: "Enable 'Message Content Intent' in Discord Developer Portal > Bot > Privileged Gateway Intents, then restart SeekerClaw."
+- For invalid token: "Go to discord.com/developers, select your application, copy the bot token, and update it in NodeAIgent Settings > Discord Token." Requires restart.
+- For missing intents: "Enable 'Message Content Intent' in Discord Developer Portal > Bot > Privileged Gateway Intents, then restart NodeAIgent."
 
 ### WebSocket Disconnect / Reconnection
 **Symptoms:** Messages stop arriving, then resume after a delay. Logs show "Gateway disconnected" or "Reconnecting".
@@ -152,7 +152,7 @@ grep -i "OAuth refresh\|oauth_refresh\|invalid_grant" node_debug.log | tail -20
 ```
 **Diagnosis:** The OAuth refresh token is rejected by `auth.openai.com/oauth/token`. Causes:
 - **User changed ChatGPT password** — invalidates all refresh tokens
-- **User signed out of ChatGPT on another device** — may invalidate the SeekerClaw session
+- **User signed out of ChatGPT on another device** — may invalidate the NodeAIgent session
 - **Refresh token revoked** — manual revocation in OpenAI account settings
 - **OpenAI rotated client secret** — rare, would affect all users
 **Fix:**
@@ -237,7 +237,7 @@ df -h
 1. Check storage: use `android_storage` tool or `df -h`
 2. Clean up: delete old files in `media/inbound/` (downloaded Telegram files accumulate)
 3. Check `node_debug.log.old` size — large debug logs consume space
-4. Tell user: "Your device storage is nearly full. Clear some space in the SeekerClaw app or your phone's storage settings."
+4. Tell user: "Your device storage is nearly full. Clear some space in the NodeAIgent app or your phone's storage settings."
 
 ### memory_search Returns Nothing
 **Symptoms:** memory_search returns empty results even when the user insists they discussed something before.
@@ -294,7 +294,7 @@ grep -i "bridge\|ECONNREFUSED\|8765" node_debug.log | tail -10
 - The bridge server crashed or failed to start
 - Port 8765 is blocked or in use
 **Fix:**
-1. Tell the user: "The Android bridge is down — I can't access device features right now. Try opening the SeekerClaw app to restart the bridge."
+1. Tell the user: "The Android bridge is down — I can't access device features right now. Try opening the NodeAIgent app to restart the bridge."
 2. Non-bridge tools (Telegram, Claude API, memory, web, cron) still work normally
 3. The bridge auto-recovers when the app's Activity is reopened
 
@@ -307,7 +307,7 @@ grep -i "bridge\|ECONNREFUSED\|8765" node_debug.log | tail -10
 - `android_camera_check` → CAMERA permission
 - `android_contacts` → READ_CONTACTS permission
 **Check:** Read PLATFORM.md — it lists all granted permissions under the "Permissions" section.
-**Fix:** Tell the user which specific permission is needed: "To use [feature], grant [permission] in SeekerClaw Settings > Permissions."
+**Fix:** Tell the user which specific permission is needed: "To use [feature], grant [permission] in NodeAIgent Settings > Permissions."
 
 ---
 
@@ -331,7 +331,7 @@ grep -i "mcp\|Failed to connect" node_debug.log | tail -10
 ```
 grep -i "rug.pull\|hash.*mismatch\|tool.*blocked\|sha.256" node_debug.log | tail -10
 ```
-**Diagnosis:** SeekerClaw computes SHA-256 hashes of MCP tool definitions on first connect. If a server changes a tool's definition (parameters, description) without the agent's knowledge, the tool is blocked as a security measure. This prevents a compromised MCP server from changing what a tool does.
+**Diagnosis:** NodeAIgent computes SHA-256 hashes of MCP tool definitions on first connect. If a server changes a tool's definition (parameters, description) without the agent's knowledge, the tool is blocked as a security measure. This prevents a compromised MCP server from changing what a tool does.
 **Fix:**
 1. Tell the user: "An MCP tool's definition changed since it was first loaded. This is a security measure. To accept the new definition, remove and re-add the MCP server in Settings."
 2. This is a security feature, not a bug — explain that it protects against tool definition tampering
@@ -346,7 +346,7 @@ grep -i "rate limit.*mcp\|rate limit.*exceeded" node_debug.log | tail -10
 **Fix:**
 1. Reduce the frequency of MCP tool calls
 2. Space out requests — the rate limit resets each minute
-3. If the server itself returns 429, that's the server's own rate limit (separate from SeekerClaw's)
+3. If the server itself returns 429, that's the server's own rate limit (separate from NodeAIgent's)
 
 ---
 
@@ -391,7 +391,7 @@ BAT-549 introduced reasoning content preservation across all 4 providers, plus a
 
 ### `/think on` Toggled But Model Doesn't Think Differently
 **Symptoms:** User toggled `/think on` (or Settings > AI Provider > Reasoning > Extended thinking ON) but responses look the same as before.
-**Diagnosis:** The toggle is a no-op for models the registry doesn't list as supporting reasoning (Haiku 4.5; any freeform / unregistered model id). Run `/think` (no args) — it surfaces a user-facing hint when the active model isn't supported, e.g. "This model does not support extended thinking..." or "This model is not in SeekerClaw's known model list...". The agent's system prompt also exposes this state — the agent itself can tell the user.
+**Diagnosis:** The toggle is a no-op for models the registry doesn't list as supporting reasoning (Haiku 4.5; any freeform / unregistered model id). Run `/think` (no args) — it surfaces a user-facing hint when the active model isn't supported, e.g. "This model does not support extended thinking..." or "This model is not in NodeAIgent's known model list...". The agent's system prompt also exposes this state — the agent itself can tell the user.
 **Fix:**
 - "does not support" hint: switch to a yes-supporting model (Fable 5, Opus 4.8/4.7/4.6, Sonnet 4.6, GPT-5.4/5.5, Codex models) via `/model` or Settings.
 - "not in known model list" hint: this is the safe default for models not in the registry. If the user is on Custom — or typed a custom model ID on Anthropic/OpenAI (supported since BAT-1032) — and knows their endpoint supports thinking, ask them to confirm — the request param genuinely isn't sent because the registry is the source of truth (a "thinking" status that lies about whether thinking is happening would be worse than no status).
@@ -475,7 +475,7 @@ read runtime_state.json
 1. If write failed: check device storage (`android_storage` tool or `df -h`); a full filesystem prevents `runtime_state.json` writes.
 2. If `/provider` is stuck mid-switch: the overlay auto-reverts on write failure. Re-issue `/provider <name>` once storage is healthy.
 3. For provider switches, the service restarts to pick up new credentials — give it 5-10s before sending the next message.
-4. If UI keeps showing stale state after a successful write: kill and reopen the SeekerClaw app (the dashboard reads `runtime_state.json` independently).
+4. If UI keeps showing stale state after a successful write: kill and reopen the NodeAIgent app (the dashboard reads `runtime_state.json` independently).
 
 ### /model Rejects a Model ID That Settings Accepted (BAT-1032)
 **Symptoms:** User typed a custom model ID in Settings > AI Provider > Model > Custom model (Anthropic/OpenAI) — it works — but `/model <same-id>` replies "Unknown model for claude/openai. Options: ...".
@@ -535,12 +535,12 @@ grep -i "MCP.*reconcile\|MCP.*Failed to" node_debug.log | tail -20
 **Fix:**
 1. Re-export the key from the source wallet (Phantom: Settings → Security → Reveal Secret Recovery Phrase → derive specific account).
 2. Strip whitespace; ensure the value is base58 OR a `[1, 2, …, 64]` JSON array.
-3. If the source provides only a seed phrase (12/24 words), use a wallet's "export private key" feature — SeekerClaw does not derive from mnemonics in V1.
+3. If the source provides only a seed phrase (12/24 words), use a wallet's "export private key" feature — NodeAIgent does not derive from mnemonics in V1.
 
 ### `burner: invalid keypair (pubkey/seed mismatch)`
 **Symptoms:** Burner setup rejects a 64-byte expanded key with "pubkey mismatch."
 **Diagnosis:** The trailing 32 bytes of the expanded key don't match the public key derived from the leading 32-byte seed. The key is corrupted or was assembled incorrectly.
-**Fix:** Re-export from the source wallet. If the issue persists, switch to importing only the 32-byte seed (SeekerClaw will derive the public half itself).
+**Fix:** Re-export from the source wallet. If the issue persists, switch to importing only the 32-byte seed (NodeAIgent will derive the public half itself).
 
 ### `burner: storage_failure (Failed to persist key)`
 **Symptoms:** Burner setup parses + validates the key, but the Save step returns `storage_failure`. Bridge endpoints / Settings UI report "Failed to persist key" or `error: "storage_failure"`.
@@ -573,7 +573,7 @@ grep -i "MCP.*reconcile\|MCP.*Failed to" node_debug.log | tail -20
 ### `burner: no burner configured`
 **Symptoms:** `wallet_status` returns `burner: null`. Tools route to main MWA path with confirmation popup. Bridge calls return `burner_not_configured`.
 **Diagnosis:** No private key has been imported yet; the burner is in the "single-wallet" baseline mode.
-**Fix:** Open SeekerClaw → Settings → Burner Wallet → import a key. Until then, every tool routes through MWA exactly like v1.0.
+**Fix:** Open NodeAIgent → Settings → Burner Wallet → import a key. Until then, every tool routes through MWA exactly like v1.0.
 
 ### `burner: tx unsupported`
 **Symptoms:** `/burner/sign-transaction` returns one of:
@@ -618,11 +618,11 @@ grep -i "MCP.*reconcile\|MCP.*Failed to" node_debug.log | tail -20
 **Diagnosis:** AndroidBridge HTTP server (localhost:8765) isn't responding. Either the foreground service isn't running, the bridge port is blocked, or the auth token is wrong.
 **Fix:**
 1. Check `grep -i "Android Bridge" node_debug.log | tail -20`.
-2. Open the Dashboard in SeekerClaw — is the agent showing GREEN? If RED/yellow, restart the agent from Settings → Service Control.
+2. Open the Dashboard in NodeAIgent — is the agent showing GREEN? If RED/yellow, restart the agent from Settings → Service Control.
 3. If persistent: stop and start the SeekerClawService. The bridge initializes on service start.
 
 ### Jupiter ownership map missed a write
-**Symptoms:** Cancel-tool returns `creatorRole: "unknown"` for an order created via SeekerClaw on this device.
+**Symptoms:** Cancel-tool returns `creatorRole: "unknown"` for an order created via NodeAIgent on this device.
 **Diagnosis:** `/jupiter/order-owner/set` failed AFTER the create succeeded. Per contract, the create is not unwound — the order is real on-chain — but the cancel falls back to the "unknown → main + confirm + diagnostic" path.
 **Fix:**
 1. Confirm the user wants to cancel via main wallet (MWA popup).
@@ -683,7 +683,7 @@ All errors below:
 ### `agent_pay: burner not configured`
 **Symptoms:** Tool result `error: "burner_not_configured"`. NO HTTP request to the URL was made.
 **Diagnosis:** agent_pay refuses to fetch when there's no burner wallet; it would have nothing to pay with. /burner/status returned `configured: false`.
-**Fix:** Open SeekerClaw → Settings → Burner Wallet → import a key. Fund the burner with USDC (mainnet). Re-invoke agent_pay.
+**Fix:** Open NodeAIgent → Settings → Burner Wallet → import a key. Fund the burner with USDC (mainnet). Re-invoke agent_pay.
 
 **False-positive scenario (BAT-664 device-test 2026-05-12):** `burner_not_configured` was returned **only for POST**, while same-session GET worked fine. Root cause was NOT the burner — it was configured. `wallet/index.js _BURNER_STATUS_GATE_TOOLS` had `agent_pay` excluded under R9's v1.4-era optimization, so the confirmation gate received the empty short-circuit state (`burnerConfigured: false`) and the BAT-664 POST branch in `confirmation/policy.js:367` fast-failed every call. Fixed by re-including `agent_pay` in the gate set (commit `6957604c`). Guard: `tests/nodejs-project/wallet-registry.test.js` now asserts the gate fetches `/burner/status` for agent_pay AND propagates `configured: true` through to the policy hook. If the symptom recurs (POST-only `burner_not_configured` with GET working), check that test first, then `_BURNER_STATUS_GATE_TOOLS` membership.
 

@@ -55,7 +55,7 @@ fun DangerZoneSection(
         SectionLabel("Danger zone")
         Spacer(Modifier.height(Spacing.sm))
         Text(
-            text = "Wiping the burner is permanent. Drain any remaining funds first — SeekerClaw cannot recover the key.",
+            text = "Wiping the burner is permanent. Drain any remaining funds first — NodeAIgent cannot recover the key.",
             fontFamily = RethinkSans,
             fontSize = 12.sp,
             color = SeekerClawColors.TextDim,
@@ -77,7 +77,7 @@ fun DangerZoneSection(
             burnerAddress = burnerAddress,
             actionLabel = "Wipe",
             title = "Wipe burner?",
-            body = "This permanently deletes the burner key from this device. Drain any remaining funds first — SeekerClaw cannot recover this key.",
+            body = "This permanently deletes the burner key from this device. Drain any remaining funds first — NodeAIgent cannot recover this key.",
             onConfirm = {
                 showWipeDialog = false
                 onWipeClick()

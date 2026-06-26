@@ -147,7 +147,7 @@ class SeekerClawApplication : Application() {
         // Silent low-priority channel for the always-on foreground service notification.
         val serviceChannel = NotificationChannel(
             CHANNEL_ID,
-            "SeekerClaw Service",
+            "NodeAIgent Service",
             NotificationManager.IMPORTANCE_LOW
         ).apply {
             description = "Keeps the AI agent running in the background"
@@ -159,7 +159,7 @@ class SeekerClawApplication : Application() {
         // Uses default sound so the user is clearly alerted to an issue.
         val errorChannel = NotificationChannel(
             ERROR_CHANNEL_ID,
-            "SeekerClaw Alerts",
+            "NodeAIgent Alerts",
             NotificationManager.IMPORTANCE_HIGH
         ).apply {
             description = "Important alerts that require user action"

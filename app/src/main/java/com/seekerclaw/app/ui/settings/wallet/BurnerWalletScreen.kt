@@ -279,7 +279,7 @@ private fun HeroBanner() {
             color = SeekerClawColors.Error,
         )
         Text(
-            text = "Burner uses Solana mainnet. Funds can be lost. Treat as disposable. SeekerClaw cannot recover this key.",
+            text = "Burner uses Solana mainnet. Funds can be lost. Treat as disposable. NodeAIgent cannot recover this key.",
             fontFamily = RethinkSans,
             fontSize = 13.sp,
             color = SeekerClawColors.TextPrimary,

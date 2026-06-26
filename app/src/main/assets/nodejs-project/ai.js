@@ -639,10 +639,10 @@ function buildSystemBlocks(matchedSkills = [], chatId = null, activeModel = MODE
     }
 
     // Identity - enhanced with origin/purpose (BAT-232)
-    lines.push('You are a personal AI agent running inside SeekerClaw on Android.');
-    lines.push(`SeekerClaw turns a phone into a 24/7 always-on AI agent. Your owner talks to you through ${CHANNEL === 'discord' ? 'Discord' : 'Telegram'} — the Android app is just your host and control panel.`);
+    lines.push('You are a personal AI agent running inside NodeAIgent on Android.');
+    lines.push(`NodeAIgent turns a phone into a 24/7 always-on AI agent. Your owner talks to you through ${CHANNEL === 'discord' ? 'Discord' : 'Telegram'} — the Android app is just your host and control panel.`);
     lines.push('You are based on the OpenClaw gateway — an open-source personal AI agent framework.');
-    lines.push('Official channels — Website: seekerclaw.xyz · X: @SeekerClaw · Telegram: t.me/seekerclaw · GitHub: github.com/sepivip/SeekerClaw');
+    lines.push('Official channels — [ NodeAIgent link ]');
     lines.push('');
 
     // Architecture — agent understands its own process model (BAT-232)
@@ -1038,7 +1038,7 @@ function buildSystemBlocks(matchedSkills = [], chatId = null, activeModel = MODE
     lines.push('1. Likely cause: Node.js event loop blocked or network dropping repeatedly');
     lines.push('2. Check: shell_exec with "grep -i error node_debug.log" for recent failures');
     lines.push('3. Check: is device on WiFi? Any DNS failures? (grep ENOTFOUND or ETIMEDOUT)');
-    lines.push('4. Suggest: "Disable battery optimization for SeekerClaw in Android Settings" and "Check WiFi stability"');
+    lines.push('4. Suggest: "Disable battery optimization for NodeAIgent in Android Settings" and "Check WiFi stability"');
     lines.push('');
     lines.push('**If conversation seems corrupted or loops:**');
     lines.push('1. Use /new to archive and clear conversation history (safe — saves to memory first)');
@@ -1151,7 +1151,7 @@ function buildSystemBlocks(matchedSkills = [], chatId = null, activeModel = MODE
 
     // Heartbeat section
     lines.push('## Heartbeats');
-    lines.push('SeekerClaw sends you periodic heartbeat polls to check if anything needs attention.');
+    lines.push('NodeAIgent sends you periodic heartbeat polls to check if anything needs attention.');
     lines.push('During each heartbeat, read HEARTBEAT.md from your workspace and follow it strictly.');
     lines.push('HEARTBEAT.md is your file — you can read it, edit it, and keep it organized.');
     lines.push('When the user asks to add or remove heartbeat checks, update HEARTBEAT.md accordingly.');
@@ -1215,7 +1215,7 @@ function buildSystemBlocks(matchedSkills = [], chatId = null, activeModel = MODE
     // canonical form, user saw a truncated bullet).
     const channelName = CHANNEL === 'discord' ? 'Discord' : 'Telegram';
     lines.push('## Silent Replies');
-    lines.push(`When no user-visible reply is required, emit a silent-reply signal as your ENTIRE message and SeekerClaw will discard it instead of sending it to ${channelName}.`);
+    lines.push(`When no user-visible reply is required, emit a silent-reply signal as your ENTIRE message and NodeAIgent will discard it instead of sending it to ${channelName}.`);
     lines.push('');
     lines.push('### When to emit a silent-reply signal');
     lines.push('- Silent housekeeping (saving memory, updating state).');
@@ -1366,7 +1366,7 @@ function buildSystemBlocks(matchedSkills = [], chatId = null, activeModel = MODE
     lines.push('- On shutdown/restart');
     lines.push('Summaries are indexed into SQL.js chunks and immediately searchable via memory_search.');
     lines.push('You do NOT need to manually save session context — it happens automatically.');
-    lines.push('**User-initiated Stop (BAT-525):** When the user taps Stop Agent on the dashboard, SeekerClaw triggers a graceful flush handshake (POST /shutdown/flush over loopback) that gives you a brief window (~1.5s) to persist pending session summaries and SQL.js writes before the :node process is killed. The last ~60s of api_request_log activity and any in-flight summary survives across user-Stop. If a user worries about losing data when stopping the agent, this is the guarantee.');
+    lines.push('**User-initiated Stop (BAT-525):** When the user taps Stop Agent on the dashboard, NodeAIgent triggers a graceful flush handshake (POST /shutdown/flush over loopback) that gives you a brief window (~1.5s) to persist pending session summaries and SQL.js writes before the :node process is killed. The last ~60s of api_request_log activity and any in-flight summary survives across user-Stop. If a user worries about losing data when stopping the agent, this is the guarantee.');
     lines.push('');
 
     // Conversation Limits — hard constraints the agent should know about (BAT-232)

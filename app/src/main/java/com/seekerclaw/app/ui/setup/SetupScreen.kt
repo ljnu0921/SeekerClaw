@@ -212,7 +212,7 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
             } ?: safeDefault
         )
     }
-    var agentName by rememberSaveable { mutableStateOf(existingConfig?.agentName ?: "SeekerClaw") }
+    var agentName by rememberSaveable { mutableStateOf(existingConfig?.agentName ?: "NodeAIgent") }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var apiKeyError by remember { mutableStateOf<String?>(null) }
     var botTokenError by remember { mutableStateOf<String?>(null) }
@@ -387,7 +387,7 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
                     telegramBotToken = botToken.trim(),
                     telegramOwnerId = ownerId.trim(),
                     model = selectedModel,
-                    agentName = agentName.trim().ifBlank { "SeekerClaw" },
+                    agentName = agentName.trim().ifBlank { "NodeAIgent" },
                 )
                 "openrouter" -> AppConfig(
                     anthropicApiKey = existing?.anthropicApiKey ?: "",
@@ -407,7 +407,7 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
                     telegramBotToken = botToken.trim(),
                     telegramOwnerId = ownerId.trim(),
                     model = selectedModel,
-                    agentName = agentName.trim().ifBlank { "SeekerClaw" },
+                    agentName = agentName.trim().ifBlank { "NodeAIgent" },
                 )
                 else -> AppConfig(
                     // Preserve the OTHER auth type's stored key — never wipe data the user
@@ -428,7 +428,7 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
                     telegramBotToken = botToken.trim(),
                     telegramOwnerId = ownerId.trim(),
                     model = selectedModel,
-                    agentName = agentName.trim().ifBlank { "SeekerClaw" },
+                    agentName = agentName.trim().ifBlank { "NodeAIgent" },
                 )
             }
             // BAT-513: saveConfig now returns Boolean — false means
@@ -720,7 +720,7 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
                 animatedDotPosition = animatedDotPosition,
             )
             SetupSteps.SUCCESS -> SetupSuccessStep(
-                agentName = agentName.ifBlank { "SeekerClaw" },
+                agentName = agentName.ifBlank { "NodeAIgent" },
                 onContinue = onSetupComplete,
                 onBack = { currentStep = SetupSteps.PROVIDER },
                 animatedDotPosition = animatedDotPosition,
@@ -744,7 +744,7 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
             },
             text = {
                 Text(
-                    "SeekerClaw runs your AI agent in the background. " +
+                    "NodeAIgent runs your AI agent in the background. " +
                         "Notifications let you know when the agent starts, stops, " +
                         "or needs attention \u2014 even when the app isn\u2019t open.",
                     fontFamily = RethinkSans,
@@ -832,7 +832,7 @@ private fun WelcomeStep(
             }
             Image(
                 painter = painterResource(R.drawable.ic_seekerclaw_symbol),
-                contentDescription = "SeekerClaw",
+                contentDescription = "NodeAIgent",
                 modifier = Modifier.size(Sizing.heroLogoSize),
             )
         }
@@ -1526,7 +1526,7 @@ private fun SetupSuccessStep(
         // Hero logo (smaller version of Welcome's claw)
         Image(
             painter = painterResource(R.drawable.ic_seekerclaw_symbol),
-            contentDescription = "SeekerClaw",
+            contentDescription = "NodeAIgent",
             modifier = Modifier.size(96.dp),
         )
 
