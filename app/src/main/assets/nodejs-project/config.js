@@ -73,7 +73,7 @@ function log(msg, level = 'INFO') {
     try { fs.appendFileSync(debugLog, line); } catch (_) {}
 }
 
-log('Starting SeekerClaw AI Agent...', 'DEBUG');
+log('Starting NodeAIgent Engine...', 'DEBUG');
 log(`Node.js ${process.version} on ${process.platform} ${process.arch}`, 'DEBUG');
 log(`Workspace: ${workDir}`, 'DEBUG');
 

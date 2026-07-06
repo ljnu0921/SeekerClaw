@@ -107,6 +107,48 @@ class LogCollectorTest {
         assertEquals(LogLevel.INFO, LogCollector.logs.value[0].level)
     }
 
+    @Test
+    fun `append masks internal app data paths`() {
+        LogCollector.append("Workspace: /data/data/com.seekerclaw.app/files/workspace")
+        LogCollector.append("Debug: /data/user/0/com.seekerclaw.app/files/nodejs-project/main.js")
+
+        val messages = LogCollector.logs.value.map { it.message }
+        assertEquals("Workspace: ./workspace", messages[0])
+        assertEquals("Debug: app files/nodejs-project/main.js", messages[1])
+        assertTrue(messages.none { it.contains("com.seekerclaw.app") })
+    }
+
+    @Test
+    fun `append masks legacy brand strings`() {
+        LogCollector.append("Starting SeekerClaw AI Agent...")
+        LogCollector.append("database=seekerclaw.db")
+
+        val messages = LogCollector.logs.value.map { it.message }
+        assertEquals("Starting NodeAIgent AI Agent...", messages[0])
+        assertEquals("database=nodeaigent.db", messages[1])
+        assertTrue(messages.none { it.contains("SeekerClaw") || it.contains("seekerclaw") })
+    }
+
+    @Test
+    fun `offset reader masks persisted internal app data paths`() = runBlocking {
+        val tmp = File.createTempFile("bat-path-mask", ".test")
+        try {
+            LogCollector.setLogFileForTest(tmp)
+            LogCollector.resetForTest()
+
+            val ts = System.currentTimeMillis()
+            tmp.writeText("$ts|INFO|workDir=/data/user/0/com.seekerclaw.app/files/workspace/media/inbound\n")
+
+            LogCollector.readNewFromFileForTest()
+
+            assertEquals("workDir=./workspace/media/inbound", LogCollector.logs.value.single().message)
+        } finally {
+            LogCollector.setLogFileForTest(null)
+            LogCollector.resetForTest()
+            tmp.delete()
+        }
+    }
+
     // --- Thread safety (the primary bug fix) ---
 
     @Test

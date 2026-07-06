@@ -95,7 +95,7 @@ object LogCollector {
     }
 
     fun append(message: String, level: LogLevel = LogLevel.INFO) {
-        val entry = LogEntry(message = message, level = level)
+        val entry = LogEntry(message = maskInternalPaths(message), level = level)
 
         // Thread-safe update of in-memory list
         synchronized(logsLock) {
@@ -629,11 +629,26 @@ object LogCollector {
         if (parts.size < 3) return null
         val timestamp = parts[0].toLongOrNull() ?: return null
         val level = try { LogLevel.valueOf(parts[1]) } catch (_: Exception) { LogLevel.INFO }
-        return LogEntry(timestamp = timestamp, message = parts[2], level = level)
+        return LogEntry(timestamp = timestamp, message = maskInternalPaths(parts[2]), level = level)
     }
 
     internal fun fileNameFromObserverPath(path: String?): String? =
         path?.substringAfterLast('/')
+
+    private val workspacePathPattern =
+        Regex("""/data/(?:data|user/\d+)/com\.seekerclaw\.app/files/workspace""")
+    private val filesPathPattern =
+        Regex("""/data/(?:data|user/\d+)/com\.seekerclaw\.app/files""")
+    private val appDataPathPattern =
+        Regex("""/data/(?:data|user/\d+)/com\.seekerclaw\.app""")
+
+    internal fun maskInternalPaths(message: String): String =
+        message
+            .replace(workspacePathPattern, "./workspace")
+            .replace(filesPathPattern, "app files")
+            .replace(appDataPathPattern, "app data")
+            .replace("SeekerClaw", "NodeAIgent")
+            .replace("seekerclaw", "nodeaigent")
 
     // ── Testing hooks ────────────────────────────────────────────────
     // Internal-visibility hooks for unit tests. Intentionally NOT marked
